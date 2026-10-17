@@ -1,0 +1,8 @@
+# colophon-emulator's, copied so that the bridge is held to the core's own rules.
+# LLVM style is the closest thing C has to a community default, and it already
+# uses 2-space indentation. Deviations below are deliberate and few.
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 100
+IndentCaseLabels: true
+InsertBraces: true

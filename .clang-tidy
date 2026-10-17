@@ -1,0 +1,13 @@
+# colophon-emulator's, copied so that the bridge is held to the core's own rules.
+# Static analysis only — style is clang-format's job, correctness warnings are
+# already -Werror's. Excluded: easily-swappable-parameters is notoriously noisy
+# on small C APIs; unix.Errno demands errno bookkeeping around every stdio call
+# and we never consult errno; optin.performance.Padding would have us order a
+# machine's fields by alignment rather than by which chip they belong to, to
+# save bytes in a struct that exists once; not-null-terminated-result reads a
+# string literal as a string, and every one of ours is a file's signature
+# copied into an image at its documented length, where a terminator would be
+# a byte of corruption.
+Checks: 'clang-analyzer-*,bugprone-*,portability-*,-bugprone-easily-swappable-parameters,-clang-analyzer-unix.Errno,-clang-analyzer-optin.performance.Padding,-bugprone-not-null-terminated-result'
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'

@@ -1,0 +1,34 @@
+name: Check
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: colophon-mcp
+    steps:
+      # The machine is the sibling repository, so the two are laid out as
+      # they are on a working copy.
+      - uses: actions/checkout@v5
+        with:
+          path: colophon-mcp
+
+      - uses: actions/checkout@v5
+        with:
+          repository: tulinmola/colophon-emulator
+          path: colophon-emulator
+
+      # bindgen reads the emulator's headers through libclang.
+      - run: sudo apt-get update && sudo apt-get install --yes libclang-dev
+
+      # One release for both, pinned, because another may format differently
+      # or find other things.
+      - run: pipx install clang-format==22.1.8
+      - run: pipx install clang-tidy==22.1.8
+
+      - run: make check

@@ -73,13 +73,14 @@ A page describes what the server does today, and what it owes a reader is its li
 
 - rustfmt and clang-format decide formatting, and it is never a discussion; clippy, with its warnings denied, and clang-tidy decide the rest.
 - Every comment is a lost battle. The survivors: hardware facts, cited sources, and constraints the code cannot express — an `unsafe` block's comment says what it relies on. Never narrate what the code already says; rename or restructure instead.
-- Wrappers around the bridge mirror its C names mechanically, without the prefix: `mcp_run` becomes `run`. A wrapper that renames what it wraps hides the emulator from anyone reading both.
+- Wrappers around the bridge mirror its C names mechanically: the prefix falls away, a machine's name becomes the type the function is a method of, `_t` falls away, and what remains takes Rust's case — `mcp_cpc_run` becomes `Cpc::run`, and `mcp_run_t` becomes `Run`. A wrapper that renames what it wraps hides the emulator from anyone reading both.
 - Documented names for documented things: a register, a pin or a counter keeps the name its primary documentation gives it, as the core's headers already do. Every deviation from the documentation — an active level, a prime mark — is declared where it is defined.
 - Invented names explain themselves. Abbreviations count as cryptic (`err`, `msg`, `buf`, `cur`): write the word. Abbreviations that are documented names (`RFSH`, `WZ`), a language's own (`int`, `argv`, `u8`, `Vec`, `fn`), or the name of a real thing in the repo (the `src/` folder) stay. Single letters only in scopes a few lines long.
 - Of two options that work, the one with fewer concepts and fewer lines.
 
 ## Working
 
+- `make check` is formatting, linting and the tests together; run it before handing work back. The Makefile is the list of targets and this file does not repeat it.
 - Never commit, never push. The human reviews; the human commits.
 
 ## Unsettled
