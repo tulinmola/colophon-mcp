@@ -1,11 +1,12 @@
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::{PoisonError, RwLock};
 
 use crate::emulator::{
     CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, SPECTRUM_FRAMEBUFFER_HEIGHT,
     SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE,
-    cpc_connect_monitor, cpc_init, cpc_t, mcp_cpc_run, mcp_spectrum_run, spectrum_connect_monitor,
-    spectrum_init, spectrum_t,
+    cpc_connect_monitor, cpc_fit_disc_interface, cpc_init, cpc_set_upper_rom, cpc_t, mcp_cpc_run,
+    mcp_spectrum_run, spectrum_connect_monitor, spectrum_init, spectrum_t,
 };
 
 pub use crate::emulator::mcp_run_t as Run;
@@ -44,6 +45,7 @@ fn framebuffer(width: u32, height: u32) -> Handed<[u8]> {
 
 pub struct Cpc {
     machine: Handed<cpc_t>,
+    upper_roms: BTreeMap<u8, Handed<[u8; 0x4000]>>,
     _ram: Handed<[u8]>,
     _lower_rom: Handed<[u8; 0x4000]>,
     _framebuffer: Handed<[u8]>,
@@ -78,10 +80,24 @@ impl Cpc {
         }
         Cpc {
             machine,
+            upper_roms: BTreeMap::new(),
             _ram: ram,
             _lower_rom: lower_rom,
             _framebuffer: framebuffer,
         }
+    }
+
+    pub fn set_upper_rom(&mut self, number: u8, rom: Box<[u8; 0x4000]>) {
+        let rom = Handed::new(rom);
+        // SAFETY: the ROM is held beside the machine; the one it replaces, if
+        // any, is freed only once the machine no longer points at it.
+        unsafe { cpc_set_upper_rom(self.machine.as_ptr(), number, rom.as_ptr().cast()) };
+        self.upper_roms.insert(number, rom);
+    }
+
+    pub fn fit_disc_interface(&mut self, fitted: bool) {
+        // SAFETY: the machine stands where it was built.
+        unsafe { cpc_fit_disc_interface(self.machine.as_ptr(), fitted) };
     }
 
     pub fn run(&mut self, frames: u32, limit: u64) -> Run {
@@ -239,14 +255,14 @@ mod tests {
     }
 
     impl Cpc {
-        fn machine(&self) -> &cpc_t {
+        pub(crate) fn machine(&self) -> &cpc_t {
             // SAFETY: no run is under way while this value is borrowed.
             unsafe { &*self.machine.as_ptr() }
         }
     }
 
     impl Spectrum {
-        fn machine(&self) -> &spectrum_t {
+        pub(crate) fn machine(&self) -> &spectrum_t {
             // SAFETY: no run is under way while this value is borrowed.
             unsafe { &*self.machine.as_ptr() }
         }

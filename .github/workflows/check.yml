@@ -32,3 +32,10 @@ jobs:
       - run: pipx install clang-tidy==22.1.8
 
       - run: make check
+
+      # The Inspector is a client this repository did not write.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - run: make test-inspector

@@ -19,7 +19,8 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 ## The server
 
 - Several machines stand at once, each behind a handle the server gives it, because a game's releases are read side by side. A tool that acts on a machine names it by its handle.
-- The server speaks over standard input and output, one client to a process.
+- The server speaks over standard input and output, one client to a process. It answers in the revisions a test speaks, and a revision is supported the day a test speaks it, not before.
+- Each machine is built on a thread of its own and never leaves it. A machine holds raw pointers, a CPC's into itself, and nothing claims it can be sent between threads.
 - Rust holds the protocol, the handles, the threads and the encodings. Its types for the core's structs are generated from the headers by bindgen, and so is everything that reads them by name; none of it is written by hand, so a renamed field breaks the build and a new one arrives without anyone listing it.
 
 ## The bridge
@@ -33,6 +34,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 - A tool is added the day someone needs it and not before. The first stand machines up, list them and put them away, run them by the frame and step them by the instruction, stop them where they are told, type at them, read and set anything they hold by its path, read and write their memory and disassemble it, show their picture, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
 - A tool's description is the reference for it, as a header is for the core, and a page never restates a schema.
 - A tool speaks in the machine's terms. A field keeps the name its header gives it.
+- A tool that succeeds answers with a JSON object, and the same JSON as text beside it: the older revisions take no other structured answer, and the protocol asks for the text. One that fails answers with text alone, saying what would have worked.
 - What can be told as text is told as text. A picture is returned only for what only a picture shows, and comes with text saying which machine, at which tick, and at what size.
 - An error says what would have worked.
 
@@ -40,6 +42,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 
 - A tool exists when a test grades it, and a test arrives in the change that writes what it grades.
 - Prefer evidence we did not write: a ROM disassembly someone else made, the firmware's own tables. A test built from our own understanding agrees with our own mistakes. The emulator's command line, run on the same copy, is a second program around the same core: it shows that the server reports what the machine did, never that the machine did it right.
+- The protocol is graded by the specification's own sentences, quoted in the tests that hold the server to them, and by the protocol's own Inspector, a client this repository did not write.
 - No firmware and no software is kept here. The tests write the few bytes they run, and anything heavier reads the emulator's own fetched copies.
 
 ## Crates

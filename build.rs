@@ -2,12 +2,32 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "src/build_name.rs"]
+mod build_name;
+
+// What a build is compiled from, in each repository, and so what marks it.
+const SOURCES: &[&str] = &[
+    "Cargo.lock",
+    "Cargo.toml",
+    "build.rs",
+    "emulator",
+    "rust-toolchain.toml",
+    "src",
+];
+const EMULATOR_SOURCES: &[&str] = &["src"];
+
 fn c_files_in(directory: &Path) -> Vec<PathBuf> {
     let entries = fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
     let mut files: Vec<PathBuf> = entries
         .map(|entry| entry.expect("a directory entry").path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
+        // A name that begins with a dot is a file of the editor's or the
+        // operating system's, which may end in .c without being C.
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+        })
         .collect();
     files.sort();
     files
@@ -28,8 +48,30 @@ fn main() {
     }
 
     println!("cargo::rerun-if-env-changed=EMULATOR_DIR");
-    println!("cargo::rerun-if-changed={}", machine.display());
-    println!("cargo::rerun-if-changed={}", bridge.display());
+    for source in SOURCES {
+        println!("cargo::rerun-if-changed={source}");
+    }
+    for source in EMULATOR_SOURCES {
+        println!(
+            "cargo::rerun-if-changed={}",
+            emulator.join(source).display()
+        );
+    }
+    for repository in [&manifest, &emulator] {
+        for path in build_name::watched(repository) {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
+    }
+    let name = build_name::name(
+        &env::var("CARGO_PKG_VERSION").expect("cargo names the version"),
+        build_name::commit(&manifest, SOURCES).as_ref(),
+        build_name::commit(&emulator, EMULATOR_SOURCES).as_ref(),
+    );
+    println!("cargo::rustc-env=COLOPHON_MCP_BUILD={name}");
+    println!(
+        "cargo::rustc-env=COLOPHON_MCP_EMULATOR_DIR={}",
+        emulator.display()
+    );
 
     cc::Build::new()
         .std("c99")
