@@ -1,8 +1,18 @@
 use std::fs;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
-use crate::emulator::{SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE};
-use crate::machine::{Cpc, Spectrum};
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+use crate::emulator::{
+    CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE,
+    SPECTRUM_TICKS_PER_FRAME,
+};
+use crate::fields::{self, Fields, Segment};
+use crate::machine::{Cpc, Run, Spectrum};
 
 // Named and wired as the emulator's command line names and wires them, in
 // its order: its machines table, and the sockets run_cpc fills, in cli/main.c
@@ -70,9 +80,34 @@ pub fn named(name: &str) -> Option<&'static Machine> {
     MACHINES.iter().find(|machine| machine.name == name)
 }
 
+// A file a machine was built from, named by what it holds.
+#[derive(Clone, Serialize, JsonSchema)]
+pub struct FileRead {
+    /// Where the file was read.
+    pub path: PathBuf,
+    /// The SHA-256 of what it held, in hexadecimal.
+    pub sha256: String,
+}
+
+impl FileRead {
+    fn of(path: &Path, contents: &[u8]) -> FileRead {
+        let digest = Sha256::digest(contents);
+        FileRead {
+            path: path.to_owned(),
+            sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        }
+    }
+}
+
 // What a machine is built from, read and checked, so that building it
-// cannot fail.
-pub enum Parts {
+// cannot fail but on its snapshot, which only the core can judge.
+pub struct Parts {
+    memories: Memories,
+    snapshot: Option<(PathBuf, Vec<u8>)>,
+    pub files: Vec<FileRead>,
+}
+
+enum Memories {
     Cpc {
         ram: Box<[u8]>,
         lower_rom: Box<[u8; CPC_ROM_SIZE]>,
@@ -85,13 +120,34 @@ pub enum Parts {
     },
 }
 
-pub enum Built {
+enum Hardware {
     Cpc(Cpc),
     Spectrum(Spectrum),
 }
 
-fn read(roms: &Path, file: &str, size: usize) -> Result<Vec<u8>, String> {
+// A machine as the server holds it: the hardware, and the ticks it has run
+// since it was stood up, which the core leaves to whoever runs it.
+pub struct Built {
+    hardware: Hardware,
+    tick: u64,
+}
+
+fn read(
+    roms: &Path,
+    file: &str,
+    size: usize,
+    files: &mut Vec<FileRead>,
+) -> Result<Vec<u8>, String> {
     let path = roms.join(file);
+    // A pipe or a device under the firmware's name could keep its reader
+    // waiting for good.
+    if path.exists() && !path.is_file() {
+        return Err(format!(
+            "{} is not a file; the emulator's `make roms` fetches the firmware into its roms \
+             directory as files",
+            path.display()
+        ));
+    }
     let contents = fs::read(&path).map_err(|error| {
         format!(
             "cannot read {}: {error}; the emulator's `make roms` fetches the firmware into its \
@@ -107,6 +163,7 @@ fn read(roms: &Path, file: &str, size: usize) -> Result<Vec<u8>, String> {
             contents.len()
         ));
     }
+    files.push(FileRead::of(&path, &contents));
     Ok(contents)
 }
 
@@ -119,39 +176,118 @@ fn rom<const SIZE: usize>(bytes: &[u8]) -> Box<[u8; SIZE]> {
 }
 
 impl Machine {
-    pub fn parts(&self, roms: &Path) -> Result<Parts, String> {
-        match self.board {
+    pub fn parts(&self, roms: &Path, snapshot: Option<&Path>) -> Result<Parts, String> {
+        let mut files = Vec::new();
+        let memories = match self.board {
             Board::Cpc {
                 firmware,
                 ram_size,
                 disc_interface,
             } => {
-                let firmware = read(roms, firmware, 2 * CPC_ROM_SIZE)?;
+                let firmware = read(roms, firmware, 2 * CPC_ROM_SIZE, &mut files)?;
                 let amsdos = if disc_interface {
-                    Some(rom(&read(roms, AMSDOS, CPC_ROM_SIZE)?))
+                    Some(rom(&read(roms, AMSDOS, CPC_ROM_SIZE, &mut files)?))
                 } else {
                     None
                 };
                 let (lower_rom, basic) = firmware.split_at(CPC_ROM_SIZE);
-                Ok(Parts::Cpc {
+                Memories::Cpc {
                     ram: vec![0; ram_size].into_boxed_slice(),
                     lower_rom: rom(lower_rom),
                     basic: rom(basic),
                     amsdos,
-                })
+                }
             }
-            Board::Spectrum { firmware, ram_size } => Ok(Parts::Spectrum {
+            Board::Spectrum { firmware, ram_size } => Memories::Spectrum {
                 ram: vec![0; ram_size].into_boxed_slice(),
-                rom: rom(&read(roms, firmware, SPECTRUM_ROM_SIZE as usize)?),
-            }),
+                rom: rom(&read(
+                    roms,
+                    firmware,
+                    SPECTRUM_ROM_SIZE as usize,
+                    &mut files,
+                )?),
+            },
+        };
+        let snapshot = match snapshot {
+            None => None,
+            Some(path) => {
+                let contents = self.snapshot(path)?;
+                files.push(FileRead::of(path, &contents));
+                Some((path.to_owned(), contents))
+            }
+        };
+        Ok(Parts {
+            memories,
+            snapshot,
+            files,
+        })
+    }
+
+    // A file that is no snapshot of this machine's is refused by its size
+    // before it is read, so that neither a pipe nor a device can hold the
+    // server up. A Spectrum's is one length; a CPC's of version 3 may carry
+    // chunks of its writer's own after its memory, as many as it kept
+    // ("Snapshot (.SNA) file format", cpctech), so its bound stands far past
+    // them.
+    fn snapshot(&self, path: &Path) -> Result<Vec<u8>, String> {
+        let unreadable = |error: io::Error| {
+            format!(
+                "cannot read {}: {error}; a snapshot is named by its path on the file system the \
+                 server runs on",
+                path.display()
+            )
+        };
+        let largest = match self.board {
+            Board::Cpc { .. } => 8 * 1024 * 1024,
+            Board::Spectrum { .. } => u64::from(SPECTRUM_SNAPSHOT_SIZE),
+        };
+        let metadata = fs::metadata(path).map_err(unreadable)?;
+        if !metadata.is_file() || metadata.len() > largest {
+            return Err(format!(
+                "{} is not a file of at most {largest} bytes; {}",
+                path.display(),
+                self.snapshots()
+            ));
+        }
+        let mut contents = Vec::new();
+        fs::File::open(path)
+            .and_then(|file| file.take(largest + 1).read_to_end(&mut contents))
+            .map_err(unreadable)?;
+        if contents.len() as u64 > largest {
+            return Err(format!(
+                "{} grew past {largest} bytes while it was read; {}",
+                path.display(),
+                self.snapshots()
+            ));
+        }
+        Ok(contents)
+    }
+
+    // How long a frame of this machine is when nothing has reprogrammed it.
+    pub fn standard_frame(&self) -> u64 {
+        match self.board {
+            Board::Cpc { .. } => u64::from(CPC_TICKS_PER_STANDARD_FRAME),
+            Board::Spectrum { .. } => u64::from(SPECTRUM_TICKS_PER_FRAME),
+        }
+    }
+
+    // What machine_open would take, said when a snapshot is refused.
+    fn snapshots(&self) -> &'static str {
+        match self.board {
+            Board::Cpc { .. } => {
+                "a CPC opens an SNA snapshot of version 1, 2 or 3 holding no more RAM than it \
+                 has, in the dump that follows its header: 128K on a cpc6128, 64K on a cpc664 \
+                 or a cpc464"
+            }
+            Board::Spectrum { .. } => "a spectrum48 opens a 48K .sna snapshot of 49179 bytes",
         }
     }
 }
 
 impl Parts {
-    pub fn build(self) -> Built {
-        match self {
-            Parts::Cpc {
+    pub fn build(self, machine: &Machine) -> Result<Built, String> {
+        let mut hardware = match self.memories {
+            Memories::Cpc {
                 ram,
                 lower_rom,
                 basic,
@@ -163,9 +299,138 @@ impl Parts {
                     cpc.fit_disc_interface(true);
                     cpc.set_upper_rom(7, amsdos);
                 }
-                Built::Cpc(cpc)
+                Hardware::Cpc(cpc)
             }
-            Parts::Spectrum { ram, rom } => Built::Spectrum(Spectrum::new(ram, rom)),
+            Memories::Spectrum { ram, rom } => Hardware::Spectrum(Spectrum::new(ram, rom)),
+        };
+        if let Some((path, bytes)) = self.snapshot {
+            let loaded = match &mut hardware {
+                Hardware::Cpc(cpc) => cpc.snapshot_load(&bytes),
+                Hardware::Spectrum(spectrum) => spectrum.snapshot_load(&bytes),
+            };
+            loaded.map_err(|problem| {
+                format!("{} {problem}; {}", path.display(), machine.snapshots())
+            })?;
+            // The core loads a snapshot's RAM configuration whatever RAM the
+            // machine has, and a 64K CPC has no banks for the others.
+            let checked = match &hardware {
+                Hardware::Cpc(cpc) => cpc.check(cpc.machine()),
+                Hardware::Spectrum(spectrum) => spectrum.check(spectrum.machine()),
+            };
+            checked.map_err(|problem| {
+                format!(
+                    "{} loads a machine the emulator cannot run: {problem}; {}",
+                    path.display(),
+                    machine.snapshots()
+                )
+            })?;
+        }
+        Ok(Built { hardware, tick: 0 })
+    }
+}
+
+// Every write is made to a copy, so that a value refused leaves the machine
+// as it stood.
+fn written<T: Fields>(
+    machine: &T,
+    values: &[(&String, Vec<Segment>, &Value)],
+) -> Result<T, String> {
+    // SAFETY: a machine's struct owns nothing, so a copy of its bytes is a
+    // value of its own: it is dropped, or moved back over the machine, and
+    // never run. set writes no pointer, so every pointer in the copy is one
+    // the machine already holds.
+    let mut copy = unsafe { std::ptr::read(machine) };
+    for (path, segments, value) in values {
+        copy.set(segments, value)
+            .map_err(|problem| format!("{path}: {problem}"))?;
+    }
+    Ok(copy)
+}
+
+impl Built {
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    pub fn pc(&self) -> u16 {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.machine().cpu.pc,
+            Hardware::Spectrum(spectrum) => spectrum.machine().cpu.pc,
+        }
+    }
+
+    pub fn run(&mut self, frames: u32, limit: u64) -> Run {
+        let run = match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.run(frames, limit),
+            Hardware::Spectrum(spectrum) => spectrum.run(frames, limit),
+        };
+        self.tick += run.ticks;
+        run
+    }
+
+    pub fn step(&mut self, instructions: u32) -> Run {
+        let run = match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.step(instructions),
+            Hardware::Spectrum(spectrum) => spectrum.step(instructions),
+        };
+        self.tick += run.ticks;
+        run
+    }
+
+    pub fn inspect(&self, path: &str) -> Result<Value, String> {
+        let segments = fields::parse(path)?;
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.machine().get(&segments),
+            Hardware::Spectrum(spectrum) => spectrum.machine().get(&segments),
+        }
+        .map_err(|problem| format!("{path}: {problem}"))
+    }
+
+    // Writes every value or none, and answers each path as it now reads.
+    pub fn set(&mut self, values: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+        let values = values
+            .iter()
+            .map(|(path, value)| Ok((path, fields::parse(path)?, value)))
+            .collect::<Result<Vec<_>, String>>()?;
+        match &mut self.hardware {
+            Hardware::Cpc(cpc) => {
+                let written = written(cpc.machine(), &values)?;
+                cpc.check(&written)?;
+                *cpc.machine_mut() = written;
+                cpc.remap();
+            }
+            Hardware::Spectrum(spectrum) => {
+                let written = written(spectrum.machine(), &values)?;
+                spectrum.check(&written)?;
+                *spectrum.machine_mut() = written;
+                spectrum.seek();
+            }
+        }
+        values
+            .iter()
+            .map(|(path, _, _)| Ok(((*path).clone(), self.inspect(path)?)))
+            .collect()
+    }
+
+    pub fn peek(&self, address: u16, length: u16) -> Vec<u8> {
+        (0..length)
+            .map(|offset| {
+                let address = address.wrapping_add(offset);
+                match &self.hardware {
+                    Hardware::Cpc(cpc) => cpc.peek(address),
+                    Hardware::Spectrum(spectrum) => spectrum.peek(address),
+                }
+            })
+            .collect()
+    }
+
+    pub fn poke(&mut self, address: u16, bytes: &[u8]) {
+        for (offset, value) in (0..).zip(bytes) {
+            let address = address.wrapping_add(offset);
+            match &mut self.hardware {
+                Hardware::Cpc(cpc) => cpc.poke(address, *value),
+                Hardware::Spectrum(spectrum) => spectrum.poke(address, *value),
+            }
         }
     }
 }
@@ -229,17 +494,18 @@ mod tests {
     }
 
     fn build(name: &str, roms: &Roms) -> Built {
-        named(name)
-            .expect("a machine of that name")
-            .parts(&roms.0)
+        let machine = named(name).expect("a machine of that name");
+        machine
+            .parts(&roms.0, None)
             .expect("its firmware is read")
-            .build()
+            .build(machine)
+            .expect("a machine without a snapshot is always built")
     }
 
     fn cpc(name: &str, roms: &Roms) -> Cpc {
-        match build(name, roms) {
-            Built::Cpc(cpc) => cpc,
-            Built::Spectrum(_) => panic!("{name} is built as a Spectrum"),
+        match build(name, roms).hardware {
+            Hardware::Cpc(cpc) => cpc,
+            Hardware::Spectrum(_) => panic!("{name} is built as a Spectrum"),
         }
     }
 
@@ -358,7 +624,7 @@ mod tests {
     #[test]
     fn the_spectrum_is_wired_as_the_command_line_wires_it() {
         let roms = Roms::new(STAND_INS);
-        let Built::Spectrum(spectrum) = build("spectrum48", &roms) else {
+        let Hardware::Spectrum(spectrum) = build("spectrum48", &roms).hardware else {
             panic!("spectrum48 is built as a CPC");
         };
         let machine = spectrum.machine();
@@ -366,6 +632,25 @@ mod tests {
         // SAFETY: as for a CPC's ROMs, at the Spectrum's size.
         let rom = unsafe { std::slice::from_raw_parts(machine.rom, SPECTRUM_ROM_SIZE as usize) };
         assert_eq!(rom, roms.contents("spectrum48.rom"));
+    }
+
+    // NIST's worked examples of SHA-256, its "One Block Message Sample" and
+    // "Two Block Message Sample":
+    // https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/SHA256.pdf
+    #[test]
+    fn a_file_is_named_by_its_sha256() {
+        assert_eq!(
+            FileRead::of(Path::new("one block"), b"abc").sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            FileRead::of(
+                Path::new("two blocks"),
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )
+            .sha256,
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
     }
 
     #[test]
@@ -377,7 +662,7 @@ mod tests {
     #[test]
     fn missing_firmware_says_where_it_was_looked_for_and_how_to_fetch_it() {
         let roms = Roms::new(&[("cpc6128.rom", 0x8000, 0x61)]);
-        let Err(problem) = named("cpc6128").expect("the 6128").parts(&roms.0) else {
+        let Err(problem) = named("cpc6128").expect("the 6128").parts(&roms.0, None) else {
             panic!("the 6128 is built without AMSDOS");
         };
         assert!(
@@ -394,7 +679,7 @@ mod tests {
     #[test]
     fn firmware_of_another_size_is_refused() {
         let roms = Roms::new(&[("spectrum48.rom", 0x8000, 0x48)]);
-        let Err(problem) = named("spectrum48").expect("the 48").parts(&roms.0) else {
+        let Err(problem) = named("spectrum48").expect("the 48").parts(&roms.0, None) else {
             panic!("a 32K Spectrum ROM is taken");
         };
         assert_eq!(

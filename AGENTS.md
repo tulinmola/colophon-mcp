@@ -31,7 +31,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 
 ## Tools
 
-- A tool is added the day someone needs it and not before. The first stand machines up, list them and put them away, run them by the frame and step them by the instruction, stop them where they are told, type at them, read and set anything they hold by its path, read and write their memory and disassemble it, show their picture, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
+- A tool is added the day someone needs it and not before. The first stand machines up, from power-on or from a snapshot, list them and put them away, run them by the frame and step them by the instruction, read and set anything they hold by its path, read and write their memory, stop them where they are told and gather what they do on the way, call their routines, show their picture and read their memory as one, disassemble it, type at them, give them their discs and tapes, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
 - A tool's description is the reference for it, as a header is for the core, and a page never restates a schema.
 - A tool speaks in the machine's terms. A field keeps the name its header gives it.
 - A tool that succeeds answers with a JSON object, and the same JSON as text beside it: the older revisions take no other structured answer, and the protocol asks for the text. One that fails answers with text alone, saying what would have worked.

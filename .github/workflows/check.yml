@@ -33,6 +33,10 @@ jobs:
 
       - run: make check
 
+      - run: make test-sanitized
+
+      - run: make test-firmware
+
       # The Inspector is a client this repository did not write.
       - uses: actions/setup-node@v5
         with:

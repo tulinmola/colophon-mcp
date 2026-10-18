@@ -35,7 +35,11 @@ inspect() {
 
 for era in legacy modern; do
   tools=$(inspect --method tools/list --strict) || fail "$era: tools/list exited $?"
-  for tool in machine_close machine_list machine_open; do
+  # A warning carries a schema to fewer clients as surely as an error.
+  case $tools in
+  *'"schemaFindings"'*) fail "$era: tool schemas would not carry to every client: $tools" ;;
+  esac
+  for tool in inspect machine_close machine_list machine_open peek poke run set step; do
     case $tools in
     *"\"name\":\"$tool\""*) ;;
     *) fail "$era: $tool is not listed: $tools" ;;
@@ -45,7 +49,7 @@ for era in legacy modern; do
   opened=$(inspect --method tools/call --tool-name machine_open --tool-arg machine=spectrum48) ||
     fail "$era: machine_open exited $?"
   case $opened in
-  *'"structuredContent":{"handle":"spectrum48-1","machine":"spectrum48"}'*) ;;
+  *'"structuredContent":{"handle":"spectrum48-1","machine":"spectrum48","files":[{"path":'*) ;;
   *) fail "$era: machine_open answered $opened" ;;
   esac
 
@@ -54,5 +58,10 @@ for era in legacy modern; do
     >/dev/null 2>&1 || status=$?
   # Each run is a server of its own, so the handle is one it never gave.
   [ "$status" -eq 5 ] || fail "$era: closing a handle never given exited $status"
+
+  status=0
+  inspect --method tools/call --tool-name run --tool-arg handle=spectrum48-1 frames=1 \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 5 ] || fail "$era: running a handle never given exited $status"
 done
 echo "inspector: both eras pass"
