@@ -277,7 +277,7 @@ impl Machine {
             Board::Cpc { .. } => {
                 "a CPC opens an SNA snapshot of version 1, 2 or 3 holding no more RAM than it \
                  has, in the dump that follows its header: 128K on a cpc6128, 64K on a cpc664 \
-                 or a cpc464"
+                 or a cpc464, which have no PAL and take only RAM configuration 0"
             }
             Board::Spectrum { .. } => "a spectrum48 opens a 48K .sna snapshot of 49179 bytes",
         }
@@ -310,19 +310,6 @@ impl Parts {
             };
             loaded.map_err(|problem| {
                 format!("{} {problem}; {}", path.display(), machine.snapshots())
-            })?;
-            // The core loads a snapshot's RAM configuration whatever RAM the
-            // machine has, and a 64K CPC has no banks for the others.
-            let checked = match &hardware {
-                Hardware::Cpc(cpc) => cpc.check(cpc.machine()),
-                Hardware::Spectrum(spectrum) => spectrum.check(spectrum.machine()),
-            };
-            checked.map_err(|problem| {
-                format!(
-                    "{} loads a machine the emulator cannot run: {problem}; {}",
-                    path.display(),
-                    machine.snapshots()
-                )
             })?;
         }
         Ok(Built { hardware, tick: 0 })

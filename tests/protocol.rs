@@ -1907,7 +1907,7 @@ fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
     let mut session = Session::start(&roms);
     let cpc_takes = "a CPC opens an SNA snapshot of version 1, 2 or 3 holding no more RAM than it \
                      has, in the dump that follows its header: 128K on a cpc6128, 64K on a \
-                     cpc664 or a cpc464";
+                     cpc664 or a cpc464, which have no PAL and take only RAM configuration 0";
     let not_a_snapshot = roms.write("notes.sna", b"nothing to see");
     assert_eq!(
         session.refusal(
@@ -1963,9 +1963,7 @@ fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
             json!({ "machine": "cpc464", "snapshot": configured })
         ),
         format!(
-            "{} loads a machine the emulator cannot run: mmr selects a RAM configuration, and a \
-             machine of 64K has configuration 0 alone: &C0, or any value whose lowest three bits \
-             are 0; {cpc_takes}",
+            "{} needs a PAL this machine does not have; {cpc_takes}",
             configured.display()
         )
     );
