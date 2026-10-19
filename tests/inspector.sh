@@ -39,7 +39,7 @@ for era in legacy modern; do
   case $tools in
   *'"schemaFindings"'*) fail "$era: tool schemas would not carry to every client: $tools" ;;
   esac
-  for tool in inspect machine_close machine_list machine_open peek poke run set step; do
+  for tool in call inspect machine_close machine_list machine_open peek poke run set step; do
     case $tools in
     *"\"name\":\"$tool\""*) ;;
     *) fail "$era: $tool is not listed: $tools" ;;

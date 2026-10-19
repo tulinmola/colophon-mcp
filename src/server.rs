@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
-use crate::machine::Run;
-use crate::machines::{self, Built, FileRead, MACHINES, Machine};
+use crate::machine::{Condition, EXECUTE, IN, Match, OUT, READ, Run, WRITE};
+use crate::machines::{self, Built, FileRead, MACHINES, Machine, Watched};
 
 // Each is spoken by a test; those before 2026-07-28 open with initialize.
 static REVISIONS: [ProtocolVersion; 3] = [
@@ -26,7 +26,7 @@ static REVISIONS: [ProtocolVersion; 3] = [
     ProtocolVersion::V_2026_07_28,
 ];
 
-// How far one call may run a machine: half a minute of either machine's time,
+// How far one request may run a machine: half a minute of either machine's time,
 // a minute if its frames never come. 1500 of a CPC's standard frames ran in
 // about 6 seconds where this was written, inside the 60 seconds a client of
 // the protocol's TypeScript SDK waits for an answer by default:
@@ -39,6 +39,11 @@ const MOST_INSTRUCTIONS: u32 = 100_000;
 // 8192 hexadecimal digits, well under the 10000 tokens of an answer at which
 // Claude Code warns: https://code.claude.com/docs/en/mcp
 const MOST_BYTES: u16 = 4096;
+// A match takes some 80 characters, so these come to about as many as
+// MOST_BYTES does.
+const MOST_GATHERED: u32 = 128;
+// Each is weighed against every access a run makes.
+const MOST_CONDITIONS: usize = 16;
 
 // A machine holds raw pointers, a CPC's into itself, so it is not Send, and
 // the server must be. Each is built on a thread of its own, never leaves it,
@@ -153,9 +158,13 @@ fn values_schema(_: &mut SchemaGenerator) -> Schema {
         .expect("an object is a schema")
 }
 
-// An argument that may be left out is not one that may be null, and a type
-// that admits null does not carry to every client.
+// An argument that may be left out is not one that may be null, or one whose
+// default is null, and a type that admits null does not carry to every
+// client.
 fn absent_not_null(schema: &mut Schema) {
+    if schema.get("default") == Some(&Value::Null) {
+        schema.remove("default");
+    }
     if let Some(Value::Array(types)) = schema.get_mut("type") {
         types.retain(|kind| kind != "null");
         if let [only] = types.as_slice() {
@@ -168,13 +177,31 @@ fn absent_not_null(schema: &mut Schema) {
 const ADDRESS_FORMS: &str = "an address is a number from 0 to 65535, or hexadecimal from &0000 to \
                              &FFFF, written with &, #, $ or 0x before it";
 
-fn address_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({
+fn address_value() -> Value {
+    json!({
         "anyOf": [
             { "type": "integer", "minimum": 0, "maximum": 65535 },
             { "type": "string", "pattern": "^(&|#|\\$|0x|0X)[0-9A-Fa-f]{1,4}$" },
         ]
     })
+}
+
+// An address, kept once in a tool's $defs and named from wherever it is
+// taken.
+struct AddressForms;
+
+impl JsonSchema for AddressForms {
+    fn schema_name() -> Cow<'static, str> {
+        "Address".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        Schema::try_from(address_value()).expect("an object is a schema")
+    }
+}
+
+fn address_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<AddressForms>()
 }
 
 fn address(value: &Value) -> Result<u16, String> {
@@ -193,6 +220,145 @@ fn address(value: &Value) -> Result<u16, String> {
         })
         .and_then(|digits| u16::from_str_radix(digits, 16).ok())
         .ok_or_else(|| format!("{value} is no address; {ADDRESS_FORMS}"))
+}
+
+const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
+                               {\"write\": address}, each with \"to\" and the last address if it \
+                               is a range, or {\"in\": port, \"mask\": bits} or {\"out\": port, \
+                               \"mask\": bits}, the mask being the bits of the port's address that \
+                               its device decodes";
+
+// A condition, kept once in a tool's $defs, as until and gather both take
+// lists of them.
+struct ConditionForms;
+
+impl JsonSchema for ConditionForms {
+    fn schema_name() -> Cow<'static, str> {
+        "Condition".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let address = generator.subschema_for::<AddressForms>().to_value();
+        let condition = |kind: &str, other: &str, required: &[&str]| {
+            json!({
+                "type": "object",
+                "properties": { kind: address, other: address },
+                "required": required,
+                "additionalProperties": false,
+            })
+        };
+        let branches = [
+            condition("execute", "to", &["execute"]),
+            condition("read", "to", &["read"]),
+            condition("write", "to", &["write"]),
+            condition("in", "mask", &["in", "mask"]),
+            condition("out", "mask", &["out", "mask"]),
+        ];
+        Schema::try_from(json!({ "oneOf": branches })).expect("an object is a schema")
+    }
+}
+
+fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "array",
+        "maxItems": MOST_CONDITIONS,
+        "items": generator.subschema_for::<ConditionForms>(),
+    })
+}
+
+fn condition(value: &Value, stops: bool) -> Result<Condition, String> {
+    let fields = value
+        .as_object()
+        .ok_or_else(|| format!("{value} is not an object"))?;
+    let kinds = [
+        ("execute", EXECUTE),
+        ("read", READ),
+        ("write", WRITE),
+        ("in", IN),
+        ("out", OUT),
+    ];
+    let named: Vec<_> = kinds
+        .iter()
+        .filter(|(name, _)| fields.contains_key(*name))
+        .collect();
+    let &[&(name, kind)] = named.as_slice() else {
+        let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
+        return Err(match names.split_last() {
+            None => format!("{value} names no kind"),
+            Some((last, rest)) => format!(
+                "{value} names {} and {last}, and a condition names one",
+                rest.join(", ")
+            ),
+        });
+    };
+    let first = address(&fields[name]).map_err(|problem| format!("{name} {problem}"))?;
+    let port = kind == IN || kind == OUT;
+    let other = if port { "mask" } else { "to" };
+    if let Some(unknown) = fields.keys().find(|key| *key != name && *key != other) {
+        return Err(format!("{value} has {unknown}, which {name} does not take"));
+    }
+    let (last, mask) = if port {
+        let mask = fields
+            .get("mask")
+            .ok_or_else(|| format!("{value} has no mask"))?;
+        let mask = address(mask).map_err(|problem| format!("mask {problem}"))?;
+        (first, mask)
+    } else {
+        let last = fields
+            .get("to")
+            .map(|to| address(to).map_err(|problem| format!("to {problem}")))
+            .transpose()?
+            .unwrap_or(first);
+        if last < first {
+            return Err(format!(
+                "{value} runs back from &{first:04X} to &{last:04X}, and a range runs upward"
+            ));
+        }
+        (last, 0)
+    };
+    Ok(Condition {
+        kind,
+        first,
+        last,
+        mask,
+        stops,
+    })
+}
+
+// The conditions of until or of gather, added to those of the other.
+fn conditions(
+    field: &str,
+    listed: Option<&Value>,
+    stops: bool,
+    into: &mut Vec<Condition>,
+) -> Result<(), String> {
+    let Some(listed) = listed else {
+        return Ok(());
+    };
+    let listed = listed.as_array().ok_or_else(|| {
+        format!(
+            "{field} is a list of conditions, as [{{\"execute\": \"&0038\"}}]; {CONDITION_FORMS}"
+        )
+    })?;
+    if listed.len() > MOST_CONDITIONS {
+        return Err(format!(
+            "{field} has {} conditions, and takes at most {MOST_CONDITIONS}",
+            listed.len()
+        ));
+    }
+    for (index, value) in listed.iter().enumerate() {
+        let condition = condition(value, stops)
+            .map_err(|problem| format!("{field}[{index}]: {problem}; {CONDITION_FORMS}"))?;
+        into.push(condition);
+    }
+    Ok(())
+}
+
+fn watched_for(until: Option<&Value>, gather: Option<&Value>) -> Result<Vec<Condition>, String> {
+    let mut watched = Vec::new();
+    conditions("until", until, true, &mut watched)?;
+    conditions("gather", gather, false, &mut watched)?;
+    Ok(watched)
 }
 
 fn hexadecimal(bytes: &[u8]) -> String {
@@ -252,6 +418,45 @@ struct RunRequest {
     #[schemars(range(min = 1))]
     #[schemars(transform = absent_not_null)]
     ticks: Option<i64>,
+    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    until: Option<Value>,
+    /// Conditions whose matches are gathered as the run goes, written as until's are. The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    gather: Option<Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CallRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// Where the routine begins.
+    #[schemars(schema_with = "address_schema")]
+    address: Value,
+    /// Values to write first, by their paths, as set writes them: {"cpu.a": 1, "cpu.h": 64, "cpu.l": 0}.
+    #[schemars(schema_with = "values_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    values: Option<Map<String, Value>>,
+    /// How many times the monitor may retrace before the call stops waiting for the routine to return, from 1 to 1500; 1500 if not given.
+    #[schemars(range(min = 1, max = MOST_FRAMES))]
+    #[schemars(transform = absent_not_null)]
+    frames: Option<i64>,
+    /// Conditions that stop the call at their first match, written as run's until takes them. The routine's first instruction is never stopped before. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    until: Option<Value>,
+    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    gather: Option<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -354,6 +559,69 @@ enum Stopped {
     Instructions,
     /// An instruction did not end in the longest any instruction takes, as a chain of prefixes does not, and the machine stands inside it.
     Unsettled,
+    /// A condition of until matched.
+    Matched,
+    /// The gathering came to 128 matches, and holds the rest of the instruction that made the 128th as well, and of the response to an interrupt taken at its end.
+    Full,
+    /// The routine called returned.
+    Returned,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Matched {
+    /// The machine's tick: as an instruction is about to begin, or once the tick that put an access on the bus has run.
+    tick: u64,
+    /// An instruction about to begin, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    execute: Option<u16>,
+    /// A byte the program read as data, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    read: Option<u16>,
+    /// A byte the processor wrote, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    write: Option<u16>,
+    /// A port the processor read, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    r#in: Option<u16>,
+    /// A port the processor wrote, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    out: Option<u16>,
+    /// The byte read or written; for a port read, the byte the processor took.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    value: Option<u8>,
+    /// Where the instruction that made the access begins; not given for an instruction about to begin, whose address is its own, or when the response to an interrupt made the access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc: Option<u16>,
+    /// The monitor's beam across its line, as monitor.beam_x counts it, in samples: a line's picture is monitor.width of them, and the count runs on past it until a sync ends the line.
+    beam_x: u16,
+    /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines, of which monitor.height make a frame.
+    beam_y: u16,
+}
+
+impl Matched {
+    fn of(seen: &Match) -> Matched {
+        let at = |kind| (seen.kind == kind).then_some(seen.address);
+        let access = seen.kind != EXECUTE;
+        Matched {
+            tick: seen.tick,
+            execute: at(EXECUTE),
+            read: at(READ),
+            write: at(WRITE),
+            r#in: at(IN),
+            out: at(OUT),
+            value: access.then_some(seen.value),
+            pc: (access && !seen.response).then_some(seen.pc),
+            beam_x: seen.beam_x,
+            beam_y: seen.beam_y,
+        }
+    }
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -366,6 +634,14 @@ struct Ran {
     pc: u16,
     /// Why the run ended.
     stopped: Stopped,
+    /// What matched the conditions of until as the run stopped: the matching accesses of the instruction it stopped after, with those of an interrupt's response taken at its end, and the instruction it then stands before, if that matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    matched: Option<Vec<Matched>>,
+    /// What matched the conditions of gather, in the order it happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    gathered: Option<Vec<Matched>>,
 }
 
 impl Ran {
@@ -379,7 +655,33 @@ impl Ran {
             run,
             tick: machine.tick(),
             pc: machine.pc(),
+            matched: None,
+            gathered: None,
         }
+    }
+
+    // What the run's watch saw, and why it stopped the run if it did.
+    fn watched(mut self, watched: &Watched, gathering: bool) -> Ran {
+        if self.run.settled {
+            if watched.returned {
+                self.stopped = Stopped::Returned;
+            } else if watched.matched {
+                self.stopped = Stopped::Matched;
+            } else if watched.full {
+                self.stopped = Stopped::Full;
+            }
+        }
+        let listed = |chosen: fn(&Match) -> bool| {
+            watched
+                .matches
+                .iter()
+                .filter(|seen| chosen(seen))
+                .map(Matched::of)
+                .collect()
+        };
+        self.matched = watched.matched.then(|| listed(|seen| seen.stops));
+        self.gathered = gathering.then(|| listed(|seen| seen.gathers));
+        self
     }
 }
 
@@ -620,7 +922,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool and step moves a machine, and the same calls on the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One call runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A call is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step and call moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, and gather lists what matches its conditions on the way; each match says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -630,6 +932,8 @@ impl Server {
     async fn run(&self, Parameters(request): Parameters<RunRequest>) -> Result<Json<Ran>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
         let most_ticks = u64::from(MOST_FRAMES) * machine.standard_frame();
+        let conditions = watched_for(request.until.as_ref(), request.gather.as_ref())?;
+        let gathering = request.gather.is_some();
         let ran = match (request.frames, request.ticks) {
             (Some(frames), None) => {
                 let frames = u32::try_from(frames)
@@ -643,13 +947,13 @@ impl Server {
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
-                    let run = built.run(frames, limit);
+                    let (run, watched) = built.run(frames, limit, &conditions, MOST_GATHERED);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
                     } else {
                         Stopped::Limit
                     };
-                    Ran::of(run, built, stopped)
+                    Ran::of(run, built, stopped).watched(&watched, gathering)
                 })
                 .await?
             }
@@ -666,8 +970,8 @@ impl Server {
                         )
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
-                    let run = built.run(u32::MAX, ticks);
-                    Ran::of(run, built, Stopped::Ticks)
+                    let (run, watched) = built.run(u32::MAX, ticks, &conditions, MOST_GATHERED);
+                    Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering)
                 })
                 .await?
             }
@@ -682,7 +986,48 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Step a machine by its instructions. Each instruction is run to its end, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a step can land in an interrupt's handler. A processor halted on HALT idles on fetches that run nothing, and each of those is an instruction here. A chain of prefixes is no instruction until it ends, so a step caught in one long enough stops there, unsettled. One call runs at most 100000 instructions, and is not taken back, as a run is not. The answer is a run's.
+    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn call(
+        &self,
+        Parameters(request): Parameters<CallRequest>,
+    ) -> Result<Json<Ran>, String> {
+        let address = address(&request.address)?;
+        let frames = request.frames.unwrap_or(i64::from(MOST_FRAMES));
+        let frames = u32::try_from(frames)
+            .ok()
+            .filter(|frames| (1..=MOST_FRAMES).contains(frames))
+            .ok_or_else(|| {
+                format!(
+                    "frames is {frames}, and a call waits from 1 to {MOST_FRAMES} frames; run \
+                     again to carry the routine further"
+                )
+            })?;
+        let conditions = watched_for(request.until.as_ref(), request.gather.as_ref())?;
+        let gathering = request.gather.is_some();
+        let values = request.values.unwrap_or_default();
+        let (machine, orders) = self.thread(&request.handle)?;
+        let limit = 2 * u64::from(frames) * machine.standard_frame();
+        let ran = Server::ask(&request.handle, orders, move |built| {
+            let (run, watched) =
+                built.call(address, &values, frames, limit, &conditions, MOST_GATHERED)?;
+            let stopped = if run.frames >= frames {
+                Stopped::Frames
+            } else {
+                Stopped::Limit
+            };
+            Ok::<_, String>(Ran::of(run, built, stopped).watched(&watched, gathering))
+        })
+        .await??;
+        Ok(Json(ran))
+    }
+
+    /// Step a machine by its instructions. Each instruction is run to its end, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a step can land in an interrupt's handler. A processor halted on HALT idles on fetches that run nothing, and each of those is an instruction here. A chain of prefixes is no instruction until it ends, so a step caught in one long enough stops there, unsettled. One request runs at most 100000 instructions, and is not taken back, as a run's is not. The answer is a run's.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,

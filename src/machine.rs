@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::CStr;
+use std::marker::PhantomData;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
 use std::sync::{PoisonError, RwLock};
@@ -8,13 +9,62 @@ use crate::emulator::{
     CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, SPECTRUM_FRAMEBUFFER_HEIGHT,
     SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE,
     cpc_connect_monitor, cpc_fit_disc_interface, cpc_init, cpc_peek, cpc_poke, cpc_remap,
-    cpc_set_upper_rom, cpc_snapshot_load, cpc_t, mcp_cpc_check, mcp_cpc_run, mcp_cpc_step,
-    mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step,
-    spectrum_connect_monitor, spectrum_init, spectrum_peek, spectrum_poke, spectrum_snapshot_load,
-    spectrum_t,
+    cpc_set_upper_rom, cpc_snapshot_load, cpc_t, mcp_cpc_call, mcp_cpc_check, mcp_cpc_run,
+    mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek,
+    mcp_spectrum_step, mcp_watch_t, spectrum_connect_monitor, spectrum_init, spectrum_peek,
+    spectrum_poke, spectrum_snapshot_load, spectrum_t,
 };
 
-pub use crate::emulator::mcp_run_t as Run;
+pub use crate::emulator::{
+    mcp_condition_t as Condition, mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN,
+    mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE,
+    mcp_match_t as Match, mcp_run_t as Run,
+};
+
+// A watch holds the conditions and the room for matches it is given as
+// pointers, so it borrows both for as long as it lives, and the bridge never
+// reaches past either.
+pub struct Watch<'a> {
+    watch: mcp_watch_t,
+    _borrowed: PhantomData<(&'a [Condition], &'a mut [Match])>,
+}
+
+impl<'a> Watch<'a> {
+    pub fn new(
+        conditions: &'a [Condition],
+        matches: &'a mut [Match],
+        most_gathered: u32,
+    ) -> Watch<'a> {
+        // SAFETY: bindgen renders a watch as integers, bools and pointers,
+        // and all-zero bytes are a value of each.
+        let mut watch: mcp_watch_t = unsafe { std::mem::zeroed() };
+        watch.conditions = conditions.as_ptr();
+        watch.condition_count = u32::try_from(conditions.len()).expect("a few conditions");
+        watch.matches = matches.as_mut_ptr();
+        watch.room = u32::try_from(matches.len()).expect("room for a few thousand matches");
+        watch.most_gathered = most_gathered;
+        Watch {
+            watch,
+            _borrowed: PhantomData,
+        }
+    }
+
+    // The run stops once the processor stands at pc with its stack at sp.
+    pub fn returning_to(&mut self, pc: u16, sp: u16) {
+        self.watch.calling = true;
+        self.watch.return_pc = pc;
+        self.watch.return_sp = sp;
+    }
+
+    pub fn seen(&self) -> &mcp_watch_t {
+        &self.watch
+    }
+}
+
+// A run watches only when given a watch.
+fn watching(watch: Option<&mut Watch>) -> *mut mcp_watch_t {
+    watch.map_or(std::ptr::null_mut(), |watch| &raw mut watch.watch)
+}
 
 // Every CPC reads one buffer of the core's own for an empty upper ROM socket,
 // and each cpc_init fills it, so no CPC is built while another is built or
@@ -113,10 +163,23 @@ impl Cpc {
         unsafe { cpc_fit_disc_interface(self.machine.as_ptr(), fitted) };
     }
 
-    pub fn run(&mut self, frames: u32, limit: u64) -> Run {
+    pub fn run(&mut self, frames: u32, limit: u64, watch: Option<&mut Watch>) -> Run {
         let _running = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: the machine and what it was handed stand where they were.
-        unsafe { mcp_cpc_run(self.machine.as_ptr(), frames, limit) }
+        // SAFETY: the machine and what it was handed stand where they were,
+        // and a watch borrows its conditions and its room for matches, which
+        // are as long as it says, for as long as it lives.
+        unsafe { mcp_cpc_run(self.machine.as_ptr(), frames, limit, watching(watch)) }
+    }
+
+    pub fn call(&mut self, address: u16) -> Result<(), String> {
+        // SAFETY: the bridge pushes through write_page, which cpc_remap points
+        // only into the RAM the machine was handed.
+        let sentence = unsafe { mcp_cpc_call(self.machine.as_ptr(), address) };
+        if sentence.is_null() {
+            Ok(())
+        } else {
+            Err(problem(sentence))
+        }
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {
@@ -222,9 +285,20 @@ impl Spectrum {
         }
     }
 
-    pub fn run(&mut self, frames: u32, limit: u64) -> Run {
-        // SAFETY: the machine and what it was handed stand where they were.
-        unsafe { mcp_spectrum_run(self.machine.as_ptr(), frames, limit) }
+    pub fn run(&mut self, frames: u32, limit: u64, watch: Option<&mut Watch>) -> Run {
+        // SAFETY: as for a CPC's run.
+        unsafe { mcp_spectrum_run(self.machine.as_ptr(), frames, limit, watching(watch)) }
+    }
+
+    pub fn call(&mut self, address: u16) -> Result<(), String> {
+        // SAFETY: the bridge pushes through spectrum_poke, which writes only to
+        // the RAM the machine was handed.
+        let sentence = unsafe { mcp_spectrum_call(self.machine.as_ptr(), address) };
+        if sentence.is_null() {
+            Ok(())
+        } else {
+            Err(problem(sentence))
+        }
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {
@@ -300,13 +374,16 @@ mod tests {
 
     const DI: u8 = 0xF3;
     const EI: u8 = 0xFB;
+    const RET: u8 = 0xC9;
     const EX_SP_IX: [u8; 2] = [0xDD, 0xE3];
     const HALT: u8 = 0x76;
     const IM_1: [u8; 2] = [0xED, 0x56];
     const INC_BC: u8 = 0x03;
     const JR: u8 = 0x18;
     const LD_A: u8 = 0x3E;
+    const LD_AT_HL_A: u8 = 0x77;
     const LD_BC: u8 = 0x01;
+    const LD_HL: u8 = 0x21;
     const LD_I_A: [u8; 2] = [0xED, 0x47];
     const NOP: u8 = 0x00;
     const OUT_C_C: [u8; 2] = [0xED, 0x49];
@@ -371,7 +448,7 @@ mod tests {
     // standing just after a retrace.
     fn cpc_on_the_standard_screen() -> Cpc {
         let mut cpc = Cpc::new(sixty_four_k(), rom(&standard_screen(), HALT));
-        assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS).frames, 2);
+        assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None).frames, 2);
         cpc
     }
 
@@ -385,7 +462,7 @@ mod tests {
         program.extend(code);
         let mut cpc = Cpc::new(sixty_four_k(), rom(&program, fill));
         for _instruction in 0..1 + 4 * STANDARD_SCREEN.len() {
-            let step = cpc.run(1, 1);
+            let step = cpc.run(1, 1, None);
             assert!(step.frames == 0 && step.ticks < 64, "a step ran {step:?}");
         }
         assert_eq!(cpc.machine().cpu.pc, start);
@@ -394,7 +471,7 @@ mod tests {
 
     fn spectrum_after_a_retrace() -> Spectrum {
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[DI], HALT));
-        assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS).frames, 2);
+        assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 2);
         spectrum
     }
 
@@ -404,7 +481,7 @@ mod tests {
     fn a_cpc_run_by_the_frame_stops_at_each_retrace() {
         let mut cpc = cpc_on_the_standard_screen();
         for _ in 0..3 {
-            let run = cpc.run(1, 2 * CPC_STANDARD_FRAME_TICKS);
+            let run = cpc.run(1, 2 * CPC_STANDARD_FRAME_TICKS, None);
             assert_eq!(
                 (run.ticks, run.frames, run.settled),
                 (CPC_STANDARD_FRAME_TICKS, 1, true)
@@ -417,7 +494,7 @@ mod tests {
     fn a_spectrum_run_by_the_frame_stops_at_each_retrace() {
         let mut spectrum = spectrum_after_a_retrace();
         for _ in 0..3 {
-            let run = spectrum.run(1, 2 * SPECTRUM_FRAME_TICKS);
+            let run = spectrum.run(1, 2 * SPECTRUM_FRAME_TICKS, None);
             assert_eq!(
                 (run.ticks, run.frames, run.settled),
                 (SPECTRUM_FRAME_TICKS, 1, true)
@@ -431,11 +508,11 @@ mod tests {
     #[test]
     fn a_cpc_run_cut_short_misses_no_retrace() {
         let mut cpc = cpc_on_the_standard_screen();
-        let half = cpc.run(2, CPC_STANDARD_FRAME_TICKS / 2);
+        let half = cpc.run(2, CPC_STANDARD_FRAME_TICKS / 2, None);
         assert_eq!(half.frames, 0);
         let (mut ticks, mut frames) = (half.ticks, 0);
         while ticks < 3 * CPC_STANDARD_FRAME_TICKS {
-            let run = cpc.run(1, 1);
+            let run = cpc.run(1, 1, None);
             ticks += run.ticks;
             frames += run.frames;
         }
@@ -445,11 +522,11 @@ mod tests {
     #[test]
     fn a_spectrum_run_cut_short_misses_no_retrace() {
         let mut spectrum = spectrum_after_a_retrace();
-        let half = spectrum.run(2, SPECTRUM_FRAME_TICKS / 2);
+        let half = spectrum.run(2, SPECTRUM_FRAME_TICKS / 2, None);
         assert_eq!(half.frames, 0);
         let (mut ticks, mut frames) = (half.ticks, 0);
         while ticks < 3 * SPECTRUM_FRAME_TICKS {
-            let run = spectrum.run(1, 1);
+            let run = spectrum.run(1, 1, None);
             ticks += run.ticks;
             frames += run.frames;
         }
@@ -465,16 +542,16 @@ mod tests {
     fn a_spectrum_stopped_by_its_limit_finishes_the_instruction() {
         let program = [LD_BC, 0x34, 0x12, EX_SP_IX[0], EX_SP_IX[1]];
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&program, HALT));
-        let nothing = spectrum.run(1, 0);
+        let nothing = spectrum.run(1, 0, None);
         assert_eq!(
             (nothing.ticks, nothing.frames, nothing.settled),
             (0, 0, true)
         );
-        let load = spectrum.run(1, 1);
+        let load = spectrum.run(1, 1, None);
         assert_eq!((load.ticks, load.frames, load.settled), (10, 0, true));
         let processor = &spectrum.machine().cpu;
         assert_eq!((processor.b, processor.c, processor.pc), (0x12, 0x34, 3));
-        let exchange = spectrum.run(1, 1);
+        let exchange = spectrum.run(1, 1, None);
         assert_eq!(
             (exchange.ticks, exchange.frames, exchange.settled),
             (23, 0, true)
@@ -489,19 +566,19 @@ mod tests {
     fn a_cpc_stopped_by_its_limit_finishes_the_instruction() {
         let code = [LD_BC, 0x34, 0x12, EX_SP_IX[0], EX_SP_IX[1]];
         let (mut cpc, start) = cpc_past_the_standard_screen(&code, HALT);
-        let nothing = cpc.run(1, 0);
+        let nothing = cpc.run(1, 0, None);
         assert_eq!(
             (nothing.ticks, nothing.frames, nothing.settled),
             (0, 0, true)
         );
-        let load = cpc.run(1, 1);
+        let load = cpc.run(1, 1, None);
         assert_eq!((load.frames, load.settled), (0, true));
         let processor = &cpc.machine().cpu;
         assert_eq!(
             (processor.b, processor.c, processor.pc),
             (0x12, 0x34, start + 3)
         );
-        let exchange = cpc.run(1, 1);
+        let exchange = cpc.run(1, 1, None);
         assert_eq!((exchange.frames, exchange.settled), (0, true));
         assert_eq!(cpc.machine().cpu.pc, start + 5);
     }
@@ -518,12 +595,12 @@ mod tests {
         let program = [DI, LD_A, 0x40, LD_I_A[0], LD_I_A[1], INC_BC, JR, 0xFD];
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&program, HALT));
         for _setting_up in 0..3 {
-            spectrum.run(1, 1);
+            spectrum.run(1, 1, None);
         }
         let mut ticks = 0;
         let mut charged = 0;
         while ticks < 2 * SPECTRUM_FRAME_TICKS {
-            let run = spectrum.run(1, 1);
+            let run = spectrum.run(1, 1, None);
             // SAFETY: no run is under way.
             let settled = unsafe { spectrum_instruction_complete(spectrum.machine.as_ptr()) };
             assert!(
@@ -543,13 +620,13 @@ mod tests {
     #[test]
     fn a_cpc_caught_in_a_chain_of_prefixes_ends_unsettled() {
         let (mut cpc, _) = cpc_past_the_standard_screen(&[], PREFIX_DD);
-        assert!(!cpc.run(1, 1).settled);
+        assert!(!cpc.run(1, 1, None).settled);
     }
 
     #[test]
     fn a_spectrum_caught_in_a_chain_of_prefixes_ends_unsettled() {
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[], PREFIX_DD));
-        assert!(!spectrum.run(1, 1).settled);
+        assert!(!spectrum.run(1, 1, None).settled);
     }
 
     // LD BC,nn takes 10 T-states, EX (SP),IX 23 and NOP 4 (UM0080), from the
@@ -655,15 +732,97 @@ mod tests {
         assert!(!cpc.step(3).settled);
     }
 
+    // A program polls VSYNC on the PPI's port B, at &F5xx, with IN A,(C), and
+    // writes what it read. A CPC holds IN r,(C) over several ticks and answers
+    // it again on each, and VSYNC can change among them; each port read
+    // gathered gives the byte the processor took, which the write after it
+    // shows.
+    #[test]
+    fn a_port_read_gathered_gives_the_byte_the_processor_took() {
+        let polling = [
+            LD_BC, 0x00, 0xF5, LD_HL, 0x00, 0x40, IN_A_C[0], IN_A_C[1], LD_AT_HL_A, NOP, NOP, JR,
+            0xF9,
+        ];
+        let (mut cpc, _) = cpc_past_the_standard_screen(&polling, HALT);
+        let gathering =
+            [(IN, 0xF500, 0x0800), (WRITE, 0x4000, 0)].map(|(kind, first, mask)| Condition {
+                kind,
+                first,
+                last: first,
+                mask,
+                stops: false,
+            });
+        // SAFETY: all-zero bytes are a value of every field of a match.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 400_000];
+        let mut watch = Watch::new(&gathering, &mut matches, u32::MAX);
+        cpc.run(60, 120 * CPC_STANDARD_FRAME_TICKS, Some(&mut watch));
+        let count = watch.seen().match_count as usize;
+        assert!(count < matches.len(), "{count} matches");
+        let (mut pairs, mut changes, mut previous) = (0, 0, None);
+        for pair in matches[..count].chunks(2) {
+            let [read, written] = pair else { break };
+            assert_eq!((read.kind, written.kind), (IN, WRITE));
+            assert_eq!(read.value, written.value, "at tick {}", read.tick);
+            changes += usize::from(previous.is_some_and(|value| value != read.value));
+            previous = Some(read.value);
+            pairs += 1;
+        }
+        assert!(
+            pairs > 100_000 && changes > 100,
+            "{pairs} reads, {changes} changes"
+        );
+    }
+
+    // A gathering that fills at the end of an instruction the processor takes
+    // an interrupt at keeps the response's two pushes as well, and the run
+    // stops where every run stops, at the handler's first fetch. From &0100
+    // on, every instruction is LD (HL),A, so an interrupt is taken at the end
+    // of a write; the first run finds which, and its twin fills there.
+    #[test]
+    fn a_full_gathering_keeps_the_response_to_an_interrupt_taken_as_it_fills() {
+        let mut program = vec![LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, IM_1[0], IM_1[1], EI];
+        program.extend([JP, 0x00, 0x01]);
+        program.resize(0x38, NOP);
+        program.extend([EI, RET]);
+        let writes = [Condition {
+            kind: WRITE,
+            first: 0x7FFE,
+            last: 0x9000,
+            mask: 0,
+            stops: false,
+        }];
+        // SAFETY: all-zero bytes are a value of every field of a match.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 100_000];
+        let mut finding = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
+        let mut watch = Watch::new(&writes, &mut matches, u32::MAX);
+        finding.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
+        let count = watch.seen().match_count as usize;
+        let followed = matches[..count]
+            .iter()
+            .position(|seen| seen.address != 0x9000)
+            .expect("an interrupt's push");
+        assert!(followed > 0 && matches[followed + 1].response);
+        let mut filling = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
+        let mut watch = Watch::new(&writes, &mut matches, followed as u32);
+        let run = filling.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
+        let seen = *watch.seen();
+        assert!(seen.full && run.settled);
+        assert_eq!(seen.match_count as usize, followed + 2);
+        assert_eq!(filling.machine().cpu.pc, 0x0038);
+    }
+
     // Every value set could write, swept across machines kept busy with every
     // chip the core trusts a field of, under the sanitizers: whatever the
     // check lets through must run without reading or writing out of bounds.
     // Run by `make test-sanitized`, where the core is built with
     // AddressSanitizer and UBSan's bounds checks; elsewhere it shows only that
-    // nothing crashes outright.
-    const EXTREMES: [u64; 17] = [
+    // nothing crashes outright. 4 is the step at which z80.c begins a memory
+    // read, which z80_reading_operand answers from the cycle's place in the
+    // micro-program.
+    const EXTREMES: [u64; 18] = [
         0,
         1,
+        4,
         7,
         8,
         9,
@@ -862,8 +1021,8 @@ mod tests {
         // beside.
         unsafe { cpc_insert_disc(cpc.machine_mut(), 0, &mut *disc.floppy) };
         if !before_any_command {
-            cpc.run(3, 8 * CPC_STANDARD_FRAME_TICKS);
-            cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS * 3 / 4);
+            cpc.run(3, 8 * CPC_STANDARD_FRAME_TICKS, None);
+            cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS * 3 / 4, None);
         }
         while cpc.machine().cpu.pc != looped {
             cpc.step(1);
@@ -872,11 +1031,31 @@ mod tests {
         cpc
     }
 
+    // Runs with a watch on every instruction, every access and every port,
+    // gathering without end into room for a few, and answers whether the
+    // run saw more than there was room for, which are counted and never kept.
+    // The room is on the heap, where AddressSanitizer sees past its end.
+    fn watching_everything(run: impl FnOnce(Option<&mut Watch>) -> Run) -> bool {
+        let conditions = [EXECUTE, READ, WRITE, IN, OUT].map(|kind| Condition {
+            kind,
+            first: 0,
+            last: 0xFFFF,
+            mask: 0,
+            stops: false,
+        });
+        // SAFETY: all-zero bytes are a value of every field of a match.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
+        let mut watch = Watch::new(&conditions, &mut matches, u32::MAX);
+        run(Some(&mut watch));
+        watch.seen().match_count > watch.seen().room
+    }
+
     fn sweep_cpc(cpc: &mut Cpc, contexts: &[(&str, &[(&str, Value)])]) -> (usize, usize) {
         // SAFETY: as in sweep.
         let standing = unsafe { std::ptr::read(cpc.machine()) };
         let trials = trials(&standing.encode(), contexts);
-        sweep(&standing, &trials, |written| {
+        let mut overflowed = 0;
+        let (ran, checked_out) = sweep(&standing, &trials, |written| {
             // SAFETY: as in sweep; restored into the machine it was taken from.
             *cpc.machine_mut() = unsafe { std::ptr::read(&standing) };
             let Some(written) = written else { return false };
@@ -885,9 +1064,13 @@ mod tests {
             }
             *cpc.machine_mut() = written;
             cpc.remap();
-            cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 2);
+            if watching_everything(|watch| cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 2, watch)) {
+                overflowed += 1;
+            }
             true
-        })
+        });
+        assert!(overflowed > ran / 2, "{overflowed} of {ran} overflowed");
+        (ran, checked_out)
     }
 
     #[test]
@@ -939,11 +1122,12 @@ mod tests {
         for size in [SPECTRUM_RAM_16K, SPECTRUM_RAM_48K] {
             let ram = vec![0; size as usize].into_boxed_slice();
             let mut spectrum = Spectrum::new(ram, rom(&spectrum_workload(), HALT));
-            spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS);
-            spectrum.run(u32::MAX, SPECTRUM_FRAME_TICKS * 3 / 4);
+            spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+            spectrum.run(u32::MAX, SPECTRUM_FRAME_TICKS * 3 / 4, None);
             // SAFETY: as in sweep.
             let standing = unsafe { std::ptr::read(spectrum.machine()) };
             let trials = trials(&standing.encode(), &[("", &[])]);
+            let mut overflowed = 0;
             let (ran, checked_out) = sweep(&standing, &trials, |written| {
                 // SAFETY: as for a CPC.
                 *spectrum.machine_mut() = unsafe { std::ptr::read(&standing) };
@@ -953,9 +1137,17 @@ mod tests {
                 }
                 *spectrum.machine_mut() = written;
                 spectrum.seek();
-                spectrum.run(u32::MAX, SPECTRUM_FRAME_TICKS / 2);
+                if watching_everything(|watch| {
+                    spectrum.run(u32::MAX, SPECTRUM_FRAME_TICKS / 2, watch)
+                }) {
+                    overflowed += 1;
+                }
                 true
             });
+            assert!(
+                overflowed > ran / 2,
+                "{size}: {overflowed} of {ran} overflowed"
+            );
             assert!(
                 ran > 1000 && checked_out > 50,
                 "{size}: {ran} ran, {checked_out} checked out"
@@ -1082,6 +1274,49 @@ mod tests {
             let spectrum = Spectrum::new(ram, rom(&[], HALT));
             assert_eq!(spectrum.machine().ram_size, size);
             assert_eq!(spectrum.machine().ram, spectrum._ram.as_ptr().cast());
+        }
+    }
+
+    // A return address the processor would not read back where it was pushed
+    // is refused, and the processor left as it stood, whichever of its two
+    // bytes would not: pushed under a CPC's lower or upper ROM, into a
+    // Spectrum's ROM, or past a 16K Spectrum's RAM, which ends at &7FFF.
+    #[test]
+    fn a_call_is_refused_where_its_return_address_would_not_read_back() {
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI], HALT));
+        let standing = cpc.machine().cpu;
+        for (sp, called) in [
+            (0x4002, true),
+            (0x4001, false),
+            (0xC000, true),
+            (0xC001, false),
+        ] {
+            cpc.machine_mut().cpu = standing;
+            cpc.machine_mut().cpu.sp = sp;
+            assert_eq!(cpc.call(0x0100).is_ok(), called, "&{sp:04X}");
+            let cpu = cpc.machine().cpu;
+            assert_eq!(
+                (cpu.pc, cpu.sp),
+                if called { (0x0100, sp - 2) } else { (0, sp) }
+            );
+        }
+        let sixteen_k = vec![0; SPECTRUM_RAM_16K as usize].into_boxed_slice();
+        let mut spectrum = Spectrum::new(sixteen_k, rom(&[DI], HALT));
+        let standing = spectrum.machine().cpu;
+        for (sp, called) in [
+            (0x4002, true),
+            (0x4001, false),
+            (0x8000, true),
+            (0x8001, false),
+        ] {
+            spectrum.machine_mut().cpu = standing;
+            spectrum.machine_mut().cpu.sp = sp;
+            assert_eq!(spectrum.call(0x0100).is_ok(), called, "&{sp:04X}");
+            let cpu = spectrum.machine().cpu;
+            assert_eq!(
+                (cpu.pc, cpu.sp),
+                if called { (0x0100, sp - 2) } else { (0, sp) }
+            );
         }
     }
 

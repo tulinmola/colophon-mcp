@@ -9,10 +9,10 @@ use sha2::{Digest, Sha256};
 
 use crate::emulator::{
     CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE,
-    SPECTRUM_TICKS_PER_FRAME,
+    SPECTRUM_TICKS_PER_FRAME, cpc_t, spectrum_t, z80_t,
 };
 use crate::fields::{self, Fields, Segment};
-use crate::machine::{Cpc, Run, Spectrum};
+use crate::machine::{Condition, Cpc, Match, Run, Spectrum, Watch};
 
 // Named and wired as the emulator's command line names and wires them, in
 // its order: its machines table, and the sockets run_cpc fills, in cli/main.c
@@ -316,6 +316,28 @@ impl Parts {
     }
 }
 
+// What a run saw, when it watched: every match, in the order it happened,
+// its tick counted from the machine's start.
+pub struct Watched {
+    pub matches: Vec<Match>,
+    pub matched: bool,
+    pub full: bool,
+    pub returned: bool,
+}
+
+// Past the match that fills a gathering, a run sees out the instruction under
+// way, which makes four accesses at most (EX (SP),IX), then the response to
+// an interrupt taken at its end, four more (in mode 2), and the instruction it
+// stops before.
+const ROOM_PAST_FULL: u32 = 9;
+
+// The machine as it stood, put back when a call is refused after its values
+// were written.
+enum Kept {
+    Cpc(Box<cpc_t>),
+    Spectrum(Box<spectrum_t>),
+}
+
 // Every write is made to a copy, so that a value refused leaves the machine
 // as it stood.
 fn written<T: Fields>(
@@ -346,13 +368,137 @@ impl Built {
         }
     }
 
-    pub fn run(&mut self, frames: u32, limit: u64) -> Run {
+    fn cpu(&self) -> &z80_t {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => &cpc.machine().cpu,
+            Hardware::Spectrum(spectrum) => &spectrum.machine().cpu,
+        }
+    }
+
+    fn cpu_mut(&mut self) -> &mut z80_t {
+        match &mut self.hardware {
+            Hardware::Cpc(cpc) => &mut cpc.machine_mut().cpu,
+            Hardware::Spectrum(spectrum) => &mut spectrum.machine_mut().cpu,
+        }
+    }
+
+    // A run watches for the conditions given, gathering up to most_gathered
+    // matches, and a call's for its return as well.
+    pub fn run(
+        &mut self,
+        frames: u32,
+        limit: u64,
+        conditions: &[Condition],
+        most_gathered: u32,
+    ) -> (Run, Watched) {
+        self.watched(frames, limit, conditions, most_gathered, None)
+    }
+
+    fn watched(
+        &mut self,
+        frames: u32,
+        limit: u64,
+        conditions: &[Condition],
+        most_gathered: u32,
+        returning: Option<(u16, u16)>,
+    ) -> (Run, Watched) {
+        // A gathering that may hold nothing fills at its first match.
+        let room = most_gathered.max(1).saturating_add(ROOM_PAST_FULL);
+        // SAFETY: bindgen renders a match as integers and bools, and all-zero
+        // bytes are a value of each.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
+        let mut watch = Watch::new(conditions, &mut matches, most_gathered);
+        if let Some((pc, sp)) = returning {
+            watch.returning_to(pc, sp);
+        }
+        let watching = !conditions.is_empty() || returning.is_some();
         let run = match &mut self.hardware {
-            Hardware::Cpc(cpc) => cpc.run(frames, limit),
-            Hardware::Spectrum(spectrum) => spectrum.run(frames, limit),
+            Hardware::Cpc(cpc) => cpc.run(frames, limit, watching.then_some(&mut watch)),
+            Hardware::Spectrum(spectrum) => {
+                spectrum.run(frames, limit, watching.then_some(&mut watch))
+            }
         };
+        let watch = *watch.seen();
+        assert!(
+            watch.match_count <= room,
+            "a run saw {} matches, past the {room} there was room for",
+            watch.match_count
+        );
+        matches.truncate(watch.match_count as usize);
+        for seen in &mut matches {
+            seen.tick += self.tick;
+        }
         self.tick += run.ticks;
-        run
+        let watched = Watched {
+            matches,
+            matched: watch.matched,
+            full: watch.full,
+            returned: watch.returned,
+        };
+        (run, watched)
+    }
+
+    // Writes the values, as set does, then calls the routine and runs until
+    // it returns. A processor halted on HALT is woken for the routine, and
+    // halted again once it has returned.
+    pub fn call(
+        &mut self,
+        address: u16,
+        values: &Map<String, Value>,
+        frames: u32,
+        limit: u64,
+        conditions: &[Condition],
+        most_gathered: u32,
+    ) -> Result<(Run, Watched), String> {
+        let kept = (!values.is_empty()).then(|| self.keep());
+        if !values.is_empty() {
+            self.set(values)?;
+        }
+        let (pc, sp, halted) = {
+            let cpu = self.cpu();
+            (cpu.pc, cpu.sp, cpu.halted)
+        };
+        let called = match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.call(address),
+            Hardware::Spectrum(spectrum) => spectrum.call(address),
+        };
+        if let Err(problem) = called {
+            if let Some(kept) = kept {
+                self.restore(kept);
+            }
+            return Err(format!("cannot call &{address:04X}: {problem}"));
+        }
+        self.cpu_mut().halted = false;
+        let (run, watched) = self.watched(frames, limit, conditions, most_gathered, Some((pc, sp)));
+        if watched.returned {
+            self.cpu_mut().halted = halted;
+        }
+        Ok((run, watched))
+    }
+
+    fn keep(&self) -> Kept {
+        // SAFETY: as in written(): a copy of a machine's bytes owns nothing,
+        // and is moved back over the machine or dropped.
+        match &self.hardware {
+            Hardware::Cpc(cpc) => Kept::Cpc(Box::new(unsafe { std::ptr::read(cpc.machine()) })),
+            Hardware::Spectrum(spectrum) => {
+                Kept::Spectrum(Box::new(unsafe { std::ptr::read(spectrum.machine()) }))
+            }
+        }
+    }
+
+    fn restore(&mut self, kept: Kept) {
+        match (&mut self.hardware, kept) {
+            (Hardware::Cpc(cpc), Kept::Cpc(kept)) => {
+                *cpc.machine_mut() = *kept;
+                cpc.remap();
+            }
+            (Hardware::Spectrum(spectrum), Kept::Spectrum(kept)) => {
+                *spectrum.machine_mut() = *kept;
+                spectrum.seek();
+            }
+            _ => unreachable!("a machine is kept as the machine it is"),
+        }
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {

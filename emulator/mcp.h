@@ -25,6 +25,91 @@ typedef struct {
   bool settled;
 } mcp_run_t;
 
+/* What a condition watches for. */
+typedef enum {
+  /* An instruction beginning at an address in the range, matched before it
+     begins. A halted processor's idle fetches begin none. */
+  MCP_EXECUTE,
+  /* The program reading a byte of memory in the range as data. The bytes of
+     an instruction are not data: its opcodes carry M1, and its operands are
+     told apart by z80_reading_operand. */
+  MCP_READ,
+  /* The processor writing a byte of memory in the range. */
+  MCP_WRITE,
+  /* The processor reading a port whose address agrees with `first` on the
+     bits of `mask`. */
+  MCP_IN,
+  /* The processor writing such a port. */
+  MCP_OUT,
+} mcp_kind_t;
+
+typedef struct {
+  mcp_kind_t kind;
+  /* The first address of the range, or the port. */
+  uint16_t first;
+  /* The last address of the range. */
+  uint16_t last;
+  /* The bits of a port's address that its device decodes. */
+  uint16_t mask;
+  /* Whether a match stops the run rather than being gathered. */
+  bool stops;
+} mcp_condition_t;
+
+typedef struct {
+  /* The ticks into the run: before an instruction begins, or once the tick
+     that put an access on the bus has run. */
+  uint64_t tick;
+  mcp_kind_t kind;
+  /* The address, or the port. */
+  uint16_t address;
+  /* The byte read or written, a port's as the processor took it; 0 for an
+     instruction. */
+  uint8_t value;
+  /* Where the instruction that made an access begins, unless the response to
+     an interrupt made it. */
+  uint16_t pc;
+  bool response;
+  uint16_t beam_x;
+  uint16_t beam_y;
+  /* Whether it matched a condition that stops the run, and one that
+     gathers. */
+  bool stops;
+  bool gathers;
+} mcp_match_t;
+
+/* What a run watches for and what it saw. The caller sets what comes before
+ * match_count and zeroes the rest; the run keeps the rest. */
+typedef struct {
+  const mcp_condition_t *conditions;
+  uint32_t condition_count;
+  /* Where the matches are kept, in the order they happened. */
+  mcp_match_t *matches;
+  uint32_t room;
+  /* The run stops at the end of the instruction that gathers this many. */
+  uint32_t most_gathered;
+  /* A call stops the run once the processor stands at return_pc with its
+     stack at return_sp, where the routine's own return leaves it. */
+  bool calling;
+  uint16_t return_pc;
+  uint16_t return_sp;
+
+  /* Every match, which may be more than there is room for. */
+  uint32_t match_count;
+  uint32_t gathered;
+  /* Why the run stopped, if the watch stopped it. */
+  bool matched;
+  bool full;
+  bool returned;
+
+  /* The run's own reckoning, from one tick to the next. */
+  bool begun;
+  bool responding;
+  uint16_t pc;
+  /* A port read matched and kept, and still on the bus: which match it is. */
+  bool port_read_held;
+  uint32_t port_read_match;
+} mcp_watch_t;
+
 /* Run until the monitor has retraced this many times or the limit in ticks
  * is reached, then on to the end of the instruction standing there, and
  * through the response to an interrupt taken at its end, to the first fetch
@@ -34,9 +119,25 @@ typedef struct {
  * programmed to make, and may never end, so there is always a limit. The end
  * of the instruction is waited for only as long as the core's own finishing
  * waits for it, so a chain of prefixes longer than that leaves the run
- * unsettled. */
-mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit);
-mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit);
+ * unsettled.
+ *
+ * A watch, if given, stops the run sooner: before an instruction a stopping
+ * condition matches, at the end of the instruction whose access matched one,
+ * at the end of the instruction whose match fills the gathering, or once a
+ * call has returned; the ends are reached as the run's own end is. The
+ * instruction a run begins on is matched only as it begins, since the run
+ * that stopped before it has matched it already. */
+mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch);
+mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
+                           mcp_watch_t *watch);
+
+/* Call the routine at this address: push the program counter, as the
+ * processor's CALL does, and jump. NULL if called, or a sentence saying why
+ * not, the machine left as it stood: the processor is inside an instruction,
+ * or the two bytes pushed would not read back where the routine's own return
+ * reads them. */
+const char *mcp_cpc_call(cpc_t *cpc, uint16_t address);
+const char *mcp_spectrum_call(spectrum_t *spectrum, uint16_t address);
 
 /* Run this many instructions, each as a run limited to one tick: on to its
  * end and through the response to an interrupt taken there. A halted

@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 9] = [
+const TOOLS: [&str; 10] = [
+    "call",
     "inspect",
     "machine_close",
     "machine_list",
@@ -984,19 +985,44 @@ fn an_unknown_tool_is_a_protocol_error_and_unfit_arguments_a_tool_error() {
 }
 
 // Programs the tests write, in the Z80's own bytes.
+const ADD_A_B: u8 = 0x80;
 const DI: u8 = 0xF3;
+const EI: u8 = 0xFB;
 const EX_SP_IX: [u8; 2] = [0xDD, 0xE3];
 const HALT: u8 = 0x76;
+const IM_1: [u8; 2] = [0xED, 0x56];
+const IN_A_N: u8 = 0xDB;
+const INC_A: u8 = 0x3C;
+const DEC_BC: u8 = 0x0B;
 const INC_BC: u8 = 0x03;
 const INC_HL: u8 = 0x23;
 const INC_AT_HL: u8 = 0x34;
+const INC_L: u8 = 0x2C;
 const JR: u8 = 0x18;
+const JR_NZ: u8 = 0x20;
 const LD_A: u8 = 0x3E;
+const LD_A_AT_HL: u8 = 0x7E;
+const LD_A_B: u8 = 0x78;
+const LD_A_FROM: u8 = 0x3A;
+const LD_AT_HL: u8 = 0x36;
+const LD_AT_HL_A: u8 = 0x77;
 const LD_BC: u8 = 0x01;
 const LD_HL: u8 = 0x21;
+const LD_HL_TO: u8 = 0x22;
 const LD_I_A: [u8; 2] = [0xED, 0x47];
+const LD_SP: u8 = 0x31;
+const LD_TO_A: u8 = 0x32;
 const NOP: u8 = 0x00;
+const OUT_C_A: [u8; 2] = [0xED, 0x79];
+const OUT_C_C: [u8; 2] = [0xED, 0x49];
+const OR_C: u8 = 0xB1;
+const OUT_N_A: u8 = 0xD3;
+const POP_AF: u8 = 0xF1;
+const POP_DE: u8 = 0xD1;
 const PREFIX_DD: u8 = 0xDD;
+const PUSH_AF: u8 = 0xF5;
+const PUSH_HL: u8 = 0xE5;
+const RET: u8 = 0xC9;
 
 // A standard frame is 312 lines of 64µs, "exactly 19968 μsec" (ch. 4.1), and
 // the Gate Array "clocks the Z80A at 4 MHz" (ch. 4.4.4): "The Amstrad CPC
@@ -1979,6 +2005,687 @@ fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
     assert!(session.handles().is_empty());
 }
 
+// What a run or a call answered it matched or gathered, each as its kind, its
+// address or port, its byte and where the instruction that made it begins.
+fn seen(list: &Value) -> Vec<(&'static str, u64, Option<u64>, Option<u64>)> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|seen| {
+            let kind = ["execute", "read", "write", "in", "out"]
+                .into_iter()
+                .find(|kind| seen.get(*kind).is_some())
+                .expect("a kind");
+            let address = seen[kind].as_u64().expect("an address");
+            (kind, address, seen["value"].as_u64(), seen["pc"].as_u64())
+        })
+        .collect()
+}
+
+// Writes from &0000 on, whose places the expected matches name: LD (HL),n at
+// &0007, PUSH HL at &0009, high byte first, and LD (nn),HL at &000A, low byte
+// first (Z80 CPU User Manual, UM0080).
+const WRITING: [u8; 14] = [
+    DI, LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, LD_AT_HL, 0xAA, PUSH_HL, LD_HL_TO, 0x10, 0x90, HALT,
+];
+
+#[test]
+fn a_write_names_the_instruction_that_made_it() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &WRITING);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let gathering = json!([
+            { "write": "&7FFE", "to": "&7FFF" },
+            { "write": "&9000", "to": "&90FF" },
+        ]);
+        let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+        assert_eq!(ran["stopped"], "ticks", "{ran}");
+        assert_eq!(
+            seen(&ran["gathered"]),
+            [
+                ("write", 0x9000, Some(0xAA), Some(0x0007)),
+                ("write", 0x7FFF, Some(0x90), Some(0x0009)),
+                ("write", 0x7FFE, Some(0x00), Some(0x0009)),
+                ("write", 0x9010, Some(0x00), Some(0x000A)),
+                ("write", 0x9011, Some(0x90), Some(0x000A)),
+            ],
+            "{machine}: {ran}"
+        );
+        let ticks: Vec<u64> = ran["gathered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seen| seen["tick"].as_u64().unwrap())
+            .collect();
+        assert!(
+            ticks.is_sorted() && ticks[4] <= ran["tick"].as_u64().unwrap(),
+            "{ran}"
+        );
+        for seen in ran["gathered"].as_array().unwrap() {
+            assert!(seen["beam_x"].is_u64() && seen["beam_y"].is_u64(), "{seen}");
+        }
+        // Stopped by a write, the machine stands at the end of the
+        // instruction that made it; what it gathered on the way is listed
+        // apart from what stopped it.
+        let twin = session.open(machine);
+        let until = json!([{ "write": "&9010" }]);
+        let gathering = json!([{ "write": "&9000" }]);
+        let stopped = session.run(
+            &twin,
+            json!({ "ticks": 200, "until": until, "gather": gathering }),
+        );
+        assert_eq!(
+            (&stopped["stopped"], &stopped["pc"]),
+            (&json!("matched"), &json!(0x000D)),
+            "{machine}: {stopped}"
+        );
+        assert_eq!(
+            seen(&stopped["matched"]),
+            [("write", 0x9010, Some(0x00), Some(0x000A))],
+            "{machine}: {stopped}"
+        );
+        assert_eq!(
+            seen(&stopped["gathered"]),
+            [("write", 0x9000, Some(0xAA), Some(0x0007))],
+            "{machine}: {stopped}"
+        );
+    }
+}
+
+// LD A,n's n and LD A,(nn)'s nn are the instruction's own bytes; LD A,(nn) at
+// &0002 reads the first byte of its own nn, &0003, as data, and the byte it
+// gives is that one, 3, and not the 0 fetched just before it.
+#[test]
+fn an_instructions_own_bytes_are_not_read_as_data() {
+    let program = [LD_A, 0x05, LD_A_FROM, 0x03, 0x00, HALT];
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &program);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let gathering = json!([{ "read": 0, "to": 255 }]);
+        let ran = session.run(&handle, json!({ "ticks": 100, "gather": gathering }));
+        assert_eq!(
+            seen(&ran["gathered"]),
+            [("read", 0x0003, Some(0x03), Some(0x0002))],
+            "{machine}: {ran}"
+        );
+    }
+}
+
+// From &9000 on, round again incrementing the byte at HL and HL itself; the
+// loop begins at &0004.
+const COUNTING_FROM_9000: [u8; 8] = [DI, LD_HL, 0x00, 0x90, INC_AT_HL, INC_HL, JR, 0xFC];
+
+// A run that begins where it was stopped makes one pass of the loop, INC
+// (HL), INC HL and JR, before it stops again: 11, 6 and 12 T-states from a
+// Spectrum's ROM, where nothing is contended (UM0080). A CPC's board holds
+// its instructions to whole microseconds, and where on its four-tick grid
+// one ends moves with the instruction stopped after, so its pass is told by
+// the byte it counts.
+#[test]
+fn a_run_stopped_before_an_instruction_runs_it_first_when_it_runs_on() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &COUNTING_FROM_9000);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let until = json!([{ "execute": "&0004" }]);
+        let first = session.run(&handle, json!({ "ticks": 10000, "until": until }));
+        assert_eq!(
+            (&first["stopped"], &first["pc"]),
+            (&json!("matched"), &json!(4)),
+            "{machine}: {first}"
+        );
+        assert_eq!(
+            seen(&first["matched"]),
+            [("execute", 4, None, None)],
+            "{machine}: {first}"
+        );
+        assert_eq!(
+            first["matched"][0]["tick"], first["tick"],
+            "{machine}: {first}"
+        );
+        assert_eq!(session.peek(&handle, json!("&9000"), 1), "00", "{machine}");
+        let second = session.run(&handle, json!({ "ticks": 10000, "until": until }));
+        assert_eq!(second["stopped"], "matched", "{machine}: {second}");
+        if machine == "spectrum48" {
+            assert_eq!(second["ticks"], 11 + 6 + 12, "{second}");
+        }
+        assert_eq!(
+            seen(&second["matched"]),
+            [("execute", 4, None, None)],
+            "{machine}: {second}"
+        );
+        assert_eq!(
+            session.peek(&handle, json!("&9000"), 2),
+            "0100",
+            "{machine}"
+        );
+    }
+}
+
+// Each pass reads a byte as data and writes it back one more, sends it to a
+// port, and pushes and pops HL, through a stack at &8000; the pass begins at
+// &000A, and the instruction at &000D sends the byte.
+fn passing(port: u16) -> Vec<u8> {
+    let [low, high] = port.to_le_bytes();
+    vec![
+        DI, LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, LD_BC, low, high, LD_A_AT_HL, INC_A, LD_AT_HL_A,
+        OUT_C_A[0], OUT_C_A[1], INC_L, PUSH_HL, POP_DE, JR, 0xF6,
+    ]
+}
+
+// A run stopped at each match in turn, and its twin gathering over the same
+// ticks, see the same matches. The instruction the last stop stands before
+// has not begun, so the gathering, which ends there too, has not seen it.
+#[test]
+fn gathering_a_stretch_is_stopping_at_every_match_across_it() {
+    for (file, machine, port) in [
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            json!({ "out": "&7F00", "mask": "&C000" }),
+        ),
+        (
+            "spectrum48.rom",
+            "spectrum48",
+            json!({ "out": "&FE", "mask": "&01" }),
+        ),
+    ] {
+        let port_address = if machine == "cpc6128" { 0x7F00 } else { 0x00FE };
+        let roms = Roms::programmed(file, &passing(port_address));
+        let mut session = Session::start(&roms);
+        let conditions = json!([
+            { "execute": "&000D" },
+            { "read": "&9000", "to": "&90FF" },
+            { "write": "&9000", "to": "&90FF" },
+            { "write": "&7FFE", "to": "&7FFF" },
+            port,
+        ]);
+        let stopping = session.open(machine);
+        let mut stops = Vec::new();
+        let mut ticks = 0;
+        for _ in 0..40 {
+            let stopped = session.run(&stopping, json!({ "ticks": 10000, "until": conditions }));
+            assert_eq!(stopped["stopped"], "matched", "{machine}: {stopped}");
+            ticks = stopped["tick"].as_u64().unwrap();
+            stops.extend(stopped["matched"].as_array().unwrap().iter().cloned());
+        }
+        let last = stops
+            .iter()
+            .rposition(|seen| seen.get("execute").is_none() || seen["tick"] != ticks)
+            .unwrap();
+        stops.truncate(last + 1);
+        let gathering = session.open(machine);
+        let gathered = session.run(&gathering, json!({ "ticks": ticks, "gather": conditions }));
+        assert_eq!(gathered["tick"], ticks, "{machine}: {gathered}");
+        assert_eq!(gathered["gathered"], json!(stops), "{machine}");
+        assert!(
+            seen(&gathered["gathered"])
+                .iter()
+                .any(|(kind, _, _, _)| *kind == "out"),
+            "{machine}: {gathered}"
+        );
+    }
+}
+
+#[test]
+fn a_gathering_that_fills_stops_and_the_next_run_gathers_on() {
+    let roms = Roms::programmed("cpc6128.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let gathering = json!([{ "write": "&9000", "to": "&FFFF" }]);
+    let mut next = 0x9000;
+    for _ in 0..3 {
+        let ran = session.run(&handle, json!({ "frames": 1, "gather": gathering }));
+        assert_eq!(ran["stopped"], "full", "{ran}");
+        let writes = seen(&ran["gathered"]);
+        assert_eq!(writes.len(), 128, "{ran}");
+        for (kind, address, value, pc) in writes {
+            assert_eq!(
+                (kind, address, value, pc),
+                ("write", next, Some(1), Some(4))
+            );
+            next += 1;
+        }
+    }
+}
+
+// One byte written by LD (nn),A, and then PUSH HL over and over: the 128th
+// write is the first of a PUSH's two, and the second is kept with it.
+#[test]
+fn a_gathering_fills_at_the_end_of_the_instruction_that_filled_it() {
+    let program = [
+        DI, LD_SP, 0x00, 0x90, LD_TO_A, 0x00, 0x80, PUSH_HL, JR, 0xFD,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let gathering = json!([{ "write": "&4000", "to": "&FFFF" }]);
+    let ran = session.run(&handle, json!({ "ticks": 10000, "gather": gathering }));
+    let writes = seen(&ran["gathered"]);
+    assert_eq!(
+        (&ran["stopped"], writes.len()),
+        (&json!("full"), 129),
+        "{ran}"
+    );
+    assert_eq!(writes[127].3, writes[128].3, "{ran}");
+    assert_eq!(ran["pc"], 8, "{ran}");
+}
+
+// A CPC's Gate Array answers &7Fxx, A15 low and A14 high ("The Gate Array",
+// Grim, https://web.archive.org/web/20260710174425/https://www.grimware.org/doku.php/documentations/devices/gatearray),
+// and "Every even I/O address will address the ULA" of a Spectrum (comp.sys.sinclair
+// FAQ, 16K/48K reference, https://worldofspectrum.org/faq/reference/48kreference.htm).
+#[test]
+fn a_port_matches_on_the_bits_its_device_decodes() {
+    let cpc_program = [
+        DI, LD_BC, 0x10, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x54, 0x7E, OUT_C_C[0], OUT_C_C[1],
+        LD_BC, 0x01, 0xBC, OUT_C_C[0], OUT_C_C[1], HALT,
+    ];
+    let roms = Roms::programmed("cpc6128.rom", &cpc_program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let gathering = json!([{ "out": "&7F00", "mask": "&C000" }]);
+    let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+    assert_eq!(
+        seen(&ran["gathered"]),
+        [
+            ("out", 0x7F10, Some(0x10), Some(0x0004)),
+            ("out", 0x7E54, Some(0x54), Some(0x0009)),
+        ],
+        "{ran}"
+    );
+    let spectrum_program = [
+        DI, LD_A, 0x07, OUT_N_A, 0xFE, OUT_N_A, 0xFF, IN_A_N, 0xFE, HALT,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &spectrum_program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let gathering = json!([
+        { "out": "&FE", "mask": "&01" },
+        { "in": "&FE", "mask": "&01" },
+    ]);
+    let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+    let ports: Vec<_> = seen(&ran["gathered"])
+        .into_iter()
+        .map(|(kind, port, _, pc)| (kind, port, pc))
+        .collect();
+    assert_eq!(
+        ports,
+        [("out", 0x07FE, Some(0x0003)), ("in", 0x07FE, Some(0x0007))],
+        "{ran}"
+    );
+    // The byte read is the one IN A,(n) left in A.
+    let read = &ran["gathered"][1]["value"];
+    assert_eq!(&session.inspect(&handle, "cpu.a"), read, "{ran}");
+}
+
+// Interrupt mode 1 pushes the program counter and runs from &0038 (UM0080),
+// where the handler writes a byte with LD (HL),n, takes interrupts again and
+// returns.
+#[test]
+fn what_the_response_to_an_interrupt_writes_names_no_instruction() {
+    let mut program = vec![
+        LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, IM_1[0], IM_1[1], EI, HALT, JR,
+    ];
+    program.push(0xFD);
+    program.resize(0x38, NOP);
+    program.extend([LD_AT_HL, 0x55, EI, RET]);
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let gathering = json!([{ "write": "&7FFE", "to": "&7FFF" }, { "write": "&9000" }]);
+    let ran = session.run(&handle, json!({ "frames": 2, "gather": gathering }));
+    let writes = seen(&ran["gathered"]);
+    assert!(writes.len() >= 3 && writes.len().is_multiple_of(3), "{ran}");
+    for answered in writes.chunks(3) {
+        assert_eq!(
+            answered,
+            [
+                ("write", 0x7FFF, Some(0x00), None),
+                ("write", 0x7FFE, Some(0x0A), None),
+                ("write", 0x9000, Some(0x55), Some(0x0038)),
+            ],
+            "{ran}"
+        );
+    }
+}
+
+// A processor halted on HALT idles on NOPs until an interrupt wakes it
+// (UM0080), and none of them is an instruction the program begins.
+#[test]
+fn a_halted_processor_begins_no_instruction_while_it_idles() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &[DI, HALT]);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let gathering = json!([{ "execute": 0, "to": "&FFFF" }]);
+        let ran = session.run(&handle, json!({ "ticks": 1000, "gather": gathering }));
+        assert_eq!(
+            seen(&ran["gathered"]),
+            [("execute", 0, None, None), ("execute", 1, None, None)],
+            "{machine}: {ran}"
+        );
+        let until = json!([{ "execute": 0, "to": "&FFFF" }]);
+        let idled = session.run(&handle, json!({ "ticks": 1000, "until": until }));
+        assert_eq!(idled["stopped"], "ticks", "{machine}: {idled}");
+    }
+}
+
+// LD SP,0 and back to &0000: the machine comes to &0000 with its stack
+// pointer at 0 again and again, and only a call returns.
+#[test]
+fn only_a_call_returns() {
+    let roms = Roms::programmed("spectrum48.rom", &[LD_SP, 0x00, 0x00, JR, 0xFB]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let gathering = json!([{ "execute": 0 }]);
+    let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+    assert_eq!(ran["stopped"], "ticks", "{ran}");
+}
+
+// A routine at &0100 adds B to A and returns.
+fn routine(file: &str, program: &[u8]) -> Roms {
+    let roms = Roms::programmed(file, program);
+    roms.write_at(file, 0x0100, &[ADD_A_B, RET]);
+    roms
+}
+
+#[test]
+fn a_called_routine_returns_with_its_registers_and_leaves_the_machine_where_it_was() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = routine(file, &COUNTING_FROM_9000);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        session.step(&handle, 3);
+        let before = session.inspect(&handle, "cpu");
+        let called = session.answer(
+            "call",
+            json!({
+                "handle": handle,
+                "address": "&0100",
+                "values": { "cpu.a": 2, "cpu.b": 3, "cpu.sp": 0x8000 },
+            }),
+        );
+        assert_eq!(
+            (&called["stopped"], &called["pc"]),
+            (&json!("returned"), &before["pc"]),
+            "{machine}: {called}"
+        );
+        // ADD A,r 4 T-states and RET 10 (UM0080), from a Spectrum's ROM, where
+        // nothing is contended.
+        if machine == "spectrum48" {
+            assert_eq!(called["ticks"], 4 + 10, "{called}");
+        }
+        assert_eq!(session.inspect(&handle, "cpu.a"), 5, "{machine}");
+        assert_eq!(session.inspect(&handle, "cpu.sp"), 0x8000, "{machine}");
+        assert_eq!(
+            session.peek(&handle, json!("&7FFE"), 2),
+            "0500",
+            "{machine}"
+        );
+        // It runs on from where it stood, at INC HL.
+        let stepped = session.step(&handle, 1);
+        assert_eq!(stepped["pc"], 6, "{machine}: {stepped}");
+    }
+}
+
+// The call stands the machine at &0200, where a RET lies. The routine calls
+// &0200 itself, which returns to it, before it loads A and returns; arriving
+// at &0200 the first time, deeper in the stack, is not the call's return.
+#[test]
+fn a_call_ends_at_its_own_return_and_not_at_another_arrival_there() {
+    let roms = Roms::programmed("spectrum48.rom", &[DI, HALT]);
+    roms.write_at(
+        "spectrum48.rom",
+        0x0100,
+        &[0xCD, 0x00, 0x02, LD_A, 0x42, RET],
+    );
+    roms.write_at("spectrum48.rom", 0x0200, &[RET]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let called = session.answer(
+        "call",
+        json!({ "handle": handle, "address": 256, "values": { "cpu.pc": 512 } }),
+    );
+    assert_eq!(
+        (&called["stopped"], &called["pc"]),
+        (&json!("returned"), &json!(512)),
+        "{called}"
+    );
+    assert_eq!(session.inspect(&handle, "cpu.a"), 0x42);
+}
+
+#[test]
+fn a_processor_halted_when_called_is_halted_again_once_the_routine_returns() {
+    let roms = routine("spectrum48.rom", &[DI, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 100 }));
+    assert_eq!(session.inspect(&handle, "cpu.halted"), true);
+    let pc = session.inspect(&handle, "cpu.pc");
+    let called = session.answer(
+        "call",
+        json!({ "handle": handle, "address": 256, "values": { "cpu.a": 1, "cpu.b": 1 } }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    assert_eq!(session.inspect(&handle, "cpu.a"), 2);
+    assert_eq!(session.inspect(&handle, "cpu.halted"), true);
+    assert_eq!(session.inspect(&handle, "cpu.pc"), pc);
+}
+
+#[test]
+fn a_call_that_cannot_return_is_refused_and_changes_nothing() {
+    // A CPC stands up with its upper ROM enabled and its stack pointer at
+    // &FFFF, under it.
+    let roms = routine("cpc6128.rom", &[DI, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    assert_eq!(
+        session.inspect(&handle, "gate_array.upper_rom_enabled"),
+        true
+    );
+    assert_eq!(session.inspect(&handle, "cpu.sp"), 0xFFFF);
+    let before = session.inspect(&handle, "cpu");
+    let refusal = session.refusal(
+        "call",
+        json!({ "handle": handle, "address": "&0100", "values": { "cpu.a": 9 } }),
+    );
+    assert_eq!(
+        refusal,
+        "cannot call &0100: the return address would be pushed under a ROM, which answers the \
+         processor's reads there, and the routine's return would not read it back; give cpu.sp \
+         in values, pointing into RAM that no ROM enabled covers"
+    );
+    assert_eq!(session.inspect(&handle, "cpu"), before);
+    let roms = routine("spectrum48.rom", &[DI, LD_SP, 0x00, 0x40, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.step(&handle, 2);
+    let refusal = session.refusal("call", json!({ "handle": handle, "address": 256 }));
+    assert!(refusal.contains("pushed into the ROM"), "{refusal}");
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &[PREFIX_DD; 0x4000]);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        session.step(&handle, 1);
+        let refusal = session.refusal(
+            "call",
+            json!({ "handle": handle, "address": 256, "values": { "cpu.sp": 0x8000 } }),
+        );
+        assert_eq!(
+            refusal,
+            "cannot call &0100: the processor stands inside a chain of prefixes, and a routine \
+             is called only between instructions; step or run on to the end of the chain first",
+            "{machine}"
+        );
+    }
+}
+
+// A loop that stands at &0006 with interrupts on in mode 1, whose handler at
+// &0038 writes &55 to &9000 and keeps A; and a routine at &0100 that counts
+// BC down from &2000, three frames' worth, then writes A to &9001.
+fn waiting(file: &str) -> Roms {
+    let mut program = vec![LD_SP, 0x00, 0x80, IM_1[0], IM_1[1], EI, JR, 0xFE];
+    program.resize(0x38, NOP);
+    program.extend([PUSH_AF, LD_A, 0x55, LD_TO_A, 0x00, 0x90, POP_AF, EI, RET]);
+    let roms = Roms::programmed(file, &program);
+    let routine = [
+        LD_BC, 0x00, 0x20, DEC_BC, LD_A_B, OR_C, JR_NZ, 0xFB, LD_TO_A, 0x01, 0x90, RET,
+    ];
+    roms.write_at(file, 0x0100, &routine);
+    roms
+}
+
+#[test]
+fn a_call_runs_the_interrupts_handlers_within_it_and_gathers_what_they_do() {
+    let roms = waiting("spectrum48.rom");
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.step(&handle, 3);
+    let gathering = json!([{ "write": "&9000", "to": "&9001" }]);
+    let called = session.answer(
+        "call",
+        json!({ "handle": handle, "address": 256, "frames": 10, "gather": gathering }),
+    );
+    assert_eq!(
+        (&called["stopped"], &called["pc"]),
+        (&json!("returned"), &json!(6)),
+        "{called}"
+    );
+    let writes = seen(&called["gathered"]);
+    let (last, handled) = writes.split_last().expect("writes");
+    assert_eq!(*last, ("write", 0x9001, Some(0), Some(0x0108)), "{called}");
+    assert!(handled.len() >= 2, "{called}");
+    for write in handled {
+        assert_eq!(
+            *write,
+            ("write", 0x9000, Some(0x55), Some(0x003B)),
+            "{called}"
+        );
+    }
+}
+
+// A routine the call stopped waiting for runs on with the next run, which
+// stops at its return when until asks for the address it was called from.
+#[test]
+fn a_routine_that_has_not_returned_runs_on_with_the_next_run() {
+    let roms = waiting("spectrum48.rom");
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.step(&handle, 3);
+    let called = session.answer(
+        "call",
+        json!({ "handle": handle, "address": 256, "frames": 1 }),
+    );
+    assert_eq!(called["stopped"], "frames", "{called}");
+    let pc = called["pc"].as_u64().unwrap();
+    assert!(
+        (0x0100..0x010C).contains(&pc) || (0x0038..0x0041).contains(&pc),
+        "{called}"
+    );
+    let until = json!([{ "execute": 6 }]);
+    let ran = session.run(&handle, json!({ "frames": 10, "until": until }));
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &json!(6)),
+        "{ran}"
+    );
+    assert_eq!(session.inspect(&handle, "cpu.sp"), 0x8000);
+    assert_eq!(session.peek(&handle, json!("&9001"), 1), "00");
+}
+
+// Every argument but the handle and what to call is the agent's to leave out.
+#[test]
+fn run_and_call_ask_for_nothing_they_can_go_without() {
+    let roms = Roms::all();
+    let tools = tools(&mut Session::start(&roms));
+    assert_eq!(input_schema(&tools, "run")["required"], json!(["handle"]));
+    assert_eq!(
+        input_schema(&tools, "call")["required"],
+        json!(["handle", "address"])
+    );
+    // An argument left out has no value at all, not a null one.
+    for tool in TOOLS {
+        let properties = input_schema(&tools, tool)["properties"].clone();
+        for (name, property) in properties.as_object().into_iter().flatten() {
+            assert!(
+                property.get("default").is_none(),
+                "{tool}.{name}: {property}"
+            );
+        }
+    }
+}
+
+#[test]
+fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let refused = |session: &mut Session, condition: Value| {
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "frames": 1, "until": [{ "execute": 1 }, condition] }),
+        )
+    };
+    let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
+                 address}, each with \"to\" and the last address if it is a range, or {\"in\": \
+                 port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, the mask being the bits \
+                 of the port's address that its device decodes";
+    assert_eq!(
+        refused(&mut session, json!({ "read": 5, "out": 6 })),
+        format!(
+            "until[1]: {{\"read\":5,\"out\":6}} names read and out, and a condition names one; {forms}"
+        )
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "to": 5 })),
+        format!("until[1]: {{\"to\":5}} names no kind; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "out": "&FE", "mask": 70000 })),
+        format!(
+            "until[1]: mask 70000 is past &FFFF; an address is a number from 0 to 65535, or \
+             hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it; {forms}"
+        )
+    );
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "frames": 1, "until": { "execute": "&0038" } })
+        ),
+        format!("until is a list of conditions, as [{{\"execute\": \"&0038\"}}]; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "in": "&FE" })),
+        format!("until[1]: {{\"in\":\"&FE\"}} has no mask; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "write": 10, "to": 5 })),
+        format!(
+            "until[1]: {{\"write\":10,\"to\":5}} runs back from &000A to &0005, and a range runs \
+             upward; {forms}"
+        )
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "execute": 1, "mask": 2 })),
+        format!(
+            "until[1]: {{\"execute\":1,\"mask\":2}} has mask, which execute does not take; \
+             {forms}"
+        )
+    );
+    let many = vec![json!({ "execute": 1 }); 17];
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "ticks": 10, "gather": many })
+        ),
+        "gather has 17 conditions, and takes at most 16"
+    );
+    assert_eq!(session.inspect(&handle, "cpu.pc"), 0);
+}
+
 // What a machine was asked before machine_close is done, and answered.
 #[test]
 fn a_machine_put_away_answers_what_it_was_asked_first() {
@@ -2284,4 +2991,136 @@ fn a_spectrum_run_from_a_snapshot_stands_where_the_command_line_leaves_it() {
         expected[at] = 0;
     }
     assert_eq!(memory, expected);
+}
+
+// MASK-INT, the 48K ROM's handler of the frame's interrupt, counts the frames
+// with LD ($5C78),HL at &003E, whose instruction ends at &0041: "The lower
+// two bytes of the frame counter (FRAMES) are incremented every 20 ms" (The
+// Complete Spectrum ROM Disassembly, as SkoolKit gives it,
+// https://skoolkid.github.io/rom/asm/0038.html).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn the_spectrums_frame_count_is_written_by_its_interrupt_handler() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 150 }));
+    let frames = json!([{ "write": "&5C78", "to": "&5C79" }]);
+    let gathered = session.run(&handle, json!({ "frames": 2, "gather": frames }));
+    let writes: Vec<_> = seen(&gathered["gathered"])
+        .into_iter()
+        .map(|(kind, address, _, pc)| (kind, address, pc))
+        .collect();
+    let handler = Some(0x003E);
+    assert_eq!(
+        writes,
+        [
+            ("write", 0x5C78, handler),
+            ("write", 0x5C79, handler),
+            ("write", 0x5C78, handler),
+            ("write", 0x5C79, handler),
+        ],
+        "{gathered}"
+    );
+    let stopped = session.run(&handle, json!({ "frames": 2, "until": frames }));
+    assert_eq!(
+        (&stopped["stopped"], &stopped["pc"]),
+        (&json!("matched"), &json!(0x0041)),
+        "{stopped}"
+    );
+}
+
+// The Gate Array raises an interrupt each time R52 has counted 52 HSYNCs
+// ("The Amstrad CPC CRTC Compendium" v1.11, ch. 27.3.1,
+// https://shaker.logonsystem.eu/ACCC1.11-EN.pdf), and the firmware's standard
+// frame is 312 lines (ch. 4.1), so it holds six; in interrupt mode 1 the
+// processor takes each at &0038 (UM0080).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_takes_six_interrupts_a_frame() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "frames": 100 }));
+    let gathered = session.run(
+        &handle,
+        json!({ "frames": 10, "gather": [{ "execute": "&0038" }] }),
+    );
+    assert_eq!(gathered["stopped"], "frames", "{gathered}");
+    assert_eq!(seen(&gathered["gathered"]).len(), 60, "{gathered}");
+}
+
+// The 6845's registers are selected through &BCxx and written through &BDxx:
+// the chip answers A14 low, its RS is A8 and its R/W A9, and "register index
+// is 5bit wide" ("The CRTC", Grim, I/O ports,
+// https://web.archive.org/web/20240924035112/https://www.grimware.org/doku.php/documentations/devices/crtc).
+// What the firmware writes there first, as it starts, is its own table for a
+// 50Hz screen at &5C5 (Compendium ch. 4.1), all sixteen registers of it.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn the_firmware_writes_the_6845_its_own_table() {
+    let roms = firmware();
+    let table =
+        fs::read(roms.join("cpc6128.rom")).expect("the firmware")[0x05C5..0x05C5 + 16].to_vec();
+    let mut session = Session::reading(&roms);
+    let handle = session.open("cpc6128");
+    let crtc = json!([
+        { "out": "&BC00", "mask": "&4300" },
+        { "out": "&BD00", "mask": "&4300" },
+    ]);
+    let mut written = [None; 16];
+    let mut selected = 0;
+    loop {
+        let ran = session.run(&handle, json!({ "frames": 100, "gather": crtc }));
+        for (_, port, value, _) in seen(&ran["gathered"]) {
+            let value = value.expect("a byte");
+            if port & 0x0100 == 0 {
+                selected = usize::from(value as u8 & 0x1F);
+            } else if selected < 16 {
+                written[selected].get_or_insert(value);
+            }
+        }
+        if ran["stopped"] != "full" {
+            break;
+        }
+    }
+    let written: Vec<Option<u64>> = written[..16].to_vec();
+    let expected: Vec<Option<u64>> = table.iter().map(|&value| Some(u64::from(value))).collect();
+    assert_eq!(written, expected);
+}
+
+// PIXEL-ADD, at &22AA in the 48K ROM, "is entered with the co-ordinates of a
+// pixel in the BC register pair and returns with HL holding the address of
+// the display file byte which contains that pixel and A pointing to the
+// position of the pixel within the byte": B is the y, C the x, and A "C mod
+// 8" (The Complete Spectrum ROM Disassembly, as SkoolKit gives it,
+// https://skoolkid.github.io/rom/asm/22AA.html). Its first instructions
+// take B from 175, so y 175 is the picture's top line, whose first byte is
+// "the first byte of the screen (16384)" (comp.sys.sinclair FAQ, 16K/48K
+// reference); from &22BC to &22C6 it makes L from that line and C divided
+// by 8, so x 13 lies in the line's second byte.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_spectrum_rom_routine_called_returns_what_its_disassembly_says() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 150 }));
+    let before = session.inspect(&handle, "cpu");
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&22AA",
+            "values": { "cpu.b": 175, "cpu.c": 13 },
+        }),
+    );
+    assert_eq!(
+        (&called["stopped"], &called["pc"]),
+        (&json!("returned"), &before["pc"]),
+        "{called}"
+    );
+    let cpu = session.inspect(&handle, "cpu");
+    assert_eq!(
+        (&cpu["h"], &cpu["l"], &cpu["a"]),
+        (&json!(0x40), &json!(0x01), &json!(5))
+    );
+    assert_eq!(cpu["sp"], before["sp"]);
 }
