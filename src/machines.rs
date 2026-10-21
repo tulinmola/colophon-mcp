@@ -7,12 +7,19 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::disassembly;
 use crate::emulator::{
-    CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE,
-    SPECTRUM_TICKS_PER_FRAME, cpc_t, spectrum_t, z80_t,
+    CPC_FRAMEBUFFER_WIDTH, CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_FRAMEBUFFER_WIDTH,
+    SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE, SPECTRUM_TICKS_PER_FRAME, cpc_t,
+    spectrum_t, z80_t,
 };
 use crate::fields::{self, Fields, Segment};
-use crate::machine::{Condition, Cpc, Match, Run, Spectrum, Watch};
+use crate::machine::{
+    COUNT, COUNTS_PER_KIND, Condition, Cpc, KINDS, Kind, Match, Run, Spectrum, Watch,
+    gate_array_rgb, ula_rgb,
+};
+use crate::picture::Picture;
+use crate::screen::{self, Asked, Screen};
 
 // Named and wired as the emulator's command line names and wires them, in
 // its order: its machines table, and the sockets run_cpc fills, in cli/main.c
@@ -75,6 +82,38 @@ pub const MACHINES: &[Machine] = &[
 
 const AMSDOS: &str = "amsdos.rom";
 const CPC_ROM_SIZE: usize = 0x4000;
+
+// The window the emulator's command line crops a machine's screenshots to,
+// and whether it draws each line twice: CPC_CROP_* and SPECTRUM_CROP_* in its
+// cli/main.c, and double_lines in its machines table.
+struct Window {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    doubled: bool,
+}
+
+const CPC_WINDOW: Window = Window {
+    left: 208,
+    top: 34,
+    width: 768,
+    height: 272,
+    doubled: true,
+};
+
+const SPECTRUM_WINDOW: Window = Window {
+    left: 96,
+    top: 20,
+    width: 352,
+    height: 264,
+    doubled: false,
+};
+
+// gate_array_rgb reads a CPC's colour code by its lowest five bits, and
+// ula_rgb a Spectrum's sample by its lowest four.
+const CPC_COLOUR_CODES: u8 = 32;
+const SPECTRUM_SAMPLES: u8 = 16;
 
 pub fn named(name: &str) -> Option<&'static Machine> {
     MACHINES.iter().find(|machine| machine.name == name)
@@ -316,10 +355,28 @@ impl Parts {
     }
 }
 
+// The monitor's picture, and where its beam stands, in samples across and
+// lines down the raster.
+pub struct Shown {
+    pub picture: Picture,
+    pub beam_x: u16,
+    pub beam_y: u16,
+}
+
+// What a run watches for, and how many matches it gathers and places it
+// counts before it stops.
+pub struct Watching<'a> {
+    pub conditions: &'a [Condition],
+    pub most_gathered: u32,
+    pub most_counted: u32,
+}
+
 // What a run saw, when it watched: every match, in the order it happened,
-// its tick counted from the machine's start.
+// its tick counted from the machine's start, and every place counted, by kind
+// and then by address.
 pub struct Watched {
     pub matches: Vec<Match>,
+    pub counts: Vec<(Kind, u16, u32)>,
     pub matched: bool,
     pub full: bool,
     pub returned: bool,
@@ -382,32 +439,39 @@ impl Built {
         }
     }
 
-    // A run watches for the conditions given, gathering up to most_gathered
-    // matches, and a call's for its return as well.
-    pub fn run(
-        &mut self,
-        frames: u32,
-        limit: u64,
-        conditions: &[Condition],
-        most_gathered: u32,
-    ) -> (Run, Watched) {
-        self.watched(frames, limit, conditions, most_gathered, None)
+    // A run watches for what it is given, and a call's for its return as
+    // well.
+    pub fn run(&mut self, frames: u32, limit: u64, watching: &Watching) -> (Run, Watched) {
+        self.watched(frames, limit, watching, None)
     }
 
     fn watched(
         &mut self,
         frames: u32,
         limit: u64,
-        conditions: &[Condition],
-        most_gathered: u32,
+        watching: &Watching,
         returning: Option<(u16, u16)>,
     ) -> (Run, Watched) {
+        let conditions = watching.conditions;
         // A gathering that may hold nothing fills at its first match.
-        let room = most_gathered.max(1).saturating_add(ROOM_PAST_FULL);
+        let room = watching.most_gathered.max(1).saturating_add(ROOM_PAST_FULL);
         // SAFETY: bindgen renders a match as integers and bools, and all-zero
         // bytes are a value of each.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
-        let mut watch = Watch::new(conditions, &mut matches, most_gathered);
+        let counting = conditions.iter().any(|condition| condition.list == COUNT);
+        let size = if counting {
+            KINDS.len() * COUNTS_PER_KIND
+        } else {
+            0
+        };
+        let mut counts = vec![0; size];
+        let mut watch = Watch::new(
+            conditions,
+            &mut matches,
+            &mut counts,
+            watching.most_gathered,
+            watching.most_counted,
+        );
         if let Some((pc, sp)) = returning {
             watch.returning_to(pc, sp);
         }
@@ -429,8 +493,19 @@ impl Built {
             seen.tick += self.tick;
         }
         self.tick += run.ticks;
+        let counts = counts
+            .chunks(COUNTS_PER_KIND)
+            .zip(KINDS)
+            .flat_map(|(counts, kind)| {
+                (0..=u16::MAX)
+                    .zip(counts)
+                    .filter(|(_, count)| **count > 0)
+                    .map(move |(address, count)| (kind, address, *count))
+            })
+            .collect();
         let watched = Watched {
             matches,
+            counts,
             matched: watch.matched,
             full: watch.full,
             returned: watch.returned,
@@ -447,8 +522,7 @@ impl Built {
         values: &Map<String, Value>,
         frames: u32,
         limit: u64,
-        conditions: &[Condition],
-        most_gathered: u32,
+        watching: &Watching,
     ) -> Result<(Run, Watched), String> {
         let kept = (!values.is_empty()).then(|| self.keep());
         if !values.is_empty() {
@@ -469,7 +543,7 @@ impl Built {
             return Err(format!("cannot call &{address:04X}: {problem}"));
         }
         self.cpu_mut().halted = false;
-        let (run, watched) = self.watched(frames, limit, conditions, most_gathered, Some((pc, sp)));
+        let (run, watched) = self.watched(frames, limit, watching, Some((pc, sp)));
         if watched.returned {
             self.cpu_mut().halted = halted;
         }
@@ -555,6 +629,122 @@ impl Built {
                 }
             })
             .collect()
+    }
+
+    // The picture the monitor holds, cut to the window and drawn as the
+    // emulator's command line draws its screenshots, each pixel's index the
+    // colour the machine put on the cable.
+    pub fn monitor(&self) -> Shown {
+        let (window, framebuffer, samples_per_line, colours, rgb, monitor) = match &self.hardware {
+            Hardware::Cpc(cpc) => (
+                &CPC_WINDOW,
+                cpc.framebuffer(),
+                CPC_FRAMEBUFFER_WIDTH as usize,
+                CPC_COLOUR_CODES,
+                gate_array_rgb as fn(u8) -> u32,
+                &cpc.machine().monitor,
+            ),
+            Hardware::Spectrum(spectrum) => (
+                &SPECTRUM_WINDOW,
+                spectrum.framebuffer(),
+                SPECTRUM_FRAMEBUFFER_WIDTH as usize,
+                SPECTRUM_SAMPLES,
+                ula_rgb as fn(u8) -> u32,
+                &spectrum.machine().monitor,
+            ),
+        };
+        let repeats = if window.doubled { 2 } else { 1 };
+        let mut indices = Vec::with_capacity(window.width * window.height * repeats);
+        for line in 0..window.height {
+            let start = (window.top + line) * samples_per_line + window.left;
+            let row: Vec<u8> = framebuffer[start..start + window.width]
+                .iter()
+                .map(|sample| sample & (colours - 1))
+                .collect();
+            for _ in 0..repeats {
+                indices.extend(&row);
+            }
+        }
+        Shown {
+            picture: Picture {
+                width: window.width as u32,
+                height: (window.height * repeats) as u32,
+                indices,
+                palette: (0..colours).map(rgb).collect(),
+            },
+            beam_x: monitor.beam_x,
+            beam_y: monitor.beam_y,
+        }
+    }
+
+    // A CPC's memory read as a screen, with what was not asked for read from
+    // the machine; refused on a Spectrum.
+    pub fn screen(&self, asked: &Asked) -> Result<(Screen, Picture), String> {
+        let Hardware::Cpc(cpc) = &self.hardware else {
+            return Err(
+                "screen reads a CPC's memory as its video hardware does, and a Spectrum's \
+                 picture is read by monitor"
+                    .to_owned(),
+            );
+        };
+        let screen = screen::settle(asked, cpc.machine())?;
+        let picture = screen::draw(&screen, cpc.ram());
+        Ok((screen, picture))
+    }
+
+    fn read(&self, address: u16) -> u8 {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.peek(address),
+            Hardware::Spectrum(spectrum) => spectrum.peek(address),
+        }
+    }
+
+    // Instructions read as the processor would read them, from an address
+    // on, each with its address and its bytes: as many as were asked, or as
+    // fit in most_bytes.
+    pub fn disassemble(
+        &self,
+        address: u16,
+        instructions: u16,
+        most_bytes: usize,
+    ) -> Result<Vec<(u16, Vec<u8>, String)>, String> {
+        let read = |address| self.read(address);
+        let mut listed = Vec::new();
+        let (mut at, mut used) = (address, 0);
+        for _ in 0..instructions {
+            let Some(instruction) = disassembly::instruction(&read, at, most_bytes - used) else {
+                break;
+            };
+            if used + instruction.length > most_bytes {
+                break;
+            }
+            let bytes = (0..instruction.length as u16)
+                .map(|offset| read(at.wrapping_add(offset)))
+                .collect();
+            listed.push((at, bytes, instruction.text));
+            used += instruction.length;
+            at = at.wrapping_add(instruction.length as u16);
+        }
+        if listed.is_empty() {
+            let prefixed = (0..=u16::MAX)
+                .map(|offset| address.wrapping_add(offset))
+                .find(|at| !matches!(read(*at), 0xDD | 0xFD));
+            return Err(match prefixed {
+                Some(at) => {
+                    let last = at.wrapping_sub(1);
+                    format!(
+                        "&{address:04X} begins a chain of DD and FD prefixes that runs on to \
+                         &{last:04X}, longer than the {most_bytes} bytes a listing reads; the \
+                         last of them rules the instruction they prefix, so disassemble from \
+                         &{last:04X}"
+                    )
+                }
+                None => "memory holds nothing but DD and FD prefixes, which the processor runs as \
+                         one instruction without end; no listing reads one"
+                    .to_owned(),
+            });
+        }
+        Ok(listed)
     }
 
     pub fn poke(&mut self, address: u16, bytes: &[u8]) {

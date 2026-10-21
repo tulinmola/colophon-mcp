@@ -6,6 +6,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+base64 = "=0.22.1"
+png = "=0.18.1"
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "=1.2.3"
 serde = { version = "=1.0.229", features = ["derive"] }

@@ -46,7 +46,30 @@ test-firmware:
 	$(MAKE) -C $(EMULATOR_DIR) roms build/emulator
 	cargo test --test protocol -- --ignored
 
-test-all: test test-sanitized test-firmware test-inspector
+# The disassembly tier's evidence, which no test here wrote, each file fetched
+# at a version of its own and checked by its hash before it is used: SkoolKit,
+# https://skoolkit.ca, whose disassembler is pure Python and runs from its
+# source, and The Complete Spectrum ROM Disassembly as SkoolKit's author keeps
+# it, https://github.com/skoolkid/rom. The 48K's firmware is the emulator's.
+SKOOLKIT = https://files.pythonhosted.org/packages/source/s/skoolkit/skoolkit-10.1.tar.gz
+SKOOLKIT_SHA256 = e71f0bac2bd38de1eacbb58650e95d43082351a1e9ecb8edecb11da112d02383
+ROM_SKOOL = https://raw.githubusercontent.com/skoolkid/rom/20260409/sources/rom.skool
+ROM_SKOOL_SHA256 = 07c1eeeeb471016a4e2090110b5717b45f8310a806f61bd60986d22f1a3a2696
+SHA256SUM ?= $(shell command -v sha256sum 2>/dev/null || echo shasum -a 256)
+EVIDENCE = $${CARGO_TARGET_DIR:-target}/disassembly
+
+test-disassembly:
+	$(MAKE) -C $(EMULATOR_DIR) roms
+	mkdir -p "$(EVIDENCE)"
+	curl -sSfL -o "$(EVIDENCE)/skoolkit.tar.gz" $(SKOOLKIT)
+	curl -sSfL -o "$(EVIDENCE)/rom.skool" $(ROM_SKOOL)
+	cd "$(EVIDENCE)" && printf '%s  skoolkit.tar.gz\n%s  rom.skool\n' \
+	  $(SKOOLKIT_SHA256) $(ROM_SKOOL_SHA256) | $(SHA256SUM) -c
+	rm -rf "$(EVIDENCE)/skoolkit" && mkdir "$(EVIDENCE)/skoolkit"
+	tar -xzf "$(EVIDENCE)/skoolkit.tar.gz" -C "$(EVIDENCE)/skoolkit" --strip-components 1
+	COLOPHON_MCP_DISASSEMBLY_EVIDENCE="$(EVIDENCE)" cargo test --test disassembly -- --ignored
+
+test-all: test test-sanitized test-firmware test-disassembly test-inspector
 
 check: format-check lint test
 
@@ -62,4 +85,4 @@ lint:
 	cargo clippy --all-targets -- --deny warnings
 	$(CLANG_TIDY) $(BRIDGE_SOURCES) -- -std=c99 -Wall -Wextra -I$(EMULATOR_DIR)/src
 
-.PHONY: all test test-inspector test-sanitized test-firmware test-all check format format-check lint
+.PHONY: all test test-inspector test-sanitized test-firmware test-disassembly test-all check format format-check lint

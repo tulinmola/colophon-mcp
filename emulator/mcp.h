@@ -43,6 +43,21 @@ typedef enum {
   MCP_OUT,
 } mcp_kind_t;
 
+/* How many kinds mcp_kind_t gives, and how many places each can name: an
+   address or a port, sixteen bits of either. */
+#define MCP_KINDS 5
+#define MCP_COUNTS_PER_KIND 0x10000
+
+/* The list a condition is given in, which says what its matches do. */
+typedef enum {
+  /* A match stops the run. */
+  MCP_UNTIL,
+  /* A match is kept, in the order it happened. */
+  MCP_GATHER,
+  /* A match is counted, by its kind and its address. */
+  MCP_COUNT,
+} mcp_list_t;
+
 typedef struct {
   mcp_kind_t kind;
   /* The first address of the range, or the port. */
@@ -51,8 +66,7 @@ typedef struct {
   uint16_t last;
   /* The bits of a port's address that its device decodes. */
   uint16_t mask;
-  /* Whether a match stops the run rather than being gathered. */
-  bool stops;
+  mcp_list_t list;
 } mcp_condition_t;
 
 typedef struct {
@@ -87,6 +101,14 @@ typedef struct {
   uint32_t room;
   /* The run stops at the end of the instruction that gathers this many. */
   uint32_t most_gathered;
+  /* Where the matches of the count list are counted, from zero:
+     MCP_COUNTS_PER_KIND counts to a kind, by address, for each of the
+     MCP_KINDS kinds in the order mcp_kind_t gives them; NULL if the list is
+     empty. */
+  uint32_t *counts;
+  /* The run stops at the end of the instruction that counts at this many
+     places, a place being a kind and an address. */
+  uint32_t most_counted;
   /* A call stops the run once the processor stands at return_pc with its
      stack at return_sp, where the routine's own return leaves it. */
   bool calling;
@@ -96,6 +118,7 @@ typedef struct {
   /* Every match, which may be more than there is room for. */
   uint32_t match_count;
   uint32_t gathered;
+  uint32_t counted;
   /* Why the run stopped, if the watch stopped it. */
   bool matched;
   bool full;
@@ -123,10 +146,10 @@ typedef struct {
  *
  * A watch, if given, stops the run sooner: before an instruction a stopping
  * condition matches, at the end of the instruction whose access matched one,
- * at the end of the instruction whose match fills the gathering, or once a
- * call has returned; the ends are reached as the run's own end is. The
- * instruction a run begins on is matched only as it begins, since the run
- * that stopped before it has matched it already. */
+ * at the end of the instruction whose match fills the gathering or the
+ * count, or once a call has returned; the ends are reached as the run's own
+ * end is. The instruction a run begins on is matched only as it begins,
+ * since the run that stopped before it has matched it already. */
 mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch);
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch);

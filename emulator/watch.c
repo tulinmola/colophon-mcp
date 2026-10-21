@@ -15,17 +15,32 @@ static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t a
   return address >= condition->first && address <= condition->last;
 }
 
-/* Keeps what was seen if a condition of the kinds allowed matches it. */
+/* Counts a place matched, and fills the count at its last new place. */
+static void count(mcp_watch_t *watch, mcp_kind_t kind, uint16_t address) {
+  uint32_t *counted = &watch->counts[(uint32_t)kind * MCP_COUNTS_PER_KIND + address];
+  if (*counted == 0 && ++watch->counted >= watch->most_counted) {
+    watch->full = true;
+  }
+  (*counted)++;
+}
+
+/* Keeps what was seen if a condition of the lists allowed matches it. A
+   match is counted where it may be gathered. */
 static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp_kind_t kind,
                 uint16_t address, uint8_t value, bool may_stop, bool may_gather) {
   bool stops = false;
   bool gathers = false;
+  bool counts = false;
   for (uint32_t index = 0; index < watch->condition_count; index++) {
     const mcp_condition_t *condition = &watch->conditions[index];
     if (agrees(condition, kind, address)) {
-      stops |= condition->stops && may_stop;
-      gathers |= !condition->stops && may_gather;
+      stops |= condition->list == MCP_UNTIL && may_stop;
+      gathers |= condition->list == MCP_GATHER && may_gather;
+      counts |= condition->list == MCP_COUNT && may_gather;
     }
+  }
+  if (counts) {
+    count(watch, kind, address);
   }
   if (!stops && !gathers) {
     return;

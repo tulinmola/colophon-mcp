@@ -377,9 +377,9 @@ fn main() {
         // copied alone or with its CPC, would point at the drives of the one
         // it was copied from.
         .no_copy("(cpc_t|upd765_t|spectrum_t)")
-        .allowlist_function("(cpc|spectrum|mcp|floppy)_.*")
+        .allowlist_function("(cpc|spectrum|mcp|floppy)_.*|gate_array_rgb|ula_rgb")
         .allowlist_type("(cpc|spectrum|mcp)_.*")
-        .allowlist_var("(CPC|SPECTRUM|Z80)_.*")
+        .allowlist_var("(CPC|SPECTRUM|Z80|MCP)_.*")
         .generate()
         .expect("bindgen reads the bridge's header")
         .to_string();

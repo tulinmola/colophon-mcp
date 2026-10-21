@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 
-use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext, schema_for_output};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, JsonObject, MetaObject,
-    ProtocolVersion, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    JsonObject, MetaObject, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -16,8 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
-use crate::machine::{Condition, EXECUTE, IN, Match, OUT, READ, Run, WRITE};
-use crate::machines::{self, Built, FileRead, MACHINES, Machine, Watched};
+use crate::machine::{
+    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, READ, Run, UNTIL, WRITE,
+};
+use crate::machines::{self, Built, FileRead, MACHINES, Machine, Watched, Watching};
+use crate::picture;
+use crate::screen::{Asked, MOST_HEIGHT, MOST_RASTERS, MOST_WIDTH, Reading};
 
 // Each is spoken by a test; those before 2026-07-28 open with initialize.
 static REVISIONS: [ProtocolVersion; 3] = [
@@ -42,8 +46,14 @@ const MOST_BYTES: u16 = 4096;
 // A match takes some 80 characters, so these come to about as many as
 // MOST_BYTES does.
 const MOST_GATHERED: u32 = 128;
+// A place counted takes some 30 characters, so these come to about twice what
+// MOST_BYTES does.
+const MOST_COUNTED: u32 = 512;
 // Each is weighed against every access a run makes.
 const MOST_CONDITIONS: usize = 16;
+// An instruction listed takes some 50 characters, so these come to about half
+// as many again as MOST_BYTES does.
+const MOST_INSTRUCTIONS_LISTED: u16 = 256;
 
 // A machine holds raw pointers, a CPC's into itself, so it is not Send, and
 // the server must be. Each is built on a thread of its own, never leaves it,
@@ -204,11 +214,8 @@ fn address_schema(generator: &mut SchemaGenerator) -> Schema {
     generator.subschema_for::<AddressForms>()
 }
 
-fn address(value: &Value) -> Result<u16, String> {
-    if let Some(number) = value.as_u64() {
-        return u16::try_from(number)
-            .map_err(|_| format!("{value} is past &FFFF; {ADDRESS_FORMS}"));
-    }
+// Hexadecimal of up to so many digits, after the &, #, $ or 0x that marks it.
+fn hexadecimal_number(value: &Value, most_digits: usize) -> Option<u32> {
     let digits = value.as_str().and_then(|text| {
         ["&", "#", "$", "0x", "0X"]
             .iter()
@@ -216,10 +223,43 @@ fn address(value: &Value) -> Result<u16, String> {
     });
     digits
         .filter(|digits| {
-            (1..=4).contains(&digits.len()) && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+            (1..=most_digits).contains(&digits.len())
+                && digits.chars().all(|digit| digit.is_ascii_hexdigit())
         })
-        .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+}
+
+fn address(value: &Value) -> Result<u16, String> {
+    if let Some(number) = value.as_u64() {
+        return u16::try_from(number)
+            .map_err(|_| format!("{value} is past &FFFF; {ADDRESS_FORMS}"));
+    }
+    hexadecimal_number(value, 4)
+        .and_then(|number| u16::try_from(number).ok())
         .ok_or_else(|| format!("{value} is no address; {ADDRESS_FORMS}"))
+}
+
+const RAM_ADDRESS_FORMS: &str = "an address in the RAM is a number from 0 to 131071, or \
+                                 hexadecimal from &00000 to &1FFFF, written with &, #, $ or 0x \
+                                 before it";
+
+fn ram_address_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 0x1FFFF },
+            { "type": "string", "pattern": "^(&|#|\\$|0x|0X)[0-9A-Fa-f]{1,5}$" },
+        ]
+    })
+}
+
+// An address counted in the machine's own RAM, which a 6128 has 128K of.
+fn ram_address(value: &Value) -> Result<u32, String> {
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .or_else(|| hexadecimal_number(value, 5))
+        .filter(|address| *address <= 0x1FFFF)
+        .ok_or_else(|| format!("{value} is no address in the RAM; {RAM_ADDRESS_FORMS}"))
 }
 
 const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
@@ -228,8 +268,8 @@ const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\":
                                \"mask\": bits}, the mask being the bits of the port's address that \
                                its device decodes";
 
-// A condition, kept once in a tool's $defs, as until and gather both take
-// lists of them.
+// A condition, kept once in a tool's $defs, as until, gather and count all
+// take lists of them.
 struct ConditionForms;
 
 impl JsonSchema for ConditionForms {
@@ -266,7 +306,7 @@ fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
     })
 }
 
-fn condition(value: &Value, stops: bool) -> Result<Condition, String> {
+fn condition(value: &Value, list: List) -> Result<Condition, String> {
     let fields = value
         .as_object()
         .ok_or_else(|| format!("{value} is not an object"))?;
@@ -321,15 +361,15 @@ fn condition(value: &Value, stops: bool) -> Result<Condition, String> {
         first,
         last,
         mask,
-        stops,
+        list,
     })
 }
 
-// The conditions of until or of gather, added to those of the other.
+// The conditions of until, gather or count, added to those of the others.
 fn conditions(
     field: &str,
     listed: Option<&Value>,
-    stops: bool,
+    list: List,
     into: &mut Vec<Condition>,
 ) -> Result<(), String> {
     let Some(listed) = listed else {
@@ -347,18 +387,31 @@ fn conditions(
         ));
     }
     for (index, value) in listed.iter().enumerate() {
-        let condition = condition(value, stops)
+        let condition = condition(value, list)
             .map_err(|problem| format!("{field}[{index}]: {problem}; {CONDITION_FORMS}"))?;
         into.push(condition);
     }
     Ok(())
 }
 
-fn watched_for(until: Option<&Value>, gather: Option<&Value>) -> Result<Vec<Condition>, String> {
+fn watched_for(
+    until: Option<&Value>,
+    gather: Option<&Value>,
+    count: Option<&Value>,
+) -> Result<Vec<Condition>, String> {
     let mut watched = Vec::new();
-    conditions("until", until, true, &mut watched)?;
-    conditions("gather", gather, false, &mut watched)?;
+    conditions("until", until, UNTIL, &mut watched)?;
+    conditions("gather", gather, GATHER, &mut watched)?;
+    conditions("count", count, COUNT, &mut watched)?;
     Ok(watched)
+}
+
+fn watching(conditions: &[Condition]) -> Watching<'_> {
+    Watching {
+        conditions,
+        most_gathered: MOST_GATHERED,
+        most_counted: MOST_COUNTED,
+    }
 }
 
 fn hexadecimal(bytes: &[u8]) -> String {
@@ -428,6 +481,11 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     gather: Option<Value>,
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    count: Option<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -457,6 +515,11 @@ struct CallRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     gather: Option<Value>,
+    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. At most 16.
+    #[schemars(schema_with = "conditions_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    count: Option<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -516,6 +579,62 @@ struct PokeRequest {
     bytes: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MonitorRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ScreenRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// Where the bytes of the picture are; video if not given.
+    #[schemars(transform = absent_not_null)]
+    reading: Option<Reading>,
+    /// The address the first byte is read from, in the RAM: for the video reading a display start, at the start of a 16K page or up to 2K into it, and for linear and columns any address in the machine's RAM. The 6845's start address, from R12 and R13, if not given. A base given is an address and cannot carry what R12's bits 3 and 2 tell the 6845, which carry a row on past its 2K into the next 16K, as a screen of 32K does; left out, the base is read with them.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    base: Option<Value>,
+    /// Bytes across, from 1 to 128. Twice the characters the 6845 displays across, R1, if not given. In the video reading a row of characters is this many bytes on from the last, as R1 sets it on the machine, so a width other than the machine's is no crop of its screen.
+    #[schemars(range(min = 1, max = MOST_WIDTH))]
+    #[schemars(transform = absent_not_null)]
+    width: Option<i64>,
+    /// Lines down, from 1 to 512. The rows the 6845 displays, R6, times the lines of a row, rasters, if not given.
+    #[schemars(range(min = 1, max = MOST_HEIGHT))]
+    #[schemars(transform = absent_not_null)]
+    height: Option<i64>,
+    /// Lines in a character row, from 1 to 32, read by the video reading alone. R9 and one if not given.
+    #[schemars(range(min = 1, max = MOST_RASTERS))]
+    #[schemars(transform = absent_not_null)]
+    rasters: Option<i64>,
+    /// How a byte becomes pixels: 0 for two of sixteen pens, 1 for four of four, 2 for eight of two, 3 for two of four. The mode the Gate Array is drawing in if not given.
+    #[schemars(range(min = 0, max = 3))]
+    #[schemars(transform = absent_not_null)]
+    mode: Option<i64>,
+    /// Sixteen hardware colour codes, 0 to 31, one for each pen in order, as inspect reads the first sixteen of gate_array.inks. The sixteen inks the Gate Array holds if not given.
+    #[schemars(length(equal = 16), inner(range(min = 0, max = 31)))]
+    #[schemars(transform = absent_not_null)]
+    palette: Option<Vec<i64>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DisassembleRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// Where the first instruction begins.
+    #[schemars(schema_with = "address_schema")]
+    address: Value,
+    /// How many instructions to list, from 1 to 256; 16 if not given.
+    #[schemars(range(min = 1, max = MOST_INSTRUCTIONS_LISTED))]
+    #[schemars(transform = absent_not_null)]
+    instructions: Option<i64>,
+}
+
 #[derive(Serialize, JsonSchema)]
 struct Standing {
     /// The handle the server gave the machine.
@@ -561,7 +680,7 @@ enum Stopped {
     Unsettled,
     /// A condition of until matched.
     Matched,
-    /// The gathering came to 128 matches, and holds the rest of the instruction that made the 128th as well, and of the response to an interrupt taken at its end.
+    /// The gathering came to 128 matches, or the count to 512 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end.
     Full,
     /// The routine called returned.
     Returned,
@@ -625,6 +744,46 @@ impl Matched {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct Counted {
+    /// Where instructions began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    execute: Option<u16>,
+    /// A byte the program read as data, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    read: Option<u16>,
+    /// A byte the processor wrote, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    write: Option<u16>,
+    /// A port the processor read, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    r#in: Option<u16>,
+    /// A port the processor wrote, by its address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    out: Option<u16>,
+    /// How many times it matched.
+    count: u32,
+}
+
+impl Counted {
+    fn of(&(kind, address, count): &(Kind, u16, u32)) -> Counted {
+        let at = |listed| (kind == listed).then_some(address);
+        Counted {
+            execute: at(EXECUTE),
+            read: at(READ),
+            write: at(WRITE),
+            r#in: at(IN),
+            out: at(OUT),
+            count,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
 struct Ran {
     #[serde(flatten)]
     run: Run,
@@ -642,6 +801,10 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
+    /// Each place that matched the conditions of count, and how many times: executes first, then reads, writes, port reads and port writes, each by address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    counted: Option<Vec<Counted>>,
 }
 
 impl Ran {
@@ -657,11 +820,12 @@ impl Ran {
             pc: machine.pc(),
             matched: None,
             gathered: None,
+            counted: None,
         }
     }
 
     // What the run's watch saw, and why it stopped the run if it did.
-    fn watched(mut self, watched: &Watched, gathering: bool) -> Ran {
+    fn watched(mut self, watched: &Watched, gathering: bool, counting: bool) -> Ran {
         if self.run.settled {
             if watched.returned {
                 self.stopped = Stopped::Returned;
@@ -681,6 +845,7 @@ impl Ran {
         };
         self.matched = watched.matched.then(|| listed(|seen| seen.stops));
         self.gathered = gathering.then(|| listed(|seen| seen.gathers));
+        self.counted = counting.then(|| watched.counts.iter().map(Counted::of).collect());
         self
     }
 }
@@ -715,6 +880,141 @@ struct Poked {
     address: u16,
     /// How many bytes were written.
     length: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Monitored {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The machine, by the name the emulator's command line gives it.
+    machine: String,
+    /// The machine's tick as the picture was taken.
+    tick: u64,
+    /// The picture's width in pixels.
+    width: u32,
+    /// The picture's height in pixels.
+    height: u32,
+    /// The monitor's beam across its line, as monitor.beam_x counts it, in samples of the whole raster, of which the picture is a window.
+    beam_x: u16,
+    /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines of the whole raster, of which the picture is a window.
+    beam_y: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Drawn {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The machine, by the name the emulator's command line gives it.
+    machine: String,
+    /// The machine's tick as the memory was read.
+    tick: u64,
+    /// Where the bytes of the picture were read.
+    reading: Reading,
+    /// The address the first byte was read from, in the RAM.
+    base: u32,
+    /// Bytes across.
+    width: u32,
+    /// Lines down.
+    height: u32,
+    /// Lines in a character row, given for the video reading alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    rasters: Option<u32>,
+    /// The mode the bytes were read in; the Gate Array reads a mode past 3, which only set can write, as 3, and so does this.
+    mode: u8,
+    /// The colour code given each pen, in order, in the five bits a colour code has.
+    palette: [u8; 16],
+    /// The picture's width in pixels, eight to a byte.
+    picture_width: u32,
+    /// The picture's height in pixels, two to a line.
+    picture_height: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Listed {
+    /// Where the instruction begins.
+    address: u16,
+    /// Its bytes, as pairs of hexadecimal digits.
+    bytes: String,
+    /// What it says.
+    text: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Disassembled {
+    /// The instructions, in the order they stand in memory.
+    instructions: Vec<Listed>,
+}
+
+// An answer with a picture beside its JSON, which the protocol carries as an
+// image after the text: "Image Content" (2026-07-28, server/tools).
+struct Pictured<T> {
+    answer: T,
+    png: Vec<u8>,
+}
+
+impl<T: Serialize> IntoCallToolResult for Pictured<T> {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, ErrorData> {
+        let value = serde_json::to_value(self.answer).map_err(|error| {
+            ErrorData::internal_error(format!("an answer did not serialize: {error}"), None)
+        })?;
+        let mut result = CallToolResult::structured(value);
+        result
+            .content
+            .push(ContentBlock::image(picture::base64(&self.png), "image/png"));
+        Ok(result.into())
+    }
+}
+
+// A count given to screen, held to what it reads.
+fn screen_count(name: &str, value: Option<i64>, most: u32) -> Result<Option<u32>, String> {
+    value
+        .map(|value| {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| (1..=most).contains(value))
+                .ok_or_else(|| format!("{name} is {value}, and a screen reads from 1 to {most}"))
+        })
+        .transpose()
+}
+
+fn asked(request: &ScreenRequest) -> Result<Asked, String> {
+    let mode = request
+        .mode
+        .map(|mode| {
+            u8::try_from(mode)
+                .ok()
+                .filter(|mode| *mode <= 3)
+                .ok_or_else(|| format!("mode is {mode}, and the Gate Array's modes are 0 to 3"))
+        })
+        .transpose()?;
+    let palette = request
+        .palette
+        .as_ref()
+        .map(|palette| {
+            let codes: Option<Vec<u8>> = palette
+                .iter()
+                .map(|code| u8::try_from(*code).ok().filter(|code| *code <= 31))
+                .collect();
+            codes
+                .and_then(|codes| <[u8; 16]>::try_from(codes).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "palette is {palette:?}, and a palette is sixteen hardware colour codes, \
+                         one for each pen, each from 0 to 31"
+                    )
+                })
+        })
+        .transpose()?;
+    Ok(Asked {
+        reading: request.reading.unwrap_or(Reading::Video),
+        base: request.base.as_ref().map(ram_address).transpose()?,
+        width: screen_count("width", request.width, MOST_WIDTH)?,
+        height: screen_count("height", request.height, MOST_HEIGHT)?,
+        rasters: screen_count("rasters", request.rasters, MOST_RASTERS)?,
+        mode,
+        palette,
+    })
 }
 
 // A span of memory that ends at &FFFF or before it.
@@ -922,7 +1222,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step and call moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, and gather lists what matches its conditions on the way; each match says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step and call moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -932,8 +1232,13 @@ impl Server {
     async fn run(&self, Parameters(request): Parameters<RunRequest>) -> Result<Json<Ran>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
         let most_ticks = u64::from(MOST_FRAMES) * machine.standard_frame();
-        let conditions = watched_for(request.until.as_ref(), request.gather.as_ref())?;
+        let conditions = watched_for(
+            request.until.as_ref(),
+            request.gather.as_ref(),
+            request.count.as_ref(),
+        )?;
         let gathering = request.gather.is_some();
+        let counting = request.count.is_some();
         let ran = match (request.frames, request.ticks) {
             (Some(frames), None) => {
                 let frames = u32::try_from(frames)
@@ -947,13 +1252,13 @@ impl Server {
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
-                    let (run, watched) = built.run(frames, limit, &conditions, MOST_GATHERED);
+                    let (run, watched) = built.run(frames, limit, &watching(&conditions));
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
                     } else {
                         Stopped::Limit
                     };
-                    Ran::of(run, built, stopped).watched(&watched, gathering)
+                    Ran::of(run, built, stopped).watched(&watched, gathering, counting)
                 })
                 .await?
             }
@@ -970,8 +1275,8 @@ impl Server {
                         )
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
-                    let (run, watched) = built.run(u32::MAX, ticks, &conditions, MOST_GATHERED);
-                    Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering)
+                    let (run, watched) = built.run(u32::MAX, ticks, &watching(&conditions));
+                    Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering, counting)
                 })
                 .await?
             }
@@ -986,7 +1291,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
+    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1008,20 +1313,25 @@ impl Server {
                      again to carry the routine further"
                 )
             })?;
-        let conditions = watched_for(request.until.as_ref(), request.gather.as_ref())?;
+        let conditions = watched_for(
+            request.until.as_ref(),
+            request.gather.as_ref(),
+            request.count.as_ref(),
+        )?;
         let gathering = request.gather.is_some();
+        let counting = request.count.is_some();
         let values = request.values.unwrap_or_default();
         let (machine, orders) = self.thread(&request.handle)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
             let (run, watched) =
-                built.call(address, &values, frames, limit, &conditions, MOST_GATHERED)?;
+                built.call(address, &values, frames, limit, &watching(&conditions))?;
             let stopped = if run.frames >= frames {
                 Stopped::Frames
             } else {
                 Stopped::Limit
             };
-            Ok::<_, String>(Ran::of(run, built, stopped).watched(&watched, gathering))
+            Ok::<_, String>(Ran::of(run, built, stopped).watched(&watched, gathering, counting))
         })
         .await??;
         Ok(Json(ran))
@@ -1105,6 +1415,106 @@ impl Server {
         Ok(Json(Peeked {
             address,
             bytes: hexadecimal(&bytes),
+        }))
+    }
+
+    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step or a call, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before. A machine not yet run shows a picture never painted.
+    #[tool(
+        output_schema = schema_for_output::<Monitored>(),
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn monitor(
+        &self,
+        Parameters(request): Parameters<MonitorRequest>,
+    ) -> Result<Pictured<Monitored>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        let (shown, tick) = Server::ask(&request.handle, orders, |built| {
+            (built.monitor(), built.tick())
+        })
+        .await?;
+        let answer = Monitored {
+            handle: request.handle,
+            machine: machine.name.to_owned(),
+            tick,
+            width: shown.picture.width,
+            height: shown.picture.height,
+            beam_x: shown.beam_x,
+            beam_y: shown.beam_y,
+        };
+        Ok(Pictured {
+            answer,
+            png: shown.picture.png(),
+        })
+    }
+
+    /// Read a CPC's memory as a picture, as colophon-player's <colophon-cpc-screen> reads it, so that a sprite sheet, a font or a buffer built off the screen shows its shape when read in the layout it was written in: as the video hardware reads the screen, as a flat buffer, or in columns. The bytes are read from the RAM as the video hardware reads them, whatever ROM the processor sees over them: the video reading reads the base 64K, and linear and columns all of the machine's RAM, a 6128's second 64K at &10000 to &1FFFF. Whatever is not given is read from the machine as it stands: the base from R12 and R13, the width from R1, the height from R6 and the rasters, the rasters from R9, and the mode in force and the sixteen inks from the Gate Array, so that a screen asked nothing draws the memory the 6845 is displaying. The PNG beside the answer has eight pixels across to a byte and two down to a line, the scale at which monitor draws a CPC's raster; each pixel's index in its palette is the pen, and the palette is the colours of the pens' colour codes. It is drawn from memory as it stands, in one mode and one palette, so it is not what the monitor showed where a program changes either partway down a frame, or changes the memory as the beam passes; monitor shows that. Refused on a Spectrum, whose picture monitor shows.
+    #[tool(
+        output_schema = schema_for_output::<Drawn>(),
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn screen(
+        &self,
+        Parameters(request): Parameters<ScreenRequest>,
+    ) -> Result<Pictured<Drawn>, String> {
+        let asked = asked(&request)?;
+        let (machine, orders) = self.thread(&request.handle)?;
+        let (screen, picture, tick) = Server::ask(&request.handle, orders, move |built| {
+            let (screen, picture) = built.screen(&asked)?;
+            Ok::<_, String>((screen, picture, built.tick()))
+        })
+        .await??;
+        let answer = Drawn {
+            handle: request.handle,
+            machine: machine.name.to_owned(),
+            tick,
+            reading: screen.reading,
+            base: screen.base,
+            width: screen.width,
+            height: screen.height,
+            rasters: (screen.reading == Reading::Video).then_some(screen.rasters),
+            mode: screen.mode,
+            palette: screen.palette,
+            picture_width: picture.width,
+            picture_height: picture.height,
+        };
+        Ok(Pictured {
+            answer,
+            png: picture.png(),
+        })
+    }
+
+    /// Read a machine's memory as the instructions its processor would run, from an address on, each with its address, its bytes and what they say: Zilog's mnemonics, numbers in hexadecimal after &, and a relative jump's target worked out. Memory is read as peek reads it, through the banking and the ROMs, and an instruction that runs past &FFFF goes on at &0000, as the program counter does. An instruction is what step runs, so a chain of DD and FD prefixes is one, ruled by its last prefix, even one so long that a step stops inside it. Undocumented instructions are named as colophon-player's disassembly names them: IXH and IXL, SLL, RLC (IX+&05),B and its like, which copy their result into a register, IN (C), OUT (C),0, IM 0/1, and NOP for ED followed by a byte that begins no instruction, save ED FF, which is BRK, after WinAPE, whose mark it is. Nothing here tells code from data: bytes are read as instructions from wherever the listing begins. From 1 to 256 instructions, 16 if not given; a listing reads at most 4096 bytes, so only a chain of prefixes thousands long cuts it short.
+    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
+    async fn disassemble(
+        &self,
+        Parameters(request): Parameters<DisassembleRequest>,
+    ) -> Result<Json<Disassembled>, String> {
+        let address = address(&request.address)?;
+        let instructions = request.instructions.unwrap_or(16);
+        let instructions = u16::try_from(instructions)
+            .ok()
+            .filter(|instructions| (1..=MOST_INSTRUCTIONS_LISTED).contains(instructions))
+            .ok_or_else(|| {
+                format!(
+                    "instructions is {instructions}, and a listing takes from 1 to \
+                     {MOST_INSTRUCTIONS_LISTED}; disassemble again from where it ends to go \
+                     further"
+                )
+            })?;
+        let (_, orders) = self.thread(&request.handle)?;
+        let listed = Server::ask(&request.handle, orders, move |built| {
+            built.disassemble(address, instructions, usize::from(MOST_BYTES))
+        })
+        .await??;
+        Ok(Json(Disassembled {
+            instructions: listed
+                .into_iter()
+                .map(|(address, bytes, text)| Listed {
+                    address,
+                    bytes: hexadecimal(&bytes),
+                    text,
+                })
+                .collect(),
         }))
     }
 

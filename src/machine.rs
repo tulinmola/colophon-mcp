@@ -6,35 +6,69 @@ use std::ptr::NonNull;
 use std::sync::{PoisonError, RwLock};
 
 use crate::emulator::{
-    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, SPECTRUM_FRAMEBUFFER_HEIGHT,
-    SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE,
-    cpc_connect_monitor, cpc_fit_disc_interface, cpc_init, cpc_peek, cpc_poke, cpc_remap,
-    cpc_set_upper_rom, cpc_snapshot_load, cpc_t, mcp_cpc_call, mcp_cpc_check, mcp_cpc_run,
-    mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek,
-    mcp_spectrum_step, mcp_watch_t, spectrum_connect_monitor, spectrum_init, spectrum_peek,
-    spectrum_poke, spectrum_snapshot_load, spectrum_t,
+    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, MCP_COUNTS_PER_KIND, MCP_KINDS,
+    SPECTRUM_FRAMEBUFFER_HEIGHT, SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K,
+    SPECTRUM_ROM_SIZE, cpc_connect_monitor, cpc_fit_disc_interface, cpc_init, cpc_peek, cpc_poke,
+    cpc_remap, cpc_set_upper_rom, cpc_snapshot_load, cpc_t, gate_array_rgb as core_gate_array_rgb,
+    mcp_cpc_call, mcp_cpc_check, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check,
+    mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t, spectrum_connect_monitor,
+    spectrum_init, spectrum_peek, spectrum_poke, spectrum_snapshot_load, spectrum_t,
+    ula_rgb as core_ula_rgb,
 };
 
 pub use crate::emulator::{
-    mcp_condition_t as Condition, mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN,
-    mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE,
-    mcp_match_t as Match, mcp_run_t as Run,
+    mcp_condition_t as Condition, mcp_kind_t as Kind, mcp_kind_t_MCP_EXECUTE as EXECUTE,
+    mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_READ as READ,
+    mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT,
+    mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
+    mcp_run_t as Run,
 };
 
-// A watch holds the conditions and the room for matches it is given as
-// pointers, so it borrows both for as long as it lives, and the bridge never
-// reaches past either.
+// The kinds in the order mcp_kind_t gives them, which is how a watch's counts
+// are laid out.
+pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT];
+
+pub const COUNTS_PER_KIND: usize = MCP_COUNTS_PER_KIND as usize;
+
+// Each kind's counts stand at its own value in mcp_kind_t.
+const _: () = {
+    let mut kind = 0;
+    while kind < KINDS.len() {
+        assert!(KINDS[kind] as usize == kind);
+        kind += 1;
+    }
+};
+
+// A watch holds the conditions, the room for matches and the counts it is
+// given as pointers, so it borrows them for as long as it lives, and the
+// bridge never reaches past any of them.
 pub struct Watch<'a> {
     watch: mcp_watch_t,
-    _borrowed: PhantomData<(&'a [Condition], &'a mut [Match])>,
+    _borrowed: PhantomData<(&'a [Condition], &'a mut [Match], &'a mut [u32])>,
 }
 
 impl<'a> Watch<'a> {
+    // The counts are laid out as mcp_watch_t says and all zero where a
+    // condition is in the count list, and empty where none is.
     pub fn new(
         conditions: &'a [Condition],
         matches: &'a mut [Match],
+        counts: &'a mut [u32],
         most_gathered: u32,
+        most_counted: u32,
     ) -> Watch<'a> {
+        let counting = conditions.iter().any(|condition| condition.list == COUNT);
+        assert!(
+            counts.len()
+                == if counting {
+                    KINDS.len() * COUNTS_PER_KIND
+                } else {
+                    0
+                }
+                && counts.iter().all(|count| *count == 0),
+            "a count of zero for every kind and every address, where the count list has a \
+             condition"
+        );
         // SAFETY: bindgen renders a watch as integers, bools and pointers,
         // and all-zero bytes are a value of each.
         let mut watch: mcp_watch_t = unsafe { std::mem::zeroed() };
@@ -43,6 +77,10 @@ impl<'a> Watch<'a> {
         watch.matches = matches.as_mut_ptr();
         watch.room = u32::try_from(matches.len()).expect("room for a few thousand matches");
         watch.most_gathered = most_gathered;
+        if counting {
+            watch.counts = counts.as_mut_ptr();
+        }
+        watch.most_counted = most_counted;
         Watch {
             watch,
             _borrowed: PhantomData,
@@ -98,6 +136,20 @@ fn framebuffer(width: u32, height: u32) -> Handed<[u8]> {
     Handed::new(vec![0; (width * height) as usize].into_boxed_slice())
 }
 
+// What a CPC's colour code is worth on the cable, as 0xRRGGBB, from the
+// levels measured on a 40010, of which the code's lowest five bits pick one.
+pub fn gate_array_rgb(colour_code: u8) -> u32 {
+    // SAFETY: the core only reads a table of its own.
+    unsafe { core_gate_array_rgb(colour_code) }
+}
+
+// What a Spectrum's sample is worth on the cable, as 0xRRGGBB, from its lowest
+// four bits.
+pub fn ula_rgb(sample: u8) -> u32 {
+    // SAFETY: the core only computes from the sample.
+    unsafe { core_ula_rgb(sample) }
+}
+
 // The core and the bridge say what is wrong in a sentence of their own.
 fn problem(sentence: *const c_char) -> String {
     // SAFETY: a problem points at a string literal.
@@ -109,9 +161,9 @@ fn problem(sentence: *const c_char) -> String {
 pub struct Cpc {
     machine: Handed<cpc_t>,
     upper_roms: BTreeMap<u8, Handed<[u8; 0x4000]>>,
-    _ram: Handed<[u8]>,
+    ram: Handed<[u8]>,
     _lower_rom: Handed<[u8; 0x4000]>,
-    _framebuffer: Handed<[u8]>,
+    framebuffer: Handed<[u8]>,
 }
 
 impl Cpc {
@@ -144,9 +196,9 @@ impl Cpc {
         Cpc {
             machine,
             upper_roms: BTreeMap::new(),
-            _ram: ram,
+            ram,
             _lower_rom: lower_rom,
-            _framebuffer: framebuffer,
+            framebuffer,
         }
     }
 
@@ -166,8 +218,9 @@ impl Cpc {
     pub fn run(&mut self, frames: u32, limit: u64, watch: Option<&mut Watch>) -> Run {
         let _running = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the machine and what it was handed stand where they were,
-        // and a watch borrows its conditions and its room for matches, which
-        // are as long as it says, for as long as it lives.
+        // and a watch borrows its conditions, its room for matches and its
+        // counts, which are as long as it says, for as long as it lives, and
+        // has counts wherever a condition is in the count list.
         unsafe { mcp_cpc_run(self.machine.as_ptr(), frames, limit, watching(watch)) }
     }
 
@@ -239,6 +292,18 @@ impl Cpc {
         unsafe { &*self.machine.as_ptr() }
     }
 
+    pub fn ram(&self) -> &[u8] {
+        // SAFETY: as for machine(): the core writes the RAM only in a call
+        // that borrows the machine mutably.
+        unsafe { &*self.ram.as_ptr() }
+    }
+
+    pub fn framebuffer(&self) -> &[u8] {
+        // SAFETY: as for the RAM: the beam paints the framebuffer only in a
+        // call that borrows the machine mutably.
+        unsafe { &*self.framebuffer.as_ptr() }
+    }
+
     pub fn machine_mut(&mut self) -> &mut cpc_t {
         // SAFETY: as for machine(), and a write through it changes a field and
         // never moves the machine.
@@ -250,7 +315,7 @@ pub struct Spectrum {
     machine: Handed<spectrum_t>,
     _ram: Handed<[u8]>,
     _rom: Handed<[u8; SPECTRUM_ROM_SIZE as usize]>,
-    _framebuffer: Handed<[u8]>,
+    framebuffer: Handed<[u8]>,
 }
 
 impl Spectrum {
@@ -281,7 +346,7 @@ impl Spectrum {
             machine,
             _ram: ram,
             _rom: rom,
-            _framebuffer: framebuffer,
+            framebuffer,
         }
     }
 
@@ -352,6 +417,11 @@ impl Spectrum {
     pub fn machine(&self) -> &spectrum_t {
         // SAFETY: as for a CPC's.
         unsafe { &*self.machine.as_ptr() }
+    }
+
+    pub fn framebuffer(&self) -> &[u8] {
+        // SAFETY: as for a CPC's.
+        unsafe { &*self.framebuffer.as_ptr() }
     }
 
     pub fn machine_mut(&mut self) -> &mut spectrum_t {
@@ -750,11 +820,11 @@ mod tests {
                 first,
                 last: first,
                 mask,
-                stops: false,
+                list: GATHER,
             });
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 400_000];
-        let mut watch = Watch::new(&gathering, &mut matches, u32::MAX);
+        let mut watch = Watch::new(&gathering, &mut matches, &mut [], u32::MAX, 0);
         cpc.run(60, 120 * CPC_STANDARD_FRAME_TICKS, Some(&mut watch));
         let count = watch.seen().match_count as usize;
         assert!(count < matches.len(), "{count} matches");
@@ -789,12 +859,12 @@ mod tests {
             first: 0x7FFE,
             last: 0x9000,
             mask: 0,
-            stops: false,
+            list: GATHER,
         }];
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 100_000];
         let mut finding = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
-        let mut watch = Watch::new(&writes, &mut matches, u32::MAX);
+        let mut watch = Watch::new(&writes, &mut matches, &mut [], u32::MAX, 0);
         finding.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
         let count = watch.seen().match_count as usize;
         let followed = matches[..count]
@@ -803,7 +873,7 @@ mod tests {
             .expect("an interrupt's push");
         assert!(followed > 0 && matches[followed + 1].response);
         let mut filling = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
-        let mut watch = Watch::new(&writes, &mut matches, followed as u32);
+        let mut watch = Watch::new(&writes, &mut matches, &mut [], followed as u32, 0);
         let run = filling.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
         let seen = *watch.seen();
         assert!(seen.full && run.settled);
@@ -1032,20 +1102,27 @@ mod tests {
     }
 
     // Runs with a watch on every instruction, every access and every port,
-    // gathering without end into room for a few, and answers whether the
-    // run saw more than there was room for, which are counted and never kept.
+    // gathering without end into room for a few and counting each, and
+    // answers whether the run saw more than there was room for, which are
+    // counted and never kept.
     // The room is on the heap, where AddressSanitizer sees past its end.
     fn watching_everything(run: impl FnOnce(Option<&mut Watch>) -> Run) -> bool {
-        let conditions = [EXECUTE, READ, WRITE, IN, OUT].map(|kind| Condition {
-            kind,
-            first: 0,
-            last: 0xFFFF,
-            mask: 0,
-            stops: false,
-        });
+        let conditions: Vec<Condition> = [GATHER, COUNT]
+            .into_iter()
+            .flat_map(|list| {
+                KINDS.map(|kind| Condition {
+                    kind,
+                    first: 0,
+                    last: 0xFFFF,
+                    mask: 0,
+                    list,
+                })
+            })
+            .collect();
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
-        let mut watch = Watch::new(&conditions, &mut matches, u32::MAX);
+        let mut counts = vec![0; KINDS.len() * COUNTS_PER_KIND];
+        let mut watch = Watch::new(&conditions, &mut matches, &mut counts, u32::MAX, u32::MAX);
         run(Some(&mut watch));
         watch.seen().match_count > watch.seen().room
     }
@@ -1267,7 +1344,7 @@ mod tests {
         for size in [0x10000, 0x20000] {
             let cpc = Cpc::new(vec![0; size].into_boxed_slice(), rom(&[], HALT));
             assert_eq!(cpc.machine().ram_size as usize, size);
-            assert_eq!(cpc.machine().ram, cpc._ram.as_ptr().cast());
+            assert_eq!(cpc.machine().ram, cpc.ram.as_ptr().cast());
         }
         for size in [SPECTRUM_RAM_16K, SPECTRUM_RAM_48K] {
             let ram = vec![0; size as usize].into_boxed_slice();
@@ -1318,6 +1395,30 @@ mod tests {
                 if called { (0x0100, sp - 2) } else { (0, sp) }
             );
         }
+    }
+
+    fn counting_everything() -> [Condition; 1] {
+        [Condition {
+            kind: EXECUTE,
+            first: 0,
+            last: 0xFFFF,
+            mask: 0,
+            list: COUNT,
+        }]
+    }
+
+    #[test]
+    #[should_panic(expected = "a count of zero for every kind and every address")]
+    fn a_watch_that_counts_refuses_to_go_without_its_counts() {
+        Watch::new(&counting_everything(), &mut [], &mut [], 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a count of zero for every kind and every address")]
+    fn a_watch_that_counts_refuses_counts_already_begun() {
+        let mut counts = vec![0; KINDS.len() * COUNTS_PER_KIND];
+        counts[0x38] = 1;
+        Watch::new(&counting_everything(), &mut [], &mut counts, 1, 1);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 // and 2025-11-25 and 2025-06-18 beside it; the text quoted was read in the
 // specification repository at tag 2026-07-28.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,20 +15,25 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use colophon_mcp::machines::MACHINES;
 use serde_json::{Value, json};
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 10] = [
+const TOOLS: [&str; 13] = [
     "call",
+    "disassemble",
     "inspect",
     "machine_close",
     "machine_list",
     "machine_open",
+    "monitor",
     "peek",
     "poke",
     "run",
+    "screen",
     "set",
     "step",
 ];
@@ -207,10 +213,14 @@ impl Session {
         )
     }
 
-    // "If an output schema is provided: Servers MUST provide structured
-    // results that conform to this schema." (2026-07-28, tools)
     fn answer(&mut self, tool: &str, arguments: Value) -> Value {
         let result = self.call(tool, arguments);
+        self.conforming(tool, &result)
+    }
+
+    // "If an output schema is provided: Servers MUST provide structured
+    // results that conform to this schema." (2026-07-28, tools)
+    fn conforming(&mut self, tool: &str, result: &Value) -> Value {
         assert_eq!(result["isError"], false, "{result}");
         let answer = result["structuredContent"].clone();
         if self.tools.is_none() {
@@ -327,6 +337,8 @@ const KEYWORDS: &[&str] = &[
     "required",
     "additionalProperties",
     "items",
+    "minItems",
+    "maxItems",
     "$defs",
     "$schema",
     "title",
@@ -464,6 +476,18 @@ fn fits(value: &Value, schema: &Value, root: &Value, at: &str) -> Result<(), Str
                     }
                 }
             }
+        }
+    }
+    if let Value::Array(elements) = value {
+        let count = elements.len() as u64;
+        let fewer = schema["minItems"]
+            .as_u64()
+            .is_some_and(|least| count < least);
+        let more = schema["maxItems"].as_u64().is_some_and(|most| count > most);
+        if fewer || more {
+            return Err(format!(
+                "{at}: {value} has {count} items, out of the bounds of {schema}"
+            ));
         }
     }
     if let (Value::Array(elements), Some(items)) = (value, schema.get("items")) {
@@ -1134,7 +1158,15 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
     for name in TOOLS {
         let annotations = &listed(&tools, name)["annotations"];
         assert_eq!(annotations["openWorldHint"], false, "{name}: {annotations}");
-        let reads = ["inspect", "machine_list", "peek"].contains(&name);
+        let reads = [
+            "disassemble",
+            "inspect",
+            "machine_list",
+            "monitor",
+            "peek",
+            "screen",
+        ]
+        .contains(&name);
         assert_eq!(annotations["readOnlyHint"], reads, "{name}: {annotations}");
         if !reads {
             let destroys = name != "machine_open";
@@ -1322,6 +1354,9 @@ fn every_tool_refuses_a_handle_never_given_with_the_handles_there_are() {
         ("set", json!({ "values": {} })),
         ("peek", json!({ "address": 0 })),
         ("poke", json!({ "address": 0, "bytes": "00" })),
+        ("monitor", json!({})),
+        ("screen", json!({})),
+        ("disassemble", json!({ "address": 0 })),
         ("machine_close", json!({})),
     ] {
         let mut arguments = arguments;
@@ -2431,6 +2466,36 @@ fn a_called_routine_returns_with_its_registers_and_leaves_the_machine_where_it_w
     }
 }
 
+// A call counts what its routine does, ADD A,B and RET at &0100 and the two
+// bytes the RET reads, and not the instruction it returns to, which the
+// machine then stands before.
+#[test]
+fn a_call_counts_what_its_routine_does() {
+    let roms = routine("spectrum48.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.step(&handle, 3);
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&0100",
+            "values": { "cpu.sp": 0x8000 },
+            "count": [{ "execute": 0, "to": "&FFFF" }, { "read": "&7FFE", "to": "&7FFF" }],
+        }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    assert_eq!(
+        called["counted"],
+        json!([
+            { "execute": 0x0100, "count": 1 },
+            { "execute": 0x0101, "count": 1 },
+            { "read": 0x7FFE, "count": 1 },
+            { "read": 0x7FFF, "count": 1 },
+        ])
+    );
+}
+
 // The call stands the machine at &0200, where a RET lies. The routine calls
 // &0200 itself, which returns to it, before it loads A and returns; arriving
 // at &0200 the first time, deeper in the stack, is not the call's return.
@@ -2683,6 +2748,16 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         ),
         "gather has 17 conditions, and takes at most 16"
     );
+    assert_eq!(
+        session.refusal(
+            "call",
+            json!({ "handle": handle, "address": 0, "count": [{ "write": 3, "to": 2 }] })
+        ),
+        format!(
+            "count[0]: {{\"write\":3,\"to\":2}} runs back from &0003 to &0002, and a range runs \
+             upward; {forms}"
+        )
+    );
     assert_eq!(session.inspect(&handle, "cpu.pc"), 0);
 }
 
@@ -2701,6 +2776,943 @@ fn a_machine_put_away_answers_what_it_was_asked_first() {
         .expect("the run is answered");
     assert_eq!(run["result"]["structuredContent"]["frames"], 50, "{run}");
     assert!(session.handles().is_empty());
+}
+
+// A picture as a tool answers it, read back out of its PNG by the png crate:
+// each pixel's index, and the palette the indices name.
+struct Picture {
+    width: usize,
+    height: usize,
+    indices: Vec<u8>,
+    palette: Vec<u32>,
+}
+
+impl Picture {
+    fn at(&self, x: usize, y: usize) -> u8 {
+        self.indices[y * self.width + x]
+    }
+}
+
+// "Unstructured content is returned in the content field of a result, and can
+// contain multiple content items of different types", an image among them as
+// "type": "image", "data": "base64-encoded-data" and its "mimeType"
+// (2026-07-28, server/tools, Tool Result).
+fn picture_of(result: &Value) -> Picture {
+    let content = result["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2, "{result}");
+    let image = &content[1];
+    assert_eq!(
+        (&image["type"], &image["mimeType"]),
+        (&json!("image"), &json!("image/png")),
+        "{image}"
+    );
+    let png = STANDARD
+        .decode(image["data"].as_str().expect("data"))
+        .expect("base64");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+        .read_info()
+        .expect("a PNG");
+    let info = reader.info();
+    assert_eq!(
+        (info.color_type, info.bit_depth),
+        (png::ColorType::Indexed, png::BitDepth::Eight)
+    );
+    let palette = info
+        .palette
+        .as_ref()
+        .expect("a palette")
+        .chunks(3)
+        .map(|rgb| u32::from_be_bytes([0, rgb[0], rgb[1], rgb[2]]))
+        .collect();
+    let (width, height) = (info.width as usize, info.height as usize);
+    let mut indices = vec![0; reader.output_buffer_size().expect("a size")];
+    reader.next_frame(&mut indices).expect("the pixels");
+    assert_eq!(indices.len(), width * height);
+    Picture {
+        width,
+        height,
+        indices,
+        palette,
+    }
+}
+
+impl Session {
+    // A picture's answer, its JSON told as text first, and the picture.
+    fn pictured(&mut self, tool: &str, arguments: Value) -> (Value, Picture) {
+        let result = self.call(tool, arguments);
+        let answer = self.conforming(tool, &result);
+        let text: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+                .expect("JSON");
+        assert_eq!(text, answer);
+        let picture = picture_of(&result);
+        assert_eq!(
+            (picture.width, picture.height),
+            if tool == "monitor" {
+                (
+                    answer["width"].as_u64().unwrap() as usize,
+                    answer["height"].as_u64().unwrap() as usize,
+                )
+            } else {
+                (
+                    answer["picture_width"].as_u64().unwrap() as usize,
+                    answer["picture_height"].as_u64().unwrap() as usize,
+                )
+            }
+        );
+        (answer, picture)
+    }
+
+    fn fill(&mut self, handle: &str, address: u16, bytes: &[u8]) {
+        for (offset, chunk) in (0..).step_by(4096).zip(bytes.chunks(4096)) {
+            let written: String = chunk.iter().map(|byte| format!("{byte:02X}")).collect();
+            self.poke(handle, json!(address + offset), &written);
+        }
+    }
+}
+
+// The firmware's 50Hz screen, as its table at &05C5 in the 6128's ROM sets
+// the 6845 ("The Amstrad CPC CRTC Compendium" v1.11, ch. 4.1): every register
+// it sets to other than zero, save R14's &C0, which belongs to the cursor.
+const STANDARD_SCREEN: [(u8, u8); 9] = [
+    (0, 63),
+    (1, 40),
+    (2, 46),
+    (3, 0x8E),
+    (4, 38),
+    (6, 25),
+    (7, 30),
+    (9, 7),
+    (12, 0x30),
+];
+
+// Sixteen inks all told apart, and a border unlike any of them.
+// Pen 0's is not 20, the black the Gate Array shows where it blanks.
+const INKS: [u8; 16] = [4, 21, 28, 24, 29, 12, 5, 13, 22, 6, 23, 30, 0, 31, 14, 20];
+const BORDER: u8 = 18;
+
+// A CPC whose 6845 is set to the firmware's screen and whose inks and border
+// are set, then halted for good: OUT (C),C to the 6845's select and data
+// ports, &BCxx and &BDxx, and to the Gate Array's, &7Fxx, PENR choosing a pen
+// and INKR, &40 and a colour code, setting it ("The Gate Array", Grim).
+fn cpc_screen_program() -> Vec<u8> {
+    let mut program = vec![DI];
+    let mut out = |port: u8, value: u8| {
+        program.extend([LD_BC, value, port, OUT_C_C[0], OUT_C_C[1]]);
+    };
+    for (register, value) in STANDARD_SCREEN {
+        out(0xBC, register);
+        out(0xBD, value);
+    }
+    for (pen, ink) in (0..).zip(INKS.iter().chain([&BORDER])) {
+        out(0x7F, pen);
+        out(0x7F, 0x40 | ink);
+    }
+    program.push(HALT);
+    program
+}
+
+// Bytes that run through every value in each 256 of them, a step further on
+// in each, so that no pen and no pixel goes unused.
+fn varied(length: usize) -> Vec<u8> {
+    (0..length)
+        .map(|index| (index * 37 + index / 256) as u8)
+        .collect()
+}
+
+#[test]
+fn a_picture_comes_with_its_answer_told_as_text_first() {
+    let roms = Roms::programmed("spectrum48.rom", &[DI, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let ran = session.run(&handle, json!({ "frames": 2 }));
+    let (shown, _) = session.pictured("monitor", json!({ "handle": handle }));
+    assert_eq!(
+        (&shown["handle"], &shown["machine"], &shown["tick"]),
+        (&json!(handle), &json!("spectrum48"), &ran["tick"])
+    );
+}
+
+// Each INKR command and the colour a 40010 was measured giving it, as "The
+// Gate Array" (Grim) tabulates them, INKR color-codes: the twenty-seven
+// colours and the five that ghost them.
+const GATE_ARRAY_COLOURS: [(u8, u32); 32] = [
+    (0x54, 0x000201),
+    (0x44, 0x00026B),
+    (0x55, 0x0C02F4),
+    (0x5C, 0x6C0201),
+    (0x58, 0x690268),
+    (0x5D, 0x6C02F2),
+    (0x4C, 0xF30506),
+    (0x45, 0xF00268),
+    (0x4D, 0xF302F4),
+    (0x56, 0x027801),
+    (0x46, 0x007868),
+    (0x57, 0x0C7BF4),
+    (0x5E, 0x6E7B01),
+    (0x40, 0x6E7D6B),
+    (0x5F, 0x6E7BF6),
+    (0x4E, 0xF37D0D),
+    (0x47, 0xF37D6B),
+    (0x4F, 0xFA80F9),
+    (0x52, 0x02F001),
+    (0x42, 0x00F36B),
+    (0x53, 0x0FF3F2),
+    (0x5A, 0x71F504),
+    (0x59, 0x71F36B),
+    (0x5B, 0x71F3F4),
+    (0x4A, 0xF3F30D),
+    (0x43, 0xF3F36D),
+    (0x4B, 0xFFF3F9),
+    (0x41, 0x6E7B6D),
+    (0x48, 0xF30268),
+    (0x49, 0xF3F36B),
+    (0x50, 0x000268),
+    (0x51, 0x02F36B),
+];
+
+// The window is the command line's, cut where its CPC_CROP_* and
+// SPECTRUM_CROP_* say, and its picture is what the machine put on the cable:
+// a CPC's border and its display, whose first byte is shown at sample 272 of
+// line 70 (the comment over those constants in the emulator's cli/main.c), and
+// a Spectrum's border, set by OUT (&FE) ("16K/48K reference", comp.sys.
+// sinclair FAQ, https://worldofspectrum.org/faq/reference/48kreference.htm),
+// and its picture, at sample 144 of line 56, coloured by its attributes,
+// which follow the display file's 6144 bytes line by line from &5800, each in
+// ATTR's form: 64 if bright, 8 times the paper's colour, and the ink's (ZX
+// Spectrum BASIC programming, ch. 16 and 24,
+// https://worldofspectrum.org/ZXBasicManual/zxmanchap16.html). A run by
+// frames leaves the beam at the top of the frame.
+#[test]
+fn the_monitor_shows_what_the_machine_put_on_the_cable() {
+    let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc464");
+    session.run(&cpc, json!({ "frames": 3 }));
+    let (shown, monitor) = session.pictured("monitor", json!({ "handle": cpc }));
+    assert_eq!(
+        (&shown["width"], &shown["height"], &shown["beam_y"]),
+        (&json!(768), &json!(544), &json!(0))
+    );
+    for (inkr, colour) in GATE_ARRAY_COLOURS {
+        assert_eq!(
+            monitor.palette[usize::from(inkr & 0x1F)],
+            colour,
+            "&{inkr:02X}"
+        );
+    }
+    let display = (272 - 208, (70 - 34) * 2);
+    assert_eq!(monitor.at(0, 0), BORDER);
+    assert_eq!(monitor.at(display.0 - 1, display.1), BORDER);
+    assert_eq!(monitor.at(display.0, display.1 - 1), BORDER);
+    assert_eq!(monitor.at(display.0, display.1), INKS[0]);
+    let program = [DI, LD_A, 0x05, OUT_N_A, 0xFE, HALT];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    // The first character's attribute: bright, white paper, black ink.
+    session.poke(&spectrum, json!("&5800"), "78");
+    session.run(&spectrum, json!({ "frames": 2 }));
+    let (shown, monitor) = session.pictured("monitor", json!({ "handle": spectrum }));
+    assert_eq!(
+        (&shown["width"], &shown["height"], &shown["beam_y"]),
+        (&json!(352), &json!(264), &json!(0))
+    );
+    let picture = (144 - 96, 56 - 20);
+    assert_eq!(monitor.at(0, 0), 5);
+    assert_eq!(monitor.at(picture.0 - 1, picture.1), 5);
+    assert_eq!(monitor.at(picture.0, picture.1 - 1), 5);
+    assert_eq!(monitor.at(picture.0, picture.1), 15);
+    assert_eq!(monitor.at(picture.0 + 8, picture.1), 0);
+    // Brightness lifts every gun of white, and the guns stay level.
+    let [_, red, green, blue] = monitor.palette[15].to_be_bytes();
+    let [_, dim_red, dim_green, dim_blue] = monitor.palette[7].to_be_bytes();
+    assert!(red == green && green == blue && dim_red == dim_green && dim_green == dim_blue);
+    assert!(red > dim_red, "{red} over {dim_red}");
+    // Where the beam stands, as the machine counts it, once it has left the
+    // corner a retrace sends it to.
+    session.step(&spectrum, 1000);
+    let (shown, _) = session.pictured("monitor", json!({ "handle": spectrum }));
+    assert_eq!(
+        (&shown["beam_x"], &shown["beam_y"]),
+        (
+            &session.inspect(&spectrum, "monitor.beam_x"),
+            &session.inspect(&spectrum, "monitor.beam_y")
+        )
+    );
+    assert!(shown["beam_y"].as_u64() > Some(0), "{shown}");
+}
+
+// The monitor's picture where the display falls, held to the memory the 6845
+// is displaying, as screen reads it with nothing asked: pen for colour, every
+// pixel of every line. With the firmware's horizontal timing and its frame
+// sync at line 240, the display's first byte is shown at sample 272 of line
+// 70 (the comment over CPC_CROP_* in the emulator's cli/main.c).
+fn the_screen_is_the_monitors_picture(session: &mut Session, handle: &str) -> Value {
+    let display = (272 - 208, (70 - 34) * 2);
+    let (_, monitor) = session.pictured("monitor", json!({ "handle": handle }));
+    let (drawn, screen) = session.pictured("screen", json!({ "handle": handle }));
+    let inks: Vec<u8> = drawn["palette"]
+        .as_array()
+        .expect("a palette")
+        .iter()
+        .map(|code| code.as_u64().unwrap() as u8)
+        .collect();
+    let colours: Vec<u32> = inks
+        .iter()
+        .map(|code| {
+            let (_, colour) = GATE_ARRAY_COLOURS
+                .iter()
+                .find(|(inkr, _)| inkr & 0x1F == *code)
+                .expect("a colour code");
+            *colour
+        })
+        .collect();
+    assert_eq!(screen.palette, colours);
+    for y in 0..screen.height {
+        let shown = &monitor.indices[(display.1 + y) * monitor.width + display.0..][..screen.width];
+        let drawn: Vec<u8> = screen.indices[y * screen.width..][..screen.width]
+            .iter()
+            .map(|pen| inks[usize::from(*pen)])
+            .collect();
+        assert_eq!(shown, drawn.as_slice(), "line {y}");
+    }
+    drawn
+}
+
+// The 6845 programmed otherwise, each time keeping 312 lines to the frame and
+// its sync at line 240: rows of five lines, R5's two lines more, and a start
+// partway into its 2K whose rows wrap inside it; rows of sixteen lines, which
+// the board's three raster lines cannot tell apart from rows of eight, in
+// the 16K at &8000, where a fourth would reach another; and a
+// screen of 27 rows that starts where R12's bits 3 and 2, MA11 and MA10,
+// carry its rows from the 16K at &8000 on into the one at &C000, as a screen
+// of 32K does.
+#[test]
+fn the_screen_follows_the_6845_wherever_it_starts_and_however_it_counts() {
+    let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.run(&handle, json!({ "frames": 3 }));
+    session.fill(&handle, 0x8000, &varied(0x8000));
+    for (registers, expected) in [
+        (
+            json!({
+                "crtc.registers[4]": 61, "crtc.registers[5]": 2, "crtc.registers[6]": 40,
+                "crtc.registers[7]": 48, "crtc.registers[9]": 4, "crtc.registers[12]": 0x33,
+                "crtc.registers[13]": 0xD1,
+            }),
+            (0xC7A2, 200, 5),
+        ),
+        (
+            json!({
+                "crtc.registers[4]": 18, "crtc.registers[5]": 8, "crtc.registers[6]": 12,
+                "crtc.registers[7]": 15, "crtc.registers[9]": 15, "crtc.registers[12]": 0x21,
+                "crtc.registers[13]": 0x28,
+            }),
+            (0x8250, 192, 16),
+        ),
+        (
+            json!({
+                "crtc.registers[4]": 38, "crtc.registers[5]": 0, "crtc.registers[6]": 27,
+                "crtc.registers[7]": 30, "crtc.registers[9]": 7, "crtc.registers[12]": 0x2C,
+                "crtc.registers[13]": 0xF0,
+            }),
+            (0x81E0, 216, 8),
+        ),
+    ] {
+        session.set(&handle, registers);
+        session.run(&handle, json!({ "frames": 3 }));
+        let drawn = the_screen_is_the_monitors_picture(&mut session, &handle);
+        assert_eq!(
+            (&drawn["base"], &drawn["height"], &drawn["rasters"]),
+            (&json!(expected.0), &json!(expected.1), &json!(expected.2))
+        );
+    }
+}
+
+// The memory the 6845 is displaying, read by screen with nothing asked, is
+// the monitor's picture where the display falls, pen for colour, in each of
+// the Gate Array's modes: what the emulator's own video put on the cable is
+// the measure. The mode is set where the machine stands at a retrace, so the
+// whole frame after it is drawn in it.
+#[test]
+fn the_screen_the_6845_displays_is_the_picture_on_the_monitor_in_every_mode() {
+    let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.run(&handle, json!({ "frames": 3 }));
+    session.fill(&handle, 0xC000, &varied(0x4000));
+    for mode in 0..4 {
+        // The mode in force is read, and not one written and still to come.
+        session.set(
+            &handle,
+            json!({ "gate_array.mode": mode, "gate_array.mode_pending": (mode + 1) % 4 }),
+        );
+        let (drawn, _) = session.pictured("screen", json!({ "handle": handle }));
+        assert_eq!(drawn["mode"], mode);
+        session.set(&handle, json!({ "gate_array.mode_pending": mode }));
+        session.run(&handle, json!({ "frames": 1 }));
+        let drawn = the_screen_is_the_monitors_picture(&mut session, &handle);
+        assert_eq!(
+            drawn,
+            json!({
+                "handle": handle,
+                "machine": "cpc464",
+                "tick": drawn["tick"],
+                "reading": "video",
+                "base": 0xC000,
+                "width": 80,
+                "height": 200,
+                "rasters": 8,
+                "mode": mode,
+                "palette": INKS,
+                "picture_width": 640,
+                "picture_height": 400,
+            })
+        );
+    }
+    // A mode past 3 and an ink past five bits, which only set can write, are
+    // drawn by the Gate Array as mode 3 and as the ink's five bits, and read
+    // so; a height not given is R6's rows of the rasters given.
+    session.set(
+        &handle,
+        json!({
+            "gate_array.mode": 7, "gate_array.mode_pending": 7,
+            "gate_array.inks[0]": 0x40 | INKS[0],
+        }),
+    );
+    session.run(&handle, json!({ "frames": 1 }));
+    let drawn = the_screen_is_the_monitors_picture(&mut session, &handle);
+    assert_eq!(
+        (&drawn["mode"], &drawn["palette"]),
+        (&json!(3), &json!(INKS))
+    );
+    let (drawn, _) = session.pictured("screen", json!({ "handle": handle, "rasters": 4 }));
+    assert_eq!(drawn["height"], 25 * 4);
+}
+
+// "The Gate Array" (Grim), Byte/Pixel structure: each mode's byte from bit 7
+// to bit 0, each bit named by the pixel it belongs to, A the leftmost, and by
+// the bit of that pixel's pen it is; mode 2's bits are each a whole pen, and
+// mode 3 reads none of the bits written x.
+const BYTE_PIXEL_STRUCTURE: [&str; 4] = [
+    "A0 B0 A2 B2 A1 B1 A3 B3",
+    "A0 B0 C0 D0 A1 B1 C1 D1",
+    "A B C D E F G H",
+    "A0 B0 x x A1 B1 x x",
+];
+
+#[test]
+fn a_byte_becomes_pixels_as_the_gate_array_reads_it() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    let pens: Vec<u8> = (0..16).collect();
+    for (mode, structure) in BYTE_PIXEL_STRUCTURE.iter().enumerate() {
+        let bits: Vec<&str> = structure.split(' ').collect();
+        let pixels = bits
+            .iter()
+            .filter(|bit| **bit != "x")
+            .map(|bit| bit.as_bytes()[0])
+            .collect::<BTreeSet<u8>>()
+            .len();
+        for (place, bit) in (0..8).rev().zip(&bits) {
+            session.poke(&handle, json!("&4000"), &format!("{:02X}", 1u8 << place));
+            let (_, picture) = session.pictured(
+                "screen",
+                json!({
+                    "handle": handle, "reading": "linear", "base": "&4000", "width": 1,
+                    "height": 1, "mode": mode, "palette": pens,
+                }),
+            );
+            let mut expected = vec![0; 8];
+            if *bit != "x" {
+                let pixel = usize::from(bit.as_bytes()[0] - b'A');
+                let pen = bit[1..].parse::<u32>().map_or(1, |digit| 1 << digit);
+                let wide = 8 / pixels;
+                expected[pixel * wide..][..wide].fill(pen);
+            }
+            let expected = [expected.clone(), expected].concat();
+            assert_eq!(picture.indices, expected, "mode {mode}, bit {place}");
+        }
+    }
+}
+
+// Mode 2 lights a pixel for each bit set, so a byte with one bit set shows
+// where screen placed it, each a bit further right than the last. The bytes
+// from &0000 lie under the lower ROM, which the processor reads instead, and
+// which a screen does not.
+#[test]
+fn linear_and_columns_lay_out_the_bytes_and_wrap_at_the_end_of_the_ram() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(&handle, json!("&FFFD"), "804020");
+    session.poke(&handle, json!(0), "100804");
+    assert_eq!(session.peek(&handle, json!(0), 3), "000000");
+    let lit = |session: &mut Session, reading: &str| {
+        let (_, picture) = session.pictured(
+            "screen",
+            json!({
+                "handle": handle, "reading": reading, "base": "&FFFD", "width": 3,
+                "height": 2, "mode": 2,
+            }),
+        );
+        (0..picture.height)
+            .step_by(2)
+            .map(|y| {
+                (0..picture.width)
+                    .filter(|x| picture.at(*x, y) == 1)
+                    .collect()
+            })
+            .collect::<Vec<Vec<usize>>>()
+    };
+    assert_eq!(
+        lit(&mut session, "linear"),
+        [vec![0, 9, 18], vec![3, 12, 21]]
+    );
+    assert_eq!(
+        lit(&mut session, "columns"),
+        [vec![0, 10, 20], vec![1, 11, 21]]
+    );
+}
+
+// A row read as the video hardware reads it wraps inside its 2K, "rather
+// than running on into the next one", and its next line lies 2K on
+// (colophon-player's docs/debugger/screen.en.md, "The readings"); an odd
+// base begins at the second byte of its character. Mode 2 lights a pixel for
+// each bit set.
+#[test]
+fn a_video_row_wraps_inside_its_2k_and_may_begin_at_an_odd_byte() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(&handle, json!("&C7FE"), "8040");
+    session.poke(&handle, json!("&C000"), "2010");
+    session.poke(&handle, json!("&CFFE"), "0804");
+    session.poke(&handle, json!("&C800"), "0201");
+    let lit = |session: &mut Session, base: &str, width: u32, height: u32| {
+        let (_, picture) = session.pictured(
+            "screen",
+            json!({
+                "handle": handle, "reading": "video", "base": base, "width": width,
+                "height": height, "rasters": 8, "mode": 2,
+            }),
+        );
+        (0..picture.height)
+            .step_by(2)
+            .map(|y| {
+                (0..picture.width)
+                    .filter(|x| picture.at(*x, y) == 1)
+                    .collect()
+            })
+            .collect::<Vec<Vec<usize>>>()
+    };
+    assert_eq!(
+        lit(&mut session, "&C7FE", 4, 2),
+        [vec![0, 9, 18, 27], vec![4, 13, 22, 31]]
+    );
+    assert_eq!(lit(&mut session, "&C7FF", 2, 1), [vec![1, 10]]);
+}
+
+// RAM configuration 4 pages the second 64K's first bank in at &4000 ("Ram
+// management", cpctech, https://cpctech.cpcwiki.de/docs/rampage.html), and a
+// screen reads it at &10000, past the processor's reach.
+#[test]
+fn a_screen_reads_a_6128s_second_64k_at_its_own_addresses() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(&handle, json!("&4000"), "80");
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    assert_eq!(session.peek(&handle, json!("&4000"), 1), "00");
+    for base in [json!("&10000"), json!(65536)] {
+        let (drawn, picture) = session.pictured(
+            "screen",
+            json!({
+                "handle": handle, "reading": "linear", "base": base, "width": 1,
+                "height": 1, "mode": 2,
+            }),
+        );
+        assert_eq!(drawn["base"], 0x10000);
+        assert_eq!(picture.indices[..8], [1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+}
+
+#[test]
+fn screen_says_what_would_have_worked() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc464");
+    let spectrum = session.open("spectrum48");
+    let refused = |session: &mut Session, arguments: Value| {
+        let mut arguments = arguments;
+        if arguments.get("handle").is_none() {
+            arguments["handle"] = json!(cpc);
+        }
+        session.refusal("screen", arguments)
+    };
+    assert_eq!(
+        refused(&mut session, json!({ "handle": spectrum })),
+        "screen reads a CPC's memory as its video hardware does, and a Spectrum's picture is read \
+         by monitor"
+    );
+    assert_eq!(
+        refused(&mut session, json!({})),
+        "R1 is 0, which gives a width of 0, and a screen reads from 1 to 128; give width"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "width": 80 })),
+        "R6 is 0, which with rasters of 1 gives a height of 0, and a screen reads from 1 to 512; \
+         give height"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "reading": "linear", "rasters": 8 })),
+        "rasters is read by the video reading alone: a flat buffer or one in columns has rows of \
+         one line; give it with the video reading, or leave it out"
+    );
+    assert_eq!(
+        refused(
+            &mut session,
+            json!({ "base": "&C800", "width": 2, "height": 2 })
+        ),
+        "&C800 is no display start: the video reading reads the base 64K, and there A13 to A11 \
+         carry the raster line, so a base is &0000 to &07FF, &4000 to &47FF, &8000 to &87FF or \
+         &C000 to &C7FF; linear and columns read the rest"
+    );
+    assert_eq!(
+        refused(
+            &mut session,
+            json!({ "reading": "columns", "base": "&10000", "width": 2, "height": 2 })
+        ),
+        "&10000 is past the RAM, which ends at &FFFF"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "base": "&200000" })),
+        "\"&200000\" is no address in the RAM; an address in the RAM is a number from 0 to \
+         131071, or hexadecimal from &00000 to &1FFFF, written with &, #, $ or 0x before it"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "width": 129 })),
+        "width is 129, and a screen reads from 1 to 128"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "height": 0 })),
+        "height is 0, and a screen reads from 1 to 512"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "mode": 4 })),
+        "mode is 4, and the Gate Array's modes are 0 to 3"
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "palette": [1, 2, 32] })),
+        "palette is [1, 2, 32], and a palette is sixteen hardware colour codes, one for each pen, \
+         each from 0 to 31"
+    );
+}
+
+// Zilog's mnemonics for these bytes (Z80 CPU User Manual, UM0080), read
+// through the lower ROM the processor sees at &0000 rather than the RAM
+// beneath it, a relative jump's target worked out from the end of the jump,
+// and ED FF named as WinAPE names it ("Using the Debugger",
+// http://www.winape.net/help/debug.html).
+#[test]
+fn a_listing_reads_memory_as_the_processor_would() {
+    let program = [
+        DI, LD_HL, 0x34, 0x12, PREFIX_DD, LD_HL, 0x78, 0x56, JR, 0xFE, PREFIX_DD, LD_A_AT_HL, 0xFB,
+        0xED, 0xFF,
+    ];
+    let roms = Roms::programmed("cpc464.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(&handle, json!(0), "C9C9C9C9");
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": 0, "instructions": 6 }),
+    );
+    assert_eq!(
+        listed,
+        json!({ "instructions": [
+            { "address": 0, "bytes": "F3", "text": "DI" },
+            { "address": 1, "bytes": "213412", "text": "LD HL,&1234" },
+            { "address": 4, "bytes": "DD217856", "text": "LD IX,&5678" },
+            { "address": 8, "bytes": "18FE", "text": "JR &0008" },
+            { "address": 10, "bytes": "DD7EFB", "text": "LD A,(IX-&05)" },
+            { "address": 13, "bytes": "EDFF", "text": "BRK" },
+        ]})
+    );
+    for (asked, given) in [(None, 16), (Some(256), 256)] {
+        let mut arguments = json!({ "handle": handle, "address": 15 });
+        if let Some(asked) = asked {
+            arguments["instructions"] = json!(asked);
+        }
+        let listed = session.answer("disassemble", arguments);
+        assert_eq!(listed["instructions"].as_array().unwrap().len(), given);
+    }
+}
+
+// An instruction at &FFFF reads on from &0000, as the program counter goes.
+#[test]
+fn a_listing_runs_past_ffff_as_the_program_counter_does() {
+    let roms = Roms::programmed("spectrum48.rom", &[0x34, 0x12]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&FFFF"), "21");
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": "&FFFF", "instructions": 2 }),
+    );
+    assert_eq!(
+        listed,
+        json!({ "instructions": [
+            { "address": 0xFFFF, "bytes": "213412", "text": "LD HL,&1234" },
+            { "address": 2, "bytes": "00", "text": "NOP" },
+        ]})
+    );
+}
+
+// What a step runs is one instruction listed, a chain of prefixes and all.
+#[test]
+fn a_chain_of_prefixes_is_listed_as_the_one_instruction_a_step_runs() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&8000"), "FDDDFD213412");
+    session.set(&handle, json!({ "cpu.pc": 0x8000 }));
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": "&8000", "instructions": 1 }),
+    );
+    assert_eq!(
+        listed["instructions"],
+        json!([{ "address": 0x8000, "bytes": "FDDDFD213412", "text": "LD IY,&1234" }])
+    );
+    let stepped = session.step(&handle, 1);
+    assert_eq!(stepped["pc"], 0x8006, "{stepped}");
+    assert_eq!(
+        (
+            session.inspect(&handle, "cpu.iyh"),
+            session.inspect(&handle, "cpu.ixh")
+        ),
+        (json!(0x12), json!(0))
+    );
+}
+
+#[test]
+fn disassemble_says_what_would_have_worked() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    for instructions in [0, 257] {
+        assert_eq!(
+            session.refusal(
+                "disassemble",
+                json!({ "handle": handle, "address": 0, "instructions": instructions })
+            ),
+            format!(
+                "instructions is {instructions}, and a listing takes from 1 to 256; disassemble \
+                 again from where it ends to go further"
+            )
+        );
+    }
+    session.fill(&handle, 0x8000, &[PREFIX_DD; 4096]);
+    assert_eq!(
+        session.refusal(
+            "disassemble",
+            json!({ "handle": handle, "address": "&8000" })
+        ),
+        "&8000 begins a chain of DD and FD prefixes that runs on to &8FFF, longer than the 4096 \
+         bytes a listing reads; the last of them rules the instruction they prefix, so \
+         disassemble from &8FFF"
+    );
+    // With its last three bytes an instruction, the chain and the
+    // instruction it prefixes come to the 4096 bytes a listing reads.
+    session.poke(&handle, json!("&8FFD"), "213412");
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": "&8000", "instructions": 2 }),
+    );
+    assert_eq!(
+        listed["instructions"].as_array().unwrap().len(),
+        1,
+        "{listed:.200}"
+    );
+    assert_eq!(listed["instructions"][0]["text"], "LD IX,&1234");
+}
+
+const KINDS: [&str; 5] = ["execute", "read", "write", "in", "out"];
+
+// What a run or a call counted, in the order it answered: each place as its
+// kind, by its place among KINDS, and its address or port, and how many
+// times it matched.
+fn places(list: &Value) -> Vec<((usize, u64), u64)> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|counted| {
+            let kind = KINDS
+                .iter()
+                .position(|kind| counted.get(*kind).is_some())
+                .expect("a kind");
+            let address = counted[KINDS[kind]].as_u64().expect("an address");
+            ((kind, address), counted["count"].as_u64().unwrap())
+        })
+        .collect()
+}
+
+// A machine gathering over a stretch, and its twin counting over the same
+// ticks, run again wherever either fills, see the same matches: the
+// gathering, tallied by place, is the count. Each pass of the program walks
+// 256 bytes, so both fill on the way.
+#[test]
+fn counting_a_stretch_is_tallying_a_gathering_of_it() {
+    for (file, machine, port, port_address) in [
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            json!({ "out": "&7F00", "mask": "&C000" }),
+            0x7F00,
+        ),
+        (
+            "spectrum48.rom",
+            "spectrum48",
+            json!({ "out": "&FE", "mask": "&01" }),
+            0x00FE,
+        ),
+    ] {
+        let roms = Roms::programmed(file, &passing(port_address));
+        let mut session = Session::start(&roms);
+        let conditions = json!([
+            { "execute": 0, "to": "&3FFF" },
+            { "read": "&9000", "to": "&90FF" },
+            { "write": "&7F00", "to": "&90FF" },
+            port,
+        ]);
+        let stretch = 3 * SPECTRUM_FRAME_TICKS;
+        let mut over = |list: &str| {
+            let handle = session.open(machine);
+            let (mut tick, mut runs) = (0, 0);
+            let mut tally: BTreeMap<(String, u64), u64> = BTreeMap::new();
+            while tick < stretch {
+                let mut arguments = json!({ "ticks": stretch - tick });
+                arguments[list] = conditions.clone();
+                let ran = session.run(&handle, arguments);
+                tick = ran["tick"].as_u64().unwrap();
+                runs += 1;
+                let seen: Vec<((String, u64), u64)> = if list == "gather" {
+                    seen(&ran["gathered"])
+                        .into_iter()
+                        .map(|(kind, address, _, _)| ((kind.to_owned(), address), 1))
+                        .collect()
+                } else {
+                    let counted = places(&ran["counted"]);
+                    assert!(ran.get("gathered").is_none(), "{ran}");
+                    // Executes first, then reads, writes and ports, each
+                    // kind by address, and a full count holds 512 places
+                    // and the rest of the instruction that filled it.
+                    assert!(
+                        counted.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                        "{ran}"
+                    );
+                    if ran["stopped"] == "full" {
+                        assert!(counted.len() >= 512, "{ran}");
+                    }
+                    counted
+                        .into_iter()
+                        .map(|((kind, address), count)| ((KINDS[kind].to_owned(), address), count))
+                        .collect()
+                };
+                for (place, count) in seen {
+                    *tally.entry(place).or_insert(0) += count;
+                }
+            }
+            (tick, runs, tally)
+        };
+        let (gathered_to, gatherings, gathered) = over("gather");
+        let (counted_to, countings, counted) = over("count");
+        assert_eq!(gathered_to, counted_to, "{machine}");
+        assert_eq!(gathered, counted, "{machine}");
+        assert!(
+            gatherings > 10 && countings > 1,
+            "{machine}: {gatherings} gatherings, {countings} countings"
+        );
+    }
+}
+
+// Each place is counted by its whole address, so two values sent to the
+// Spectrum's ULA with OUT (&FE),A, whose high byte is A, are two places of one
+// condition; the instruction a run stops before is not yet counted; and a JR
+// to itself, 12 T-states each time from the ROM, where nothing holds the
+// processor (UM0080), is counted 1000 times in 12000 ticks, and gathered and
+// counted alike where one run does both.
+#[test]
+fn a_count_counts_each_place_by_its_whole_address_however_often() {
+    let program = [
+        DI, LD_A, 0x05, OUT_N_A, 0xFE, LD_A, 0x06, OUT_N_A, 0xFE, JR, 0xFE,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 1000,
+            "until": [{ "execute": 9 }],
+            "count": [{ "execute": 0, "to": 9 }, { "out": "&FE", "mask": "&01" }],
+        }),
+    );
+    assert_eq!(ran["stopped"], "matched", "{ran}");
+    assert_eq!(
+        ran["counted"],
+        json!([
+            { "execute": 0, "count": 1 },
+            { "execute": 1, "count": 1 },
+            { "execute": 3, "count": 1 },
+            { "execute": 5, "count": 1 },
+            { "execute": 7, "count": 1 },
+            { "out": 0x05FE, "count": 1 },
+            { "out": 0x06FE, "count": 1 },
+        ])
+    );
+    let jump = json!([{ "execute": 9 }]);
+    let ran = session.run(&handle, json!({ "ticks": 12000, "count": jump }));
+    assert_eq!(
+        (&ran["ticks"], &ran["counted"]),
+        (&json!(12000), &json!([{ "execute": 9, "count": 1000 }])),
+        "{ran}"
+    );
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 120, "count": jump, "gather": jump }),
+    );
+    assert_eq!(seen(&ran["gathered"]).len(), 10, "{ran}");
+    assert_eq!(ran["counted"], json!([{ "execute": 9, "count": 10 }]));
+}
+
+// The stand-in firmware is zeros, NOPs from &0000 on, each beginning at an
+// address of its own; interrupts are disabled at power-on.
+#[test]
+fn a_count_that_fills_stops_and_the_next_run_counts_on() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    let counting = json!([{ "execute": 0, "to": "&3FFF" }]);
+    for first in [0, 512] {
+        let ran = session.run(&handle, json!({ "frames": 1, "count": counting }));
+        assert_eq!(
+            (&ran["stopped"], &ran["pc"]),
+            (&json!("full"), &json!(first + 512)),
+            "{ran}"
+        );
+        let expected: Vec<Value> = (first..first + 512)
+            .map(|address| json!({ "execute": address, "count": 1 }))
+            .collect();
+        assert_eq!(ran["counted"], json!(expected));
+    }
+    let ran = session.run(&handle, json!({ "ticks": 4 }));
+    assert!(ran.get("counted").is_none(), "{ran}");
 }
 
 // The firmware tier: the emulator's own fetched firmware and its command line,
@@ -3029,6 +4041,34 @@ fn the_spectrums_frame_count_is_written_by_its_interrupt_handler() {
     );
 }
 
+// The frame's interrupt is answered at &0038 once a frame, and MASK-INT
+// writes FRAMES from &003E once each time; FRAMES is "incremented every 20
+// ms" (The Complete Spectrum ROM Disassembly, 0038). Counted over fifty
+// frames, both are fifty, and FRAMES is fifty on.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn the_spectrums_interrupt_handler_is_counted_once_a_frame() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 150 }));
+    let frames = |session: &mut Session| {
+        u16::from_str_radix(&session.peek(&handle, json!("&5C78"), 2), 16)
+            .map(u16::swap_bytes)
+            .expect("FRAMES")
+    };
+    let before = frames(&mut session);
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 50, "count": [{ "execute": "&0038" }, { "execute": "&003E" }] }),
+    );
+    assert_eq!(
+        ran["counted"],
+        json!([{ "execute": 0x0038, "count": 50 }, { "execute": 0x003E, "count": 50 }]),
+        "{ran}"
+    );
+    assert_eq!(frames(&mut session), before.wrapping_add(50));
+}
+
 // The Gate Array raises an interrupt each time R52 has counted 52 HSYNCs
 // ("The Amstrad CPC CRTC Compendium" v1.11, ch. 27.3.1,
 // https://shaker.logonsystem.eu/ACCC1.11-EN.pdf), and the firmware's standard
@@ -3123,4 +4163,116 @@ fn a_spectrum_rom_routine_called_returns_what_its_disassembly_says() {
         (&json!(0x40), &json!(0x01), &json!(5))
     );
     assert_eq!(cpu["sp"], before["sp"]);
+}
+
+// The emulator's command line boots a machine for as many of its frames, its
+// standard frames' ticks, and writes its picture, which the png crate reads
+// back as colours.
+fn command_line_screenshot(machine: &str, frames: u64, path: &Path) -> (usize, usize, Vec<u32>) {
+    let command_line = emulator().join("build/emulator");
+    let output = Command::new(command_line)
+        .arg("boot")
+        .args(["--machine", machine, "--frames", &frames.to_string()])
+        .arg("--roms")
+        .arg(firmware())
+        .arg("--screenshot")
+        .arg(path)
+        .output()
+        .expect("the command line runs");
+    assert!(output.status.success(), "{output:?}");
+    let file = fs::File::open(path).expect("the screenshot");
+    let mut reader = png::Decoder::new(std::io::BufReader::new(file))
+        .read_info()
+        .expect("a PNG");
+    let mut pixels = vec![0; reader.output_buffer_size().expect("a size")];
+    let frame = reader.next_frame(&mut pixels).expect("its pixels");
+    assert_eq!(
+        (frame.color_type, frame.bit_depth),
+        (png::ColorType::Rgb, png::BitDepth::Eight)
+    );
+    let colours = pixels
+        .chunks(3)
+        .map(|rgb| u32::from_be_bytes([0, rgb[0], rgb[1], rgb[2]]))
+        .collect();
+    (frame.width as usize, frame.height as usize, colours)
+}
+
+// Each machine booted on its own firmware shows on its monitor what the
+// command line's screenshot shows after as many frames, pixel for pixel. The
+// server runs on to the end of the instruction standing there, a few ticks
+// past the command line, which paints nothing new where the picture stands
+// still.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn each_machines_monitor_shows_what_the_command_lines_screenshot_does() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    for machine in MACHINES {
+        let name = machine.name;
+        let path = scratch.0.join(format!("{name}.png"));
+        let (width, height, colours) = command_line_screenshot(name, 100, &path);
+        let handle = session.open(name);
+        let frame = if name.starts_with("cpc") {
+            CPC_FRAME_TICKS
+        } else {
+            SPECTRUM_FRAME_TICKS
+        };
+        session.run(&handle, json!({ "ticks": 100 * frame }));
+        let (_, monitor) = session.pictured("monitor", json!({ "handle": handle }));
+        assert_eq!((monitor.width, monitor.height), (width, height), "{name}");
+        let shown: Vec<u32> = monitor
+            .indices
+            .iter()
+            .map(|index| monitor.palette[usize::from(*index)])
+            .collect();
+        let differing = shown
+            .iter()
+            .zip(&colours)
+            .filter(|(shown, written)| shown != written)
+            .count();
+        assert_eq!(differing, 0, "{name}");
+    }
+}
+
+// The firmware's screen, read by screen with nothing asked, is the monitor's
+// picture where the display falls: the start the firmware writes into R12
+// and R13, its mode 1 and its inks.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn the_firmwares_screen_is_the_6845s_reading_of_its_memory() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "frames": 100 }));
+    let (_, monitor) = session.pictured("monitor", json!({ "handle": handle }));
+    let (drawn, screen) = session.pictured("screen", json!({ "handle": handle }));
+    assert_eq!(
+        (
+            &drawn["base"],
+            &drawn["mode"],
+            &drawn["width"],
+            &drawn["height"]
+        ),
+        (&json!(0xC000), &json!(1), &json!(80), &json!(200))
+    );
+    let inks: Vec<u8> = drawn["palette"]
+        .as_array()
+        .expect("a palette")
+        .iter()
+        .map(|code| code.as_u64().unwrap() as u8)
+        .collect();
+    let display = (272 - 208, (70 - 34) * 2);
+    let mut lit = 0;
+    for y in 0..screen.height {
+        let shown = &monitor.indices[(display.1 + y) * monitor.width + display.0..][..640];
+        let drawn: Vec<u8> = screen.indices[y * 640..][..640]
+            .iter()
+            .map(|pen| inks[usize::from(*pen)])
+            .collect();
+        assert_eq!(shown, drawn.as_slice(), "line {y}");
+        lit += screen.indices[y * 640..][..640]
+            .iter()
+            .filter(|pen| **pen != 0)
+            .count();
+    }
+    assert!(lit > 1000, "{lit} pixels of the firmware's text");
 }
