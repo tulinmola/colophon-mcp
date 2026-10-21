@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -11,9 +11,10 @@ use crate::disassembly;
 use crate::emulator::{
     CPC_FRAMEBUFFER_WIDTH, CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_FRAMEBUFFER_WIDTH,
     SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE, SPECTRUM_TICKS_PER_FRAME, cpc_t,
-    spectrum_t, z80_t,
+    keyboard_t, spectrum_t, z80_t,
 };
 use crate::fields::{self, Fields, Segment};
+use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
     COUNT, COUNTS_PER_KIND, Condition, Cpc, KINDS, Kind, Match, Run, Spectrum, Watch,
     gate_array_rgb, ula_rgb,
@@ -119,7 +120,7 @@ pub fn named(name: &str) -> Option<&'static Machine> {
     MACHINES.iter().find(|machine| machine.name == name)
 }
 
-// A file a machine was built from, named by what it holds.
+// A file read for a machine or written from one, named by what it holds.
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct FileRead {
     /// Where the file was read.
@@ -129,13 +130,84 @@ pub struct FileRead {
 }
 
 impl FileRead {
-    fn of(path: &Path, contents: &[u8]) -> FileRead {
+    pub fn of(path: &Path, contents: &[u8]) -> FileRead {
         let digest = Sha256::digest(contents);
         FileRead {
             path: path.to_owned(),
             sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
         }
     }
+}
+
+pub const DISCS: &str = "a disc is a DSK image, of the original layout or the extended one";
+pub const TAPES: &str = "a tape is a .tap, of bare blocks at the ROM's own timings, or a .tzx";
+
+// A file read whole, refused by its size before it is read, so that neither
+// a pipe nor a device can hold the server up; `what` names it and `takes`
+// says what would be read.
+fn read_whole(path: &Path, largest: u64, what: &str, takes: &str) -> Result<Vec<u8>, String> {
+    let unreadable = |error: io::Error| {
+        format!(
+            "cannot read {}: {error}; {what} is named by its path on the file system the server \
+             runs on",
+            path.display()
+        )
+    };
+    let metadata = fs::metadata(path).map_err(unreadable)?;
+    if !metadata.is_file() || metadata.len() > largest {
+        return Err(format!(
+            "{} is not a file of at most {largest} bytes; {takes}",
+            path.display()
+        ));
+    }
+    let mut contents = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(largest + 1).read_to_end(&mut contents))
+        .map_err(unreadable)?;
+    if contents.len() as u64 > largest {
+        return Err(format!(
+            "{} grew past {largest} bytes while it was read; {takes}",
+            path.display()
+        ));
+    }
+    Ok(contents)
+}
+
+// Writes a file only where none is, so that none is ever written over, and
+// takes away what it began if it cannot finish.
+pub fn write_new(path: &Path, contents: &[u8]) -> Result<FileRead, String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} is taken, and a file is written only where none is: give a path that \
+                     names nothing yet",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "cannot write {}: {error}; a file is written at a path on the file system \
+                     the server runs on, in a directory that is there",
+                    path.display()
+                )
+            }
+        })?;
+    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        drop(file);
+        let begun = match fs::remove_file(path) {
+            Ok(()) => "what was begun there is taken away again",
+            Err(_) => "what was begun there is left, unfinished, and holds that path",
+        };
+        return Err(format!(
+            "cannot write {}: {error}; {begun}, and the file is written again when asked, at a \
+             path the file system can take it at",
+            path.display()
+        ));
+    }
+    Ok(FileRead::of(path, contents))
 }
 
 // What a machine is built from, read and checked, so that building it
@@ -263,43 +335,102 @@ impl Machine {
     }
 
     // A file that is no snapshot of this machine's is refused by its size
-    // before it is read, so that neither a pipe nor a device can hold the
-    // server up. A Spectrum's is one length; a CPC's of version 3 may carry
-    // chunks of its writer's own after its memory, as many as it kept
+    // before it is read. A Spectrum's is one length; a CPC's of version 3 may
+    // carry chunks of its writer's own after its memory, as many as it kept
     // ("Snapshot (.SNA) file format", cpctech), so its bound stands far past
     // them.
     fn snapshot(&self, path: &Path) -> Result<Vec<u8>, String> {
-        let unreadable = |error: io::Error| {
-            format!(
-                "cannot read {}: {error}; a snapshot is named by its path on the file system the \
-                 server runs on",
-                path.display()
-            )
-        };
         let largest = match self.board {
             Board::Cpc { .. } => 8 * 1024 * 1024,
             Board::Spectrum { .. } => u64::from(SPECTRUM_SNAPSHOT_SIZE),
         };
-        let metadata = fs::metadata(path).map_err(unreadable)?;
-        if !metadata.is_file() || metadata.len() > largest {
-            return Err(format!(
-                "{} is not a file of at most {largest} bytes; {}",
-                path.display(),
-                self.snapshots()
-            ));
+        read_whole(path, largest, "a snapshot", self.snapshots())
+    }
+
+    // A disc image, of either layout, describes at most 102 cylinders of two
+    // sides (FLOPPY_MAX_CYLINDERS and FLOPPY_MAX_SIDES in floppy.h), and a
+    // track of at most 65535 bytes, after a header of 256, which comes to
+    // under 14MB.
+    pub fn disc(&self, path: &Path) -> Result<Vec<u8>, String> {
+        self.takes_discs()?;
+        read_whole(path, 16 * 1024 * 1024, "a disc", DISCS)
+    }
+
+    // A tape is held whole for as long as it is in the deck. 90 minutes of
+    // tape at the ROM's own timings, where "a reset bit is encoded as two
+    // pulses of 855 tstates each, a set bit as two pulses of 1710 tstates
+    // each" (comp.sys.sinclair FAQ, 16K/48K reference), hold under 1.4MB at
+    // 3.5MHz, and the bound stands far past them.
+    pub fn tape(&self, path: &Path) -> Result<Vec<u8>, String> {
+        self.takes_tapes()?;
+        read_whole(path, 16 * 1024 * 1024, "a tape", TAPES)
+    }
+
+    // How many characters one request may type: as many as are held and let
+    // go in the frames a run may take.
+    pub fn most_typed(&self, most_frames: u32) -> usize {
+        let (held, released) = self.typing();
+        (u64::from(most_frames) * self.standard_frame() / (held + released)) as usize
+    }
+
+    // The ticks a key is held and then let go as text is typed.
+    pub fn typing(&self) -> (u64, u64) {
+        match self.board {
+            Board::Cpc { .. } => keys::cpc_typing(),
+            Board::Spectrum { .. } => keys::spectrum_typing(),
         }
-        let mut contents = Vec::new();
-        fs::File::open(path)
-            .and_then(|file| file.take(largest + 1).read_to_end(&mut contents))
-            .map_err(unreadable)?;
-        if contents.len() as u64 > largest {
-            return Err(format!(
-                "{} grew past {largest} bytes while it was read; {}",
-                path.display(),
-                self.snapshots()
-            ));
+    }
+
+    // A key of this machine's, by its name, or on a CPC by its number.
+    pub fn key(&self, given: &Value) -> Result<Key, String> {
+        match self.board {
+            Board::Cpc { .. } => keys::cpc_key(self.name, given),
+            Board::Spectrum { .. } => keys::spectrum_key(self.name, given),
         }
-        Ok(contents)
+    }
+
+    // The keys that type the text, or what no key types.
+    pub fn keystrokes(&self, text: &str) -> Result<Vec<Keystroke>, String> {
+        text.chars()
+            .map(|character| match self.board {
+                Board::Cpc { .. } => keys::cpc_keystroke(self.name, character),
+                Board::Spectrum { .. } => keys::spectrum_keystroke(self.name, character),
+            })
+            .collect()
+    }
+
+    // Whether the machine takes a disc, and what does if it does not.
+    pub fn takes_discs(&self) -> Result<(), String> {
+        match self.board {
+            Board::Cpc {
+                disc_interface: true,
+                ..
+            } => Ok(()),
+            Board::Cpc { .. } => Err(format!(
+                "a {} is built here as the emulator's command line builds one given no disc, \
+                 without a disc interface, and nothing here fits one afterwards; a cpc664 or a \
+                 cpc6128 takes a disc",
+                self.name
+            )),
+            Board::Spectrum { .. } => Err(format!(
+                "a {} has no disc drive; a cpc664 or a cpc6128 takes a disc, and a Spectrum a \
+                 tape",
+                self.name
+            )),
+        }
+    }
+
+    // Whether the machine takes a tape, and what does if it does not.
+    pub fn takes_tapes(&self) -> Result<(), String> {
+        match self.board {
+            Board::Spectrum { .. } => Ok(()),
+            Board::Cpc { .. } => Err(format!(
+                "a {} is given no tape here: the emulator has never loaded a tape through a CPC's \
+                 firmware, so nothing here could hold one to what the machine did; a spectrum48 \
+                 takes a tape, and a cpc664 or a cpc6128 a disc",
+                self.name
+            )),
+        }
     }
 
     // How long a frame of this machine is when nothing has reprogrammed it.
@@ -439,10 +570,119 @@ impl Built {
         }
     }
 
+    fn keyboard_mut(&mut self) -> &mut keyboard_t {
+        match &mut self.hardware {
+            Hardware::Cpc(cpc) => &mut cpc.machine_mut().keyboard,
+            Hardware::Spectrum(spectrum) => &mut spectrum.machine_mut().keyboard,
+        }
+    }
+
     // A run watches for what it is given, and a call's for its return as
-    // well.
-    pub fn run(&mut self, frames: u32, limit: u64, watching: &Watching) -> (Run, Watched) {
-        self.watched(frames, limit, watching, None)
+    // well. The keys are held down through it, on top of what the keyboard
+    // holds, which it is left holding.
+    pub fn run(
+        &mut self,
+        frames: u32,
+        limit: u64,
+        watching: &Watching,
+        keys: &[Key],
+    ) -> (Run, Watched) {
+        let kept = *self.keyboard_mut();
+        for key in keys {
+            self.keyboard_mut().press(*key);
+        }
+        let ran = self.watched(frames, limit, watching, None);
+        *self.keyboard_mut() = kept;
+        ran
+    }
+
+    // Types as the emulator's command line types: each keystroke's keys held
+    // down for `held` ticks, on top of what the keyboard holds, then the
+    // keyboard as it stood for `released`. Each stretch ends between
+    // instructions, as a run does, and is measured from where the typing
+    // began, so that a key goes down or comes up a few ticks from where the
+    // command line puts it, and the ticks one stretch runs past its end are
+    // not added to the next. A stretch that ends inside a chain of prefixes
+    // ends the typing there, as it ends a run, with the keyboard as it stood.
+    pub fn r#type(&mut self, keystrokes: &[Keystroke], held: u64, released: u64) -> Run {
+        let kept = *self.keyboard_mut();
+        let mut typed = Run {
+            ticks: 0,
+            frames: 0,
+            settled: true,
+        };
+        let mut until = 0;
+        for keystroke in keystrokes {
+            for key in keystroke.shift.into_iter().chain([keystroke.key]) {
+                self.keyboard_mut().press(key);
+            }
+            until += held;
+            self.run_until(until, &mut typed);
+            *self.keyboard_mut() = kept;
+            until += released;
+            if typed.settled {
+                self.run_until(until, &mut typed);
+            }
+            if !typed.settled {
+                break;
+            }
+        }
+        typed
+    }
+
+    fn run_until(&mut self, until: u64, typed: &mut Run) {
+        let nothing = Watching {
+            conditions: &[],
+            most_gathered: 0,
+            most_counted: 0,
+        };
+        let limit = until.saturating_sub(typed.ticks);
+        let (run, _) = self.watched(u32::MAX, limit, &nothing, None);
+        typed.ticks += run.ticks;
+        typed.frames += run.frames;
+        typed.settled = run.settled;
+    }
+
+    // Machine::disc and Machine::tape read a file only for a machine that
+    // takes it.
+    pub fn insert_disc(&mut self, drive: u8, contents: &[u8]) -> Result<(), String> {
+        match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.insert_disc(drive, contents),
+            Hardware::Spectrum(_) => unreachable!("a Spectrum is given no disc"),
+        }
+    }
+
+    pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
+        match &mut self.hardware {
+            Hardware::Spectrum(spectrum) => spectrum.insert_tape(contents),
+            Hardware::Cpc(_) => unreachable!("a CPC is given no tape"),
+        }
+    }
+
+    // The machine as the emulator's command line saves it, which a machine
+    // inside an instruction cannot be.
+    pub fn snapshot_save(&self) -> Result<Vec<u8>, String> {
+        let complete = match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.instruction_complete(),
+            Hardware::Spectrum(spectrum) => spectrum.instruction_complete(),
+        };
+        if !complete {
+            return Err(
+                "stands inside an instruction, as a run or a step leaves it in a chain of \
+                 prefixes, and a snapshot keeps no instruction half run; step it on to the \
+                 instruction's end"
+                    .to_owned(),
+            );
+        }
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.snapshot_save(),
+            Hardware::Spectrum(spectrum) => spectrum.snapshot_save().map_err(|problem| {
+                format!(
+                    "{problem}; a Spectrum's snapshot keeps the program counter in the two bytes \
+                     below the stack pointer, so cpu.sp stands from &4002 to &FFFF"
+                )
+            }),
+        }
     }
 
     fn watched(

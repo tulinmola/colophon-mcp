@@ -16,10 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
+use crate::keys::Key;
 use crate::machine::{
     COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, READ, Run, UNTIL, WRITE,
 };
-use crate::machines::{self, Built, FileRead, MACHINES, Machine, Watched, Watching};
+use crate::machines::{self, Built, DISCS, FileRead, MACHINES, Machine, TAPES, Watched, Watching};
 use crate::picture;
 use crate::screen::{Asked, MOST_HEIGHT, MOST_RASTERS, MOST_WIDTH, Reading};
 
@@ -414,6 +415,27 @@ fn watching(conditions: &[Condition]) -> Watching<'_> {
     }
 }
 
+fn keys_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "array",
+        "items": {
+            "anyOf": [
+                { "type": "string" },
+                { "type": "integer", "minimum": 0, "maximum": 79 },
+            ]
+        },
+    })
+}
+
+// The keys a request holds down, each found on the machine.
+fn keys(machine: &Machine, given: Option<&Vec<Value>>) -> Result<Vec<Key>, String> {
+    given
+        .into_iter()
+        .flatten()
+        .map(|key| machine.key(key))
+        .collect()
+}
+
 fn hexadecimal(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
@@ -486,6 +508,11 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     count: Option<Value>,
+    /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are.
+    #[schemars(schema_with = "keys_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    keys: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -520,6 +547,54 @@ struct CallRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     count: Option<Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TypeRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// What to type: "PRINT 2+2\n" on a CPC, "p2+2\n" on a Spectrum, whose ROM reads a letter typed where the cursor shows K as a keyword.
+    text: String,
+}
+
+// A CPC's two drives, as AMSDOS names them.
+#[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
+enum Drive {
+    /// The machine's own drive, of one head.
+    A,
+    /// A second drive, of two heads.
+    B,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DiscRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The disc image: its path on the file system the server runs on, a relative one read from the server's working directory.
+    path: PathBuf,
+    /// The drive the disc goes into; A if not given.
+    #[schemars(transform = absent_not_null)]
+    drive: Option<Drive>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TapeRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The tape image: its path on the file system the server runs on, a relative one read from the server's working directory.
+    path: PathBuf,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SaveRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// Where to write the snapshot: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory.
+    path: PathBuf,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -660,6 +735,32 @@ struct Listing {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct Inserted {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The drive the disc went into.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    drive: Option<Drive>,
+    /// The machine's tick as it went in.
+    tick: u64,
+    #[serde(flatten)]
+    file: FileRead,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Saved {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The machine's tick as it was saved.
+    tick: u64,
+    /// Where the snapshot was written.
+    path: PathBuf,
+    /// The SHA-256 of what was written, in hexadecimal.
+    sha256: String,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct Closed {
     /// The handle the machine had, which names nothing now.
     handle: String,
@@ -676,6 +777,8 @@ enum Stopped {
     Ticks,
     /// The instructions asked for were run.
     Instructions,
+    /// The text was typed, each key held and let go.
+    Typed,
     /// An instruction did not end in the longest any instruction takes, as a chain of prefixes does not, and the machine stands inside it.
     Unsettled,
     /// A condition of until matched.
@@ -1045,6 +1148,17 @@ impl Server {
             .ok_or_else(|| threads.unknown(handle))
     }
 
+    // Does work on files where it may block, as reading a pipe can, without
+    // holding up the server; `files` names them if it cannot be done.
+    async fn blocking<T: Send + 'static>(
+        files: String,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        tokio::task::spawn_blocking(work).await.map_err(|error| {
+            format!("{files} could not be reached: {error}; the server's error output says why")
+        })?
+    }
+
     // Has the machine's own thread do the work, and waits for it without
     // holding up the server, so that machines run side by side.
     async fn ask<T: Send + 'static>(
@@ -1102,19 +1216,12 @@ impl Server {
             threads.opened += 1;
             threads.opened
         };
-        // Read where it may block, as a pipe can, without holding up the
-        // server.
         let roms = self.roms.clone();
-        let parts =
-            tokio::task::spawn_blocking(move || machine.parts(&roms, request.snapshot.as_deref()))
-                .await
-                .map_err(|error| {
-                    format!(
-                        "the files {} is built from could not be read: {error}; the server's \
-                         error output says why",
-                        machine.name
-                    )
-                })??;
+        let parts = Server::blocking(
+            format!("the files {} is built from", machine.name),
+            move || machine.parts(&roms, request.snapshot.as_deref()),
+        )
+        .await?;
         let files = parts.files.clone();
         let handle = format!("{}-{opened}", machine.name);
         // A CPC is built only while no other runs, and the waiting is its
@@ -1222,7 +1329,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step and call moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1237,6 +1344,7 @@ impl Server {
             request.gather.as_ref(),
             request.count.as_ref(),
         )?;
+        let keys = keys(machine, request.keys.as_ref())?;
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let ran = match (request.frames, request.ticks) {
@@ -1252,7 +1360,7 @@ impl Server {
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
-                    let (run, watched) = built.run(frames, limit, &watching(&conditions));
+                    let (run, watched) = built.run(frames, limit, &watching(&conditions), &keys);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
                     } else {
@@ -1275,7 +1383,7 @@ impl Server {
                         )
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
-                    let (run, watched) = built.run(u32::MAX, ticks, &watching(&conditions));
+                    let (run, watched) = built.run(u32::MAX, ticks, &watching(&conditions), &keys);
                     Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering, counting)
                 })
                 .await?
@@ -1367,6 +1475,149 @@ impl Server {
         Ok(Json(ran))
     }
 
+    /// Type text at a machine as the emulator's command line types it with --type: each character's key held down, with the shift it needs, for 3 standard frames, then let go for 3 on a CPC and 6 on a Spectrum, long enough for each machine's firmware to see a key go down and come up, and to take the same key twice. Keys are pressed, not characters handed over, so what arrives is what the firmware makes of them: on a Spectrum a letter typed where the cursor shows K is a keyword, so "p" at the start of a line is PRINT, and "j" then two of "\"" is LOAD "". Keys the keyboard holds already, as set writes them, stay held through the typing, where the command line lets every key go. A newline is RETURN on a CPC and ENTER on a Spectrum; on a CPC a tab is TAB, an escape, \u001b, ESC, and a backspace, \b, DEL. Keys that type no character, such as COPY, the function keys and the joysticks, and a character outside ASCII, such as a CPC's £, SHIFT with ^, are held by run's keys. A text is ASCII, and one holding a character no key types, alone or with a shift, is refused before a key goes down. The firmware takes no key until it has started, and the command line waits 78 frames for a CPC's and 128 for a Spectrum's, whose ROM takes none before frame 85; a program reading the keyboard only now and then loses the keys pressed between, so type at it a character at a time, with runs between that stop where it reads the keyboard. At most 250 characters on a CPC and 166 on a Spectrum, 1500 frames' worth. Each key goes down and comes up between instructions, a few ticks at most from where the command line puts it, counting from where the typing began, and the typing ends at the end of the instruction standing as its frames' ticks run out, so the answer is a run's that took those ticks and a few more. A stretch that ends inside a chain of prefixes ends the typing there, unsettled, as it ends a run.
+    #[tool(
+        name = "type",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn r#type(
+        &self,
+        Parameters(request): Parameters<TypeRequest>,
+    ) -> Result<Json<Ran>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        let most = machine.most_typed(MOST_FRAMES);
+        let characters = request.text.chars().count();
+        if !(1..=most).contains(&characters) {
+            let rest = if characters == 0 {
+                "give a character or more"
+            } else {
+                "type the rest in another request"
+            };
+            return Err(format!(
+                "text holds {characters} characters, and from 1 to {most} are typed at a {} at \
+                 once, {MOST_FRAMES} frames' worth; {rest}",
+                machine.name
+            ));
+        }
+        let keystrokes = machine.keystrokes(&request.text)?;
+        let (held, released) = machine.typing();
+        let ran = Server::ask(&request.handle, orders, move |built| {
+            let run = built.r#type(&keystrokes, held, released);
+            Ran::of(run, built, Stopped::Typed)
+        })
+        .await?;
+        Ok(Json(ran))
+    }
+
+    /// Put a disc in a CPC's drive: a DSK image, of the original layout or the extended one, read whole from its path on the file system the server runs on and copied into the machine, with room for every track to be formatted again, as the emulator's command line gives a disc with --disc. What the machine writes lands in its copy and never in the file, and is gone once another disc takes the copy's place; nothing here writes a disc out. The disc takes the place of whatever disc the drive held, as a game's second side does when the game asks for it. A cpc664 and a cpc6128 take discs; a cpc464 is built here as the command line builds one given no disc, without the disc interface, and nothing here fits one afterwards, so its discs go to a cpc664 or a cpc6128; a Spectrum has no drive. An image the emulator cannot read is refused, with what is wrong with it, and the drive keeps the disc it had. The answer names the file by its SHA-256, with the machine's tick as the disc went in.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn disc_insert(
+        &self,
+        Parameters(request): Parameters<DiscRequest>,
+    ) -> Result<Json<Inserted>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        let drive = request.drive.unwrap_or(Drive::A);
+        let path = request.path;
+        let read = path.clone();
+        let (contents, file) = Server::blocking(path.display().to_string(), move || {
+            let contents = machine.disc(&read)?;
+            let file = FileRead::of(&read, &contents);
+            Ok((contents, file))
+        })
+        .await?;
+        let number = match drive {
+            Drive::A => 0,
+            Drive::B => 1,
+        };
+        let tick = Server::ask(&request.handle, orders, move |built| {
+            built.insert_disc(number, &contents)?;
+            Ok::<_, String>(built.tick())
+        })
+        .await?
+        .map_err(|problem| format!("{}: {problem}; {DISCS}", path.display()))?;
+        Ok(Json(Inserted {
+            handle: request.handle,
+            drive: Some(drive),
+            tick,
+            file,
+        }))
+    }
+
+    /// Put a tape in a Spectrum's deck and press PLAY: a .tap, bare blocks at the ROM's own timings, or a .tzx, read whole from its path on the file system the server runs on and copied into the machine, as the emulator's command line gives a tape with --tape. A Spectrum has no motor line, so the tape plays from its start as the machine runs, whatever the machine does: put it in just before the program asks for it, as LOAD "" does, since a header's pilot tone lasts 5 seconds and the ROM listens for only part of it. A tape stops where a block marks it to stop, as a multiload's does between its parts, and nothing here presses PLAY again, so such a tape loads its first part and waits, as it does on the command line. Blocks the emulator's reader cannot play, a waveform recorded sample by sample, data built from a table of symbols, blocks visited out of order, or a block whose ID it does not know, are refused as the tape goes in, and the deck keeps the tape it had. The tape takes the place of whatever tape the deck held. A CPC is given no tape here: the emulator has never loaded one through a CPC's firmware, so nothing could hold such a loading to what the machine did. The answer names the file by its SHA-256, with the machine's tick as the tape went in.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn tape_insert(
+        &self,
+        Parameters(request): Parameters<TapeRequest>,
+    ) -> Result<Json<Inserted>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        let path = request.path;
+        let read = path.clone();
+        let (contents, file) = Server::blocking(path.display().to_string(), move || {
+            let contents = machine.tape(&read)?;
+            let file = FileRead::of(&read, &contents);
+            Ok((contents, file))
+        })
+        .await?;
+        let tick = Server::ask(&request.handle, orders, move |built| {
+            built.insert_tape(&contents)?;
+            Ok::<_, String>(built.tick())
+        })
+        .await?
+        .map_err(|problem| format!("{} {problem}; {TAPES}", path.display()))?;
+        Ok(Json(Inserted {
+            handle: request.handle,
+            drive: None,
+            tick,
+            file,
+        }))
+    }
+
+    /// Write a machine to a new file as a snapshot, in the format the emulator's command line writes with --save and machine_open reads: an SNA of version 1 for a CPC, the 48K .sna for a Spectrum. The file is written only where none is, at its path on the file system the server runs on, from the server's working directory if relative, so that nothing is ever written over: a path that names a file already is refused. A snapshot keeps less than the machine. Neither keeps whether the processor is halted, so a machine saved on HALT, waiting for an interrupt, runs on past the HALT as soon as it is read. A CPC's keeps no counters of the 6845's, so the machine read from it starts its frame from the top, and neither the disc controller nor the discs, so one saved inside a disc access does not go on with it. A Spectrum's keeps no beam position and no tape, and keeps the program counter in the two bytes below the stack pointer, in the file and not in the machine, so a machine read from it has lost what those two bytes held; a Spectrum whose stack pointer is below &4002, 0 among them, is refused. Refused inside an instruction, as a run or a step ending in a chain of prefixes leaves the machine. The machine is left as it stands. The answer names the file by its SHA-256, with the machine's tick.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn snapshot_save(
+        &self,
+        Parameters(request): Parameters<SaveRequest>,
+    ) -> Result<Json<Saved>, String> {
+        let (_, orders) = self.thread(&request.handle)?;
+        let handle = request.handle.clone();
+        let (bytes, tick) = Server::ask(&request.handle, orders, |built| {
+            Ok::<_, String>((built.snapshot_save()?, built.tick()))
+        })
+        .await?
+        .map_err(|problem| format!("{handle} {problem}"))?;
+        let path = request.path;
+        let written = Server::blocking(path.display().to_string(), move || {
+            machines::write_new(&path, &bytes)
+        })
+        .await?;
+        Ok(Json(Saved {
+            handle: request.handle,
+            tick,
+            path: written.path,
+            sha256: written.sha256,
+        }))
+    }
+
     /// Read what a machine holds, by its path: the whole machine, or the part a path names, as a C expression names it on the emulator's struct for the machine (cpc_t or spectrum_t, in its headers): cpu.pc, crtc.registers[12], gate_array.inks, fdc.units[0].head. Fields keep the names their headers give them, numbers are numbers, and a C enum's value is the name of its enumerator. Pointers are not followed; peek reads memory. Some fields are the chips' registers and counters, and some are the emulator's own machinery for stepping them a tick at a time, which no silicon holds as such: the headers say which.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -1418,7 +1669,7 @@ impl Server {
         }))
     }
 
-    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step or a call, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before. A machine not yet run shows a picture never painted.
+    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step, a call or typing, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before. A machine not yet run shows a picture never painted.
     #[tool(
         output_schema = schema_for_output::<Monitored>(),
         annotations(read_only_hint = true, open_world_hint = false)

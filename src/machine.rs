@@ -6,14 +6,19 @@ use std::ptr::NonNull;
 use std::sync::{PoisonError, RwLock};
 
 use crate::emulator::{
-    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, MCP_COUNTS_PER_KIND, MCP_KINDS,
+    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, FLOPPY_BYTES_PER_REVOLUTION,
+    FLOPPY_MAX_CYLINDERS, FLOPPY_MAX_SIDES, MCP_COUNTS_PER_KIND, MCP_KINDS,
     SPECTRUM_FRAMEBUFFER_HEIGHT, SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K,
-    SPECTRUM_ROM_SIZE, cpc_connect_monitor, cpc_fit_disc_interface, cpc_init, cpc_peek, cpc_poke,
-    cpc_remap, cpc_set_upper_rom, cpc_snapshot_load, cpc_t, gate_array_rgb as core_gate_array_rgb,
-    mcp_cpc_call, mcp_cpc_check, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check,
+    SPECTRUM_ROM_SIZE, SPECTRUM_TICKS_PER_MILLISECOND, cpc_connect_monitor, cpc_fit_disc_interface,
+    cpc_init, cpc_insert_disc, cpc_peek, cpc_poke, cpc_remap, cpc_set_upper_rom, cpc_snapshot_load,
+    cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, floppy_give_room, floppy_t,
+    gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
+    mcp_cpc_check, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check,
     mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t, spectrum_connect_monitor,
-    spectrum_init, spectrum_peek, spectrum_poke, spectrum_snapshot_load, spectrum_t,
-    ula_rgb as core_ula_rgb,
+    spectrum_init, spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek,
+    spectrum_poke, spectrum_snapshot_load, spectrum_snapshot_save, spectrum_snapshot_size,
+    spectrum_t, tape_init, tape_insert, tape_play, tape_t, tzx_machine_TZX_SPECTRUM,
+    tzx_next_pulse, tzx_open, tzx_t, ula_rgb as core_ula_rgb, z80_instruction_complete,
 };
 
 pub use crate::emulator::{
@@ -158,12 +163,51 @@ fn problem(sentence: *const c_char) -> String {
         .into_owned()
 }
 
+impl keyboard_t {
+    // Holds a key down, as line * 8 + bit.
+    pub fn press(&mut self, key: keyboard_key) {
+        // SAFETY: the core changes the line's byte, past the matrix nothing.
+        unsafe { keyboard_press(self, key) }
+    }
+}
+
+// Room past a disc's image for every track the medium can hold to be
+// formatted once more, a revolution's worth each, as the emulator's command
+// line gives a disc: FORMAT_ROOM in its cli/main.c.
+const FORMAT_ROOM: usize = FLOPPY_MAX_CYLINDERS as usize
+    * FLOPPY_MAX_SIDES as usize
+    * FLOPPY_BYTES_PER_REVOLUTION as usize;
+
+// A medium, and the image it borrows, which takes the machine's writes.
+type Disc = (Handed<floppy_t>, Handed<[u8]>);
+
+// The deck a Spectrum plays, and the reader it points at and asks for
+// pulses, as colophon-player's emulator/deck.h holds them
+// (https://github.com/tulinmola/colophon-player).
+struct Deck {
+    tape: tape_t,
+    reader: tzx_t,
+}
+
+// A deck, and the image its reader borrows.
+type Tape = (Handed<Deck>, Handed<[u8]>);
+
+// What a snapshot writer leaves behind: the bytes, or the core's sentence.
+fn saved(bytes: Vec<u8>, written: bool, sentence: *const c_char) -> Result<Vec<u8>, String> {
+    if written {
+        Ok(bytes)
+    } else {
+        Err(problem(sentence))
+    }
+}
+
 pub struct Cpc {
     machine: Handed<cpc_t>,
     upper_roms: BTreeMap<u8, Handed<[u8; 0x4000]>>,
     ram: Handed<[u8]>,
     _lower_rom: Handed<[u8; 0x4000]>,
     framebuffer: Handed<[u8]>,
+    discs: [Option<Disc>; 2],
 }
 
 impl Cpc {
@@ -199,6 +243,7 @@ impl Cpc {
             ram,
             _lower_rom: lower_rom,
             framebuffer,
+            discs: [None, None],
         }
     }
 
@@ -276,6 +321,62 @@ impl Cpc {
         }
     }
 
+    // Reads the image onto a medium of its own, with room to format every
+    // track again, and puts it in drive 0 or 1 in place of the disc there,
+    // which is freed once the drive no longer points at it. A refused image
+    // leaves the drive as it was.
+    pub fn insert_disc(&mut self, drive: u8, contents: &[u8]) -> Result<(), String> {
+        assert!(drive < 2, "a CPC has drives 0 and 1, not {drive}");
+        let length = contents.len();
+        let mut image = vec![0; length + FORMAT_ROOM].into_boxed_slice();
+        image[..length].copy_from_slice(contents);
+        let image = Handed::new(image);
+        // SAFETY: as for a machine, all-zero bytes are a value of every field.
+        let floppy = Handed::new(unsafe { Box::<floppy_t>::new_zeroed().assume_init() });
+        let mut sentence = std::ptr::null();
+        // SAFETY: the medium borrows the image, which is held beside it and
+        // freed with it, and reads no further than the length given.
+        let read = unsafe {
+            dsk_read(
+                floppy.as_ptr(),
+                image.as_ptr().cast(),
+                length,
+                &mut sentence,
+            )
+        };
+        if !read {
+            return Err(problem(sentence));
+        }
+        // SAFETY: the room given is as far as the image's buffer reaches, and
+        // the medium is held beside the machine until another takes its
+        // place in the drive.
+        unsafe {
+            floppy_give_room(floppy.as_ptr(), length + FORMAT_ROOM);
+            cpc_insert_disc(self.machine.as_ptr(), drive, floppy.as_ptr());
+        }
+        self.discs[usize::from(drive)] = Some((floppy, image));
+        Ok(())
+    }
+
+    // The machine as a version 1 snapshot.
+    pub fn snapshot_save(&self) -> Result<Vec<u8>, String> {
+        // SAFETY: the machine is only read.
+        let size = unsafe { cpc_snapshot_size(self.machine.as_ptr()) };
+        let mut bytes = vec![0; size];
+        let mut sentence = std::ptr::null();
+        // SAFETY: the machine is only read, and the bytes are as many as it
+        // says it needs.
+        let written = unsafe {
+            cpc_snapshot_save(
+                self.machine.as_ptr(),
+                bytes.as_mut_ptr(),
+                size,
+                &mut sentence,
+            )
+        };
+        saved(bytes, written, sentence)
+    }
+
     pub fn check(&self, written: &cpc_t) -> Result<(), String> {
         // SAFETY: both are only read.
         let sentence = unsafe { mcp_cpc_check(self.machine.as_ptr(), written) };
@@ -290,6 +391,12 @@ impl Cpc {
         // SAFETY: nothing else reaches the machine while this is borrowed,
         // because every call into the core borrows the machine as well.
         unsafe { &*self.machine.as_ptr() }
+    }
+
+    // Whether the processor stands between instructions.
+    pub fn instruction_complete(&self) -> bool {
+        // SAFETY: the processor is only read.
+        unsafe { z80_instruction_complete(&self.machine().cpu) }
     }
 
     pub fn ram(&self) -> &[u8] {
@@ -316,6 +423,7 @@ pub struct Spectrum {
     _ram: Handed<[u8]>,
     _rom: Handed<[u8; SPECTRUM_ROM_SIZE as usize]>,
     framebuffer: Handed<[u8]>,
+    tape: Option<Tape>,
 }
 
 impl Spectrum {
@@ -347,7 +455,77 @@ impl Spectrum {
             _ram: ram,
             _rom: rom,
             framebuffer,
+            tape: None,
         }
+    }
+
+    // Opens the image as a Spectrum's tape, puts it in the deck in place of
+    // the tape there, which is freed once the machine no longer points at
+    // it, and presses PLAY. A refused image leaves the deck as it was.
+    pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
+        let length = u32::try_from(contents.len()).expect("a tape of less than 4GB");
+        let image = Handed::new(contents.to_vec().into_boxed_slice());
+        // SAFETY: all-zero bytes are a value of every field of the deck and
+        // the reader, whose source is then a function pointer of None.
+        let deck = Handed::new(unsafe { Box::<Deck>::new_zeroed().assume_init() });
+        let deck_at = deck.as_ptr();
+        let mut sentence = std::ptr::null();
+        // SAFETY: the reader borrows the image, which is held beside it and
+        // freed with it, and reads no further than the length given.
+        let opened = unsafe {
+            tzx_open(
+                &raw mut (*deck_at).reader,
+                image.as_ptr().cast(),
+                length,
+                SPECTRUM_TICKS_PER_MILLISECOND,
+                tzx_machine_TZX_SPECTRUM,
+                &mut sentence,
+            )
+        };
+        if !opened {
+            return Err(problem(sentence));
+        }
+        // SAFETY: the deck points at its reader in the same allocation, and
+        // the machine at the deck, which is held beside the machine until
+        // another takes its place.
+        unsafe {
+            tape_init(&raw mut (*deck_at).tape);
+            tape_insert(
+                &raw mut (*deck_at).tape,
+                Some(tzx_next_pulse),
+                (&raw mut (*deck_at).reader).cast(),
+            );
+            spectrum_insert_tape(self.machine.as_ptr(), &raw mut (*deck_at).tape);
+            tape_play(&raw mut (*deck_at).tape);
+        }
+        self.tape = Some((deck, image));
+        Ok(())
+    }
+
+    // The machine as a 48K snapshot, which leaves the machine as it stands:
+    // the two bytes its program counter takes below the stack pointer are
+    // the snapshot's alone.
+    pub fn snapshot_save(&self) -> Result<Vec<u8>, String> {
+        // SAFETY: the machine is only read.
+        let size = unsafe { spectrum_snapshot_size(self.machine.as_ptr()) };
+        let mut bytes = vec![0; size];
+        let mut sentence = std::ptr::null();
+        // SAFETY: as for a CPC's.
+        let written = unsafe {
+            spectrum_snapshot_save(
+                self.machine.as_ptr(),
+                bytes.as_mut_ptr(),
+                size,
+                &mut sentence,
+            )
+        };
+        saved(bytes, written, sentence)
+    }
+
+    // Between instructions and owing the ULA nothing.
+    pub fn instruction_complete(&self) -> bool {
+        // SAFETY: the machine is only read.
+        unsafe { spectrum_instruction_complete(self.machine.as_ptr()) }
     }
 
     pub fn run(&mut self, frames: u32, limit: u64, watch: Option<&mut Watch>) -> Run {
@@ -1099,6 +1277,74 @@ mod tests {
         }
         assert_eq!(cpc.machine().fdc.drive.is_null(), before_any_command);
         cpc
+    }
+
+    // An image of one track holding one sector, laid out as "Extended DiSK
+    // image definition" (Kevin Thacker's cpctech,
+    // https://cpctech.cpcwiki.de/docs/extdsk.html) lays one out, which the
+    // controller's READ ID finds.
+    fn one_track_image(filler: u8) -> Vec<u8> {
+        let mut image = vec![0; 0x100];
+        image[..0x22].copy_from_slice(b"EXTENDED CPC DSK File\r\nDisk-Info\r\n");
+        image[0x30] = 1;
+        image[0x31] = 1;
+        image[0x34] = 3;
+        let mut track = vec![0; 0x100];
+        track[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        track[0x14] = 2;
+        track[0x15] = 1;
+        track[0x16] = 0x4E;
+        track[0x17] = filler;
+        track[0x18..0x20].copy_from_slice(&[0, 0, 0xC1, 2, 0, 0, 0x00, 0x02]);
+        track.resize(0x300, filler);
+        image.extend(track);
+        image
+    }
+
+    // Under the sanitizers, a disc or a tape given in place of another, or
+    // refused, leaves nothing pointing at what was freed: the machine runs on,
+    // reading the drive or the deck, after each.
+    #[test]
+    fn a_disc_or_a_tape_replaced_is_freed_once_nothing_points_at_it() {
+        let (workload, _) = cpc_workload();
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT));
+        cpc.fit_disc_interface(true);
+        for image in [
+            one_track_image(0xE5),
+            one_track_image(0x00),
+            vec![0; 0x100],
+            one_track_image(0xE5),
+        ] {
+            let _ = cpc.insert_disc(0, &image);
+            cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
+        }
+        assert!(!cpc.machine().fdc.drive.is_null());
+        // The room to format every track again is the command line's.
+        let command_line = std::fs::read_to_string(
+            std::path::Path::new(env!("COLOPHON_MCP_EMULATOR_DIR")).join("cli/main.c"),
+        )
+        .expect("the command line's source");
+        assert!(command_line.contains(
+            "#define FORMAT_ROOM ((size_t)FLOPPY_MAX_CYLINDERS * FLOPPY_MAX_SIDES * \
+             FLOPPY_BYTES_PER_REVOLUTION)"
+        ));
+        let (floppy, _) = cpc.discs[0].as_ref().expect("a disc in drive 0");
+        // SAFETY: the medium stands beside the machine, which is not running.
+        let capacity = unsafe { (*floppy.as_ptr()).image_capacity };
+        assert_eq!(capacity, one_track_image(0xE5).len() + FORMAT_ROOM);
+        let mut spectrum = Spectrum::new(
+            vec![0; SPECTRUM_RAM_48K as usize].into_boxed_slice(),
+            rom(&spectrum_workload(), HALT),
+        );
+        // One block of a flag, a byte and its checksum, "calculated such that
+        // XORing all the data bytes together (including the flag byte)
+        // produces 0x00" (16K/48K reference), after its length.
+        let tape = [3, 0, 0xFF, 0x01, 0xFE];
+        for image in [&tape[..], &tape, &[1, 0], &tape] {
+            let _ = spectrum.insert_tape(image);
+            spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+        }
+        assert!(!spectrum.machine().tape.is_null());
     }
 
     // Runs with a watch on every instruction, every access and every port,

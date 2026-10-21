@@ -6,6 +6,7 @@
 // specification repository at tag 2026-07-28.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,12 +20,14 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use colophon_mcp::machines::MACHINES;
 use serde_json::{Value, json};
+use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 13] = [
+const TOOLS: [&str; 17] = [
     "call",
     "disassemble",
+    "disc_insert",
     "inspect",
     "machine_close",
     "machine_list",
@@ -35,7 +38,10 @@ const TOOLS: [&str; 13] = [
     "run",
     "screen",
     "set",
+    "snapshot_save",
     "step",
+    "tape_insert",
+    "type",
 ];
 // Long past anything the server does, so that a server that has stopped
 // answering fails a test rather than hanging it.
@@ -1010,11 +1016,14 @@ fn an_unknown_tool_is_a_protocol_error_and_unfit_arguments_a_tool_error() {
 
 // Programs the tests write, in the Z80's own bytes.
 const ADD_A_B: u8 = 0x80;
+const AND_N: u8 = 0xE6;
+const CP_E: u8 = 0xBB;
 const DI: u8 = 0xF3;
 const EI: u8 = 0xFB;
 const EX_SP_IX: [u8; 2] = [0xDD, 0xE3];
 const HALT: u8 = 0x76;
 const IM_1: [u8; 2] = [0xED, 0x56];
+const IN_A_C: [u8; 2] = [0xED, 0x78];
 const IN_A_N: u8 = 0xDB;
 const INC_A: u8 = 0x3C;
 const DEC_BC: u8 = 0x0B;
@@ -1024,6 +1033,7 @@ const INC_AT_HL: u8 = 0x34;
 const INC_L: u8 = 0x2C;
 const JR: u8 = 0x18;
 const JR_NZ: u8 = 0x20;
+const JR_Z: u8 = 0x28;
 const LD_A: u8 = 0x3E;
 const LD_A_AT_HL: u8 = 0x7E;
 const LD_A_B: u8 = 0x78;
@@ -1031,6 +1041,8 @@ const LD_A_FROM: u8 = 0x3A;
 const LD_AT_HL: u8 = 0x36;
 const LD_AT_HL_A: u8 = 0x77;
 const LD_BC: u8 = 0x01;
+const LD_E: u8 = 0x1E;
+const LD_E_A: u8 = 0x5F;
 const LD_HL: u8 = 0x21;
 const LD_HL_TO: u8 = 0x22;
 const LD_I_A: [u8; 2] = [0xED, 0x47];
@@ -1150,7 +1162,8 @@ fn listed(tools: &Value, name: &str) -> Value {
 // effect on its environment" (idempotentHint); "If false, the tool's domain of
 // interaction is closed" (openWorldHint), which is true unless said: the
 // 2026-07-28 schema's ToolAnnotations. A machine's state overwritten is a
-// destructive update, and a machine stood up an additive one.
+// destructive update, and a machine stood up or a file written where none
+// was an additive one.
 #[test]
 fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached() {
     let roms = Roms::all();
@@ -1169,10 +1182,20 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         .contains(&name);
         assert_eq!(annotations["readOnlyHint"], reads, "{name}: {annotations}");
         if !reads {
-            let destroys = name != "machine_open";
+            let destroys = !["machine_open", "snapshot_save"].contains(&name);
             // A handle put away names nothing again, so putting it away
-            // again changes nothing.
-            let repeats = ["set", "poke", "machine_close"].contains(&name);
+            // again changes nothing; a disc or a tape given again is the same
+            // fresh copy of the same file; a snapshot asked for again at its
+            // path is refused, since a file is there.
+            let repeats = [
+                "set",
+                "poke",
+                "machine_close",
+                "disc_insert",
+                "tape_insert",
+                "snapshot_save",
+            ]
+            .contains(&name);
             assert_eq!(
                 annotations["destructiveHint"], destroys,
                 "{name}: {annotations}"
@@ -3715,6 +3738,602 @@ fn a_count_that_fills_stops_and_the_next_run_counts_on() {
     assert!(ran.get("counted").is_none(), "{ran}");
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+// A Spectrum's keyboard, read by a program the test writes: port &7FFE's
+// half-row, then &FDFE's, each into a byte of its own, again and again. "A
+// zero on one of these lines selects a particular half-row of five keys",
+// 0x7ffe's "SPACE, SYM SHFT, M, N, B" and 0xfdfe's "A, S, D, F, G", and "a
+// zero in one of the five lowest bits means that the corresponding key is
+// pressed" (comp.sys.sinclair FAQ, 16K/48K reference,
+// https://worldofspectrum.org/faq/reference/48kreference.htm).
+const READING_TWO_HALF_ROWS: [u8; 17] = [
+    DI, LD_A, 0x7F, IN_A_N, 0xFE, LD_TO_A, 0x00, 0x80, LD_A, 0xFD, IN_A_N, 0xFE, LD_TO_A, 0x01,
+    0x80, JR, 0xF0,
+];
+
+fn half_rows(session: &mut Session, handle: &str, at: u16) -> (u8, u8) {
+    let bytes = bytes_of(&session.peek(handle, json!(at), 2));
+    (bytes[0] & 0x1F, bytes[1] & 0x1F)
+}
+
+#[test]
+fn keys_are_held_down_through_a_run_and_let_go_at_its_end() {
+    let roms = Roms::programmed("spectrum48.rom", &READING_TWO_HALF_ROWS);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 1000, "keys": ["SPACE", "A"] }));
+    assert_eq!(half_rows(&mut session, &handle, 0x8000), (0x1E, 0x1E));
+    session.run(&handle, json!({ "ticks": 1000 }));
+    assert_eq!(half_rows(&mut session, &handle, 0x8000), (0x1F, 0x1F));
+    session.run(
+        &handle,
+        json!({ "ticks": 1000, "keys": ["SPACE", "SYM", "M", "N", "B"] }),
+    );
+    assert_eq!(half_rows(&mut session, &handle, 0x8000), (0x00, 0x1F));
+    // A key the keyboard holds already, as set wrote it, is held on top of
+    // and held still once the run is done.
+    session.set(&handle, json!({ "keyboard.lines[7]": 0xFD }));
+    session.run(&handle, json!({ "ticks": 1000, "keys": ["SPACE"] }));
+    assert_eq!(half_rows(&mut session, &handle, 0x8000), (0x1C, 0x1F));
+    session.run(&handle, json!({ "ticks": 1000 }));
+    assert_eq!(half_rows(&mut session, &handle, 0x8000), (0x1D, 0x1F));
+    assert_eq!(session.inspect(&handle, "keyboard.lines[7]"), 0xFD);
+}
+
+#[test]
+fn a_key_neither_named_nor_numbered_is_refused_with_the_keys_there_are() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc6128");
+    let refused = session.refusal(
+        "run",
+        json!({ "handle": cpc, "ticks": 100, "keys": ["SPACE", "FIRE"] }),
+    );
+    assert!(
+        refused.starts_with(
+            "no key of a cpc6128 is \"FIRE\"; a key is given by its name, or by its number from \
+             0 to 79 as the firmware numbers it"
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("47 SPACE") && refused.contains("76 (FIRE 2)"),
+        "{refused}"
+    );
+    let refused = session.refusal("run", json!({ "handle": cpc, "ticks": 100, "keys": [80] }));
+    assert!(
+        refused.starts_with("no key of a cpc6128 is 80;"),
+        "{refused}"
+    );
+    let spectrum = session.open("spectrum48");
+    let refused = session.refusal(
+        "run",
+        json!({ "handle": spectrum, "ticks": 100, "keys": [56] }),
+    );
+    assert!(
+        refused.starts_with(
+            "no key of a spectrum48 is 56; a key is given by its name: CAPS, Z, X, C, V, A"
+        ),
+        "{refused}"
+    );
+    for handle in [cpc, spectrum] {
+        let ran = session.run(&handle, json!({ "ticks": 1 }));
+        assert_eq!(ran["tick"], ran["ticks"], "{handle} ran before");
+    }
+}
+
+// Three half-rows logged once a frame, a byte each: 0xfefe's "SHIFT, Z, X,
+// C, V", 0xdffe's "P, O, I, U, Y" and 0x7ffe's (16K/48K reference). The ULA's
+// interrupt, in mode 1, wakes the program from HALT at the start of each
+// frame, and the restart at &0038, which the test writes, enables
+// interrupts again and returns.
+const LOGGING_THREE_HALF_ROWS: [u8; 31] = [
+    DI, LD_SP, 0x00, 0xFF, IM_1[0], IM_1[1], LD_HL, 0x00, 0x80, EI, HALT, LD_A, 0xFE, IN_A_N, 0xFE,
+    LD_AT_HL_A, INC_HL, LD_A, 0xDF, IN_A_N, 0xFE, LD_AT_HL_A, INC_HL, LD_A, 0x7F, IN_A_N, 0xFE,
+    LD_AT_HL_A, INC_HL, JR, 0xEB,
+];
+
+// A double quote is P with SYM SHFT, for the ROM's "(e) Symbol code. Letter
+// keys and symbol shift." gives P, its sixteenth letter, &22, and a capital
+// P is P with CAPS SHIFT, for "(a) The main key table - L mode and CAPS
+// SHIFT." holds the letters as capitals (The Complete Spectrum ROM
+// Disassembly, https://skoolkid.github.io/rom/asm/0205.html). The command
+// line holds a key for 3 frames and lets it go for 6
+// (keys_are_held_and_let_go_as_the_command_line_types holds the server to
+// its source). M, held by set beforehand, stays held throughout.
+#[test]
+fn a_typed_key_is_held_and_let_go_for_the_frames_the_command_line_takes() {
+    let roms = Roms::programmed("spectrum48.rom", &LOGGING_THREE_HALF_ROWS);
+    roms.write_at("spectrum48.rom", 0x38, &[EI, RET]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 1 }));
+    let cpu = session.inspect(&handle, "cpu");
+    let from =
+        u16::try_from(cpu["h"].as_u64().unwrap() * 256 + cpu["l"].as_u64().unwrap()).unwrap();
+    session.set(&handle, json!({ "keyboard.lines[7]": 0xFB }));
+    let typed = session.answer("type", json!({ "handle": handle, "text": "\"P" }));
+    assert_eq!(typed["stopped"], "typed", "{typed}");
+    let logged: Vec<Vec<u8>> = bytes_of(&session.peek(&handle, json!(from), 3 * 19))
+        .chunks(3)
+        .map(|frame| frame.iter().map(|half_row| half_row & 0x1F).collect())
+        .collect();
+    let frames = |count: usize, half_rows: [u8; 3]| vec![half_rows.to_vec(); count];
+    assert_eq!(
+        logged,
+        [
+            frames(3, [0x1F, 0x1E, 0x19]),
+            frames(6, [0x1F, 0x1F, 0x1B]),
+            frames(3, [0x1E, 0x1E, 0x1B]),
+            frames(6, [0x1F, 0x1F, 0x1B]),
+            frames(1, [0, 0, 0]),
+        ]
+        .concat()
+    );
+    assert_eq!(session.inspect(&handle, "keyboard.lines[7]"), 0xFB);
+    // Each stretch is measured from where the typing began, so the typing
+    // runs the ticks one run of its 18 frames' ticks runs, which the keys do
+    // not change, since the program reads them and goes on alike.
+    let twin = session.open("spectrum48");
+    session.run(&twin, json!({ "frames": 1 }));
+    let ran = session.run(&twin, json!({ "ticks": 18 * SPECTRUM_FRAME_TICKS }));
+    assert_eq!(typed["ticks"], ran["ticks"], "{typed}");
+}
+
+// A stretch of typing that ends in a chain of prefixes ends the typing
+// there, as it ends a run, with the keyboard as it stood: here the chain is
+// all of memory, so the first stretch ends in it.
+#[test]
+fn typing_caught_in_a_chain_of_prefixes_stops_there() {
+    let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x4000]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.fill(&handle, 0x4000, &[PREFIX_DD; 0xC000]);
+    let typed = session.answer("type", json!({ "handle": handle, "text": "ab" }));
+    assert_eq!(
+        (&typed["settled"], &typed["stopped"]),
+        (&json!(false), &json!("unsettled")),
+        "{typed}"
+    );
+    assert!(
+        typed["ticks"].as_u64().unwrap() < 3 * SPECTRUM_FRAME_TICKS + 1000,
+        "{typed}"
+    );
+    assert!(
+        session
+            .inspect(&handle, "keyboard.lines")
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|line| *line == 0xFF)
+    );
+}
+
+#[test]
+fn text_a_keyboard_cannot_type_is_refused_before_a_key_goes_down() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc6128");
+    let spectrum = session.open("spectrum48");
+    for (handle, text, refused) in [
+        (
+            &cpc,
+            "PRINT £5".to_owned(),
+            "'£' is no ASCII character, and text is typed from ASCII; a key it has is held \
+             through run's keys",
+        ),
+        (
+            &spectrum,
+            "p2\t2".to_owned(),
+            "no key of a spectrum48 types '\\t', alone or with a shift; any key is held through \
+             run's keys",
+        ),
+        (
+            &cpc,
+            String::new(),
+            "text holds 0 characters, and from 1 to 250 are typed at a cpc6128 at once, 1500 \
+             frames' worth; give a character or more",
+        ),
+        (
+            &cpc,
+            "a".repeat(251),
+            "text holds 251 characters, and from 1 to 250 are typed at a cpc6128 at once, 1500 \
+             frames' worth; type the rest in another request",
+        ),
+        (
+            &spectrum,
+            "a".repeat(167),
+            "text holds 167 characters, and from 1 to 166 are typed at a spectrum48 at once, 1500 \
+             frames' worth; type the rest in another request",
+        ),
+    ] {
+        assert_eq!(
+            session.refusal("type", json!({ "handle": handle, "text": text })),
+            refused
+        );
+    }
+    for handle in [cpc, spectrum] {
+        let ran = session.run(&handle, json!({ "ticks": 1 }));
+        assert_eq!(ran["tick"], ran["ticks"], "{handle} ran before");
+        assert!(
+            session
+                .inspect(&handle, "keyboard.lines")
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|line| *line == 0xFF),
+            "{handle}"
+        );
+    }
+}
+
+// A blank disc of AMSDOS's DATA format, laid out as "Extended DiSK image
+// definition" (Marco Vieth, Ulrich Doewich and Kevin Thacker, with
+// extensions by John Elliott and Simon Owen,
+// https://cpctech.cpcwiki.de/docs/extdsk.html) lays an image out: a disc
+// information block of &100 bytes, "EXTENDED CPC DSK File\r\nDisk-Info\r\n",
+// the name of its creator, the number of tracks at &30 and of sides at &31,
+// and a track size table from &34 of each track's "high byte of track
+// length", which "includes the size of the TRACK INFORMATION BLOCK (256
+// bytes)"; then each track's information block, "Track-Info\r\n", the track
+// and the side at &10 and &11, the sector size at &14, the number of sectors
+// at &15, GAP#3 at &16 and the filler at &17, and a sector information list
+// from &18 of eight bytes a sector, C, H, R, N, the two status registers and
+// the data's length, followed by the sectors' data. The format is SOFT
+// 968's, The Amstrad 6128 Firmware Manual
+// (https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual): in
+// section 9.4, "Single sided", "512 byte physical sector size", "40 tracks
+// numbered 0 to 39", and for the DATA format "9 sectors per track numbered
+// #C1 to #C9", "0 reserved tracks" and "2 to 1 sector interleave"; in its
+// table of the format in section 9.9, 82 for "gap length (format)", "179
+// number of blocks-1" and "2 directory blocks", which leave 178 blocks of
+// 1K free. Every byte is &E5, which AMSDOS's ROM takes as the "user number
+// for deleted files" (its disassembly,
+// https://cpctech.cpcwiki.de/docs/amsdos.asm), so that the directory, in the
+// disc's first blocks, holds nothing; SOFT 968 prints the format's filler as
+// #E9, which the ROM's own table of the format does not hold.
+fn blank_data_disc() -> Vec<u8> {
+    const TRACKS: u8 = 40;
+    const SECTORS: [u8; 9] = [0xC1, 0xC6, 0xC2, 0xC7, 0xC3, 0xC8, 0xC4, 0xC9, 0xC5];
+    let track_length = 0x100 + SECTORS.len() * 512;
+    let mut disc = vec![0; 0x100];
+    disc[..0x22].copy_from_slice(b"EXTENDED CPC DSK File\r\nDisk-Info\r\n");
+    disc[0x22..0x30].copy_from_slice(b"colophon-mcp  ");
+    disc[0x30] = TRACKS;
+    disc[0x31] = 1;
+    for track in 0..TRACKS {
+        disc[0x34 + usize::from(track)] = u8::try_from(track_length / 0x100).unwrap();
+        let mut block = vec![0; 0x100];
+        block[..0x0C].copy_from_slice(b"Track-Info\r\n");
+        block[0x10] = track;
+        block[0x14] = 2;
+        block[0x15] = u8::try_from(SECTORS.len()).unwrap();
+        block[0x16] = 82;
+        block[0x17] = 0xE5;
+        for (index, sector) in SECTORS.iter().enumerate() {
+            let at = 0x18 + 8 * index;
+            block[at..at + 8].copy_from_slice(&[track, 0, *sector, 2, 0, 0, 0x00, 0x02]);
+        }
+        block.resize(track_length, 0xE5);
+        disc.extend(block);
+    }
+    disc
+}
+
+#[test]
+fn a_disc_goes_into_a_cpcs_drive_named_by_its_hash() {
+    let roms = Roms::all();
+    let disc = blank_data_disc();
+    let path = roms.write("blank.dsk", &disc);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 100 }));
+    let tick = session.run(&handle, json!({ "ticks": 1 }))["tick"].clone();
+    for (drive, asked) in [("A", None), ("B", Some("B")), ("A", Some("A"))] {
+        let mut arguments = json!({ "handle": handle, "path": path });
+        if let Some(asked) = asked {
+            arguments["drive"] = json!(asked);
+        }
+        assert_eq!(
+            session.answer("disc_insert", arguments),
+            json!({
+                "handle": handle,
+                "drive": drive,
+                "tick": tick,
+                "path": path,
+                "sha256": sha256(&disc),
+            })
+        );
+    }
+    assert_eq!(fs::read(&path).unwrap(), disc);
+}
+
+#[test]
+fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
+    let roms = Roms::all();
+    let not_a_disc = roms.write("not.dsk", &[0; 512]);
+    let missing = roms.0.join("missing.dsk");
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    let cpc464 = session.open("cpc464");
+    let cpc6128 = session.open("cpc6128");
+    let refusal = |session: &mut Session, handle: &str, path: &Path, drive: &str| {
+        session.refusal(
+            "disc_insert",
+            json!({ "handle": handle, "path": path, "drive": drive }),
+        )
+    };
+    assert_eq!(
+        refusal(&mut session, &spectrum, &not_a_disc, "A"),
+        "a spectrum48 has no disc drive; a cpc664 or a cpc6128 takes a disc, and a Spectrum a tape"
+    );
+    assert_eq!(
+        refusal(&mut session, &cpc464, &not_a_disc, "A"),
+        "a cpc464 is built here as the emulator's command line builds one given no disc, without \
+         a disc interface, and nothing here fits one afterwards; a cpc664 or a cpc6128 takes a \
+         disc"
+    );
+    assert_eq!(
+        refusal(&mut session, &cpc6128, &not_a_disc, "B"),
+        format!(
+            "{}: the image does not begin like a disc image; a disc is a DSK image, of the \
+             original layout or the extended one",
+            not_a_disc.display()
+        )
+    );
+    assert_eq!(
+        refusal(&mut session, &cpc6128, &roms.0, "A"),
+        format!(
+            "{} is not a file of at most 16777216 bytes; a disc is a DSK image, of the original \
+             layout or the extended one",
+            roms.0.display()
+        )
+    );
+    let refused = refusal(&mut session, &cpc6128, &missing, "A");
+    assert!(
+        refused.starts_with(&format!("cannot read {}: ", missing.display()))
+            && refused
+                .ends_with("; a disc is named by its path on the file system the server runs on"),
+        "{refused}"
+    );
+    let refused = refusal(&mut session, &cpc6128, &not_a_disc, "C");
+    assert!(
+        refused.contains("`A`") && refused.contains("`B`"),
+        "{refused}"
+    );
+}
+
+// A tape of one BASIC program, as the 48K's SAVE leaves it: "two blocks on
+// tape: a 19 byte header block and a variable length data block", each
+// with "a flag byte: this is 0x00 for header blocks and 0xff for data
+// blocks", then "the actual data", then "a checksum byte, calculated such
+// that XORing all the data bytes together (including the flag byte)
+// produces 0x00"; the header's 17 bytes are "Type (0,1,2 or 3)", "Filename
+// (padded with blanks)", "Length of data block", "Parameter 1" and
+// "Parameter 2", the type 0 for "a PROGRAM", whose "parameter 1 holds the
+// autostart line number" and "parameter 2 holds the start of the variable
+// area relative to the start of the program" (16K/48K reference). In a .tap
+// "all blocks start with two bytes specifying how many bytes will follow
+// (not counting the two length bytes)" ("Emulator file formats", World of
+// Spectrum FAQ, https://worldofspectrum.org/faq/reference/formats.htm).
+fn program_tape(name: &[u8; 10], autostart: u16, program: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(program.len()).unwrap();
+    let mut header = vec![0];
+    header.extend(name);
+    for word in [length, autostart, length] {
+        header.extend(word.to_le_bytes());
+    }
+    [tape_block(0x00, &header), tape_block(0xFF, program)].concat()
+}
+
+fn tape_block(flag: u8, data: &[u8]) -> Vec<u8> {
+    let mut block = vec![flag];
+    block.extend(data);
+    block.push(block.iter().fold(0, |checksum, byte| checksum ^ byte));
+    let mut tap = u16::try_from(block.len()).unwrap().to_le_bytes().to_vec();
+    tap.extend(block);
+    tap
+}
+
+// Line 10, POKE 30000,42, as a 48K holds a line of BASIC: "the line number
+// here is stored with its more significant byte first", then the length of
+// what follows it, then its text and ENTER, and "a numerical constant in the
+// program is followed by its binary form, using the character CHR$ 14
+// followed by five bytes", of which for a whole number "the first byte is
+// 0", "the second byte is 0 for a positive number", "the third and fourth
+// bytes are the less and more significant bytes of the number" and "the
+// fifth byte is 0" (ZX Spectrum BASIC programming, ch. 24,
+// https://worldofspectrum.org/ZXBasicManual/zxmanchap24.html). POKE is
+// character 244 (appendix A).
+fn poking_program() -> Vec<u8> {
+    let number = |digits: &[u8], value: u16| {
+        let [low, high] = value.to_le_bytes();
+        [digits, &[14, 0, 0, low, high, 0]].concat()
+    };
+    let text = [
+        &[244][..],
+        &number(b"30000", 30000),
+        b",",
+        &number(b"42", 42),
+        &[0x0D],
+    ]
+    .concat();
+    let mut line = vec![0x00, 10];
+    line.extend(u16::try_from(text.len()).unwrap().to_le_bytes());
+    line.extend(text);
+    line
+}
+
+// Counts each change of the level the EAR socket hears, bit 6 of port &FE
+// (16K/48K reference), into &8000: B at &FF selects no half-row of keys.
+const COUNTING_EDGES: [u8; 23] = [
+    DI, LD_HL, 0x00, 0x00, LD_E, 0x00, LD_BC, 0xFE, 0xFF, IN_A_C[0], IN_A_C[1], AND_N, 0x40, CP_E,
+    JR_Z, 0xF9, LD_E_A, INC_HL, LD_HL_TO, 0x00, 0x80, JR, 0xF2,
+];
+
+// A header block opens with "a leader consisting of 8063 (for header
+// blocks) or 3223 (data blocks) pulses, each of which has a duration of
+// 2168 tstates" (16K/48K reference), each pulse an edge, so ten frames of
+// PLAY from a tape's start hear 698880 / 2168 of them, 322.4, which is 322
+// or 323 as the first pulse is low or high; the program counts each well
+// inside its pulse. The emulator's reader plays a .tap's blocks as the TZX
+// format's standard block, ID 10, which is followed by a "Pause after this
+// block (ms.) {1000}" ("TZX format" v1.20,
+// https://worldofspectrum.net/TZXformat.html), so 265 frames on, past the
+// header's 250 of leader and its 19 bytes, the tape is silent for ten
+// frames, and a tape put in in its place plays from its own start.
+#[test]
+fn a_tape_plays_from_the_tick_it_goes_into_the_deck() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING_EDGES);
+    let tape = program_tape(b"TEST      ", 10, &poking_program());
+    let path = roms.write("program.tap", &tape);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    // The edges counted over a run of these frames, and the tick it ends at.
+    let edges = |session: &mut Session, frames: u64| {
+        let before = bytes_of(&session.peek(&handle, json!("&8000"), 2));
+        let ran = session.run(&handle, json!({ "ticks": frames * SPECTRUM_FRAME_TICKS }));
+        let after = bytes_of(&session.peek(&handle, json!("&8000"), 2));
+        let counted = u16::from_le_bytes([after[0], after[1]])
+            .wrapping_sub(u16::from_le_bytes([before[0], before[1]]));
+        (counted, ran["tick"].clone())
+    };
+    let (counted, tick) = edges(&mut session, 10);
+    assert_eq!(counted, 0);
+    assert_eq!(
+        session.answer("tape_insert", json!({ "handle": handle, "path": path })),
+        json!({ "handle": handle, "tick": tick, "path": path, "sha256": sha256(&tape) })
+    );
+    assert!([322, 323].contains(&edges(&mut session, 10).0));
+    edges(&mut session, 255);
+    assert_eq!(edges(&mut session, 10).0, 0);
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    assert!([322, 323].contains(&edges(&mut session, 10).0));
+}
+
+#[test]
+fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
+    let roms = Roms::all();
+    let not_a_tape = roms.write("not.tap", &[5, 0, 0xFF, 1]);
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc6128");
+    let spectrum = session.open("spectrum48");
+    assert_eq!(
+        session.refusal("tape_insert", json!({ "handle": cpc, "path": not_a_tape })),
+        "a cpc6128 is given no tape here: the emulator has never loaded a tape through a CPC's \
+         firmware, so nothing here could hold one to what the machine did; a spectrum48 takes a \
+         tape, and a cpc664 or a cpc6128 a disc"
+    );
+    let refused = session.refusal(
+        "tape_insert",
+        json!({ "handle": spectrum, "path": not_a_tape }),
+    );
+    assert!(
+        refused.starts_with(&format!("{} ", not_a_tape.display()))
+            && refused.ends_with(
+                "; a tape is a .tap, of bare blocks at the ROM's own timings, or a .tzx"
+            ),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_snapshot_saved_is_what_a_machine_read_from_it_saves_again() {
+    let roms = Roms::all();
+    let snapshot = spectrum_snapshot();
+    let from = roms.write("spectrum.sna", &snapshot);
+    let to = roms.0.join("spectrum-saved.sna");
+    let mut session = Session::start(&roms);
+    let handle = session.open_from("spectrum48", &from);
+    assert_eq!(
+        session.answer("snapshot_save", json!({ "handle": handle, "path": to })),
+        json!({ "handle": handle, "tick": 0, "path": to, "sha256": sha256(&snapshot) })
+    );
+    assert_eq!(fs::read(&to).unwrap(), snapshot);
+    // A CPC's, saved after a stretch of running, holds what a machine read
+    // from it saves again.
+    for (machine, kilobytes) in [("cpc464", 64), ("cpc6128", 128)] {
+        let from = roms.write("cpc.sna", &cpc_snapshot(kilobytes, 1));
+        let opened = session.open_from(machine, &from);
+        session.run(&opened, json!({ "ticks": 1000 }));
+        let saved = roms.0.join(format!("{machine}-saved.sna"));
+        let answer = session.answer("snapshot_save", json!({ "handle": opened, "path": saved }));
+        let saved = fs::read(&saved).unwrap();
+        assert_eq!(answer["sha256"], sha256(&saved));
+        let reopened = session.open_from(machine, &roms.write("reopened.sna", &saved));
+        let again = roms.0.join(format!("{machine}-again.sna"));
+        session.answer(
+            "snapshot_save",
+            json!({ "handle": reopened, "path": again }),
+        );
+        assert_eq!(fs::read(&again).unwrap(), saved, "{machine}");
+    }
+}
+
+#[test]
+fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
+    let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x4000]);
+    let taken = roms.write("taken.sna", b"kept");
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    assert_eq!(
+        session.refusal("snapshot_save", json!({ "handle": handle, "path": taken })),
+        format!(
+            "{} is taken, and a file is written only where none is: give a path that names \
+             nothing yet",
+            taken.display()
+        )
+    );
+    assert_eq!(fs::read(&taken).unwrap(), b"kept");
+    let nowhere = roms.0.join("nowhere/saved.sna");
+    let refused = session.refusal(
+        "snapshot_save",
+        json!({ "handle": handle, "path": nowhere }),
+    );
+    assert!(
+        refused.starts_with(&format!("cannot write {}: ", nowhere.display()))
+            && refused.ends_with(
+                "; a file is written at a path on the file system the server runs on, in a \
+                 directory that is there"
+            ),
+        "{refused}"
+    );
+    let unsettled = roms.0.join("unsettled.sna");
+    session.step(&handle, 1);
+    assert_eq!(
+        session.refusal(
+            "snapshot_save",
+            json!({ "handle": handle, "path": unsettled })
+        ),
+        format!(
+            "{handle} stands inside an instruction, as a run or a step leaves it in a chain of \
+             prefixes, and a snapshot keeps no instruction half run; step it on to the \
+             instruction's end"
+        )
+    );
+    assert!(!unsettled.exists());
+    let twin = session.open("spectrum48");
+    session.set(&twin, json!({ "cpu.sp": 0x3000 }));
+    assert_eq!(
+        session.refusal(
+            "snapshot_save",
+            json!({ "handle": twin, "path": unsettled })
+        ),
+        format!(
+            "{twin} has its stack below the RAM, where the program counter cannot be pushed; a \
+             Spectrum's snapshot keeps the program counter in the two bytes below the stack \
+             pointer, so cpu.sp stands from &4002 to &FFFF"
+        )
+    );
+    assert!(!unsettled.exists());
+}
+
 // The firmware tier: the emulator's own fetched firmware and its command line,
 // which `make test-firmware` asks for.
 
@@ -3732,9 +4351,8 @@ fn firmware() -> PathBuf {
     roms
 }
 
-// The emulator's command line runs a snapshot by its frames, which are its
-// standard frames' ticks, and saves the machine as it then stands.
-fn command_line_run(machine: &str, snapshot: &Path, frames: u32, saved: &Path) {
+// The emulator's command line, run on its own firmware, which must succeed.
+fn command_line<S: AsRef<OsStr>>(arguments: impl IntoIterator<Item = S>) {
     let command_line = emulator().join("build/emulator");
     assert!(
         command_line.exists(),
@@ -3742,16 +4360,28 @@ fn command_line_run(machine: &str, snapshot: &Path, frames: u32, saved: &Path) {
         command_line.display()
     );
     let output = Command::new(command_line)
-        .arg("run")
-        .arg(snapshot)
-        .args(["--machine", machine, "--frames", &frames.to_string()])
+        .args(arguments)
         .arg("--roms")
         .arg(firmware())
-        .arg("--save")
-        .arg(saved)
         .output()
         .expect("the command line runs");
     assert!(output.status.success(), "{output:?}");
+}
+
+// The emulator's command line runs a snapshot by its frames, which are its
+// standard frames' ticks, and saves the machine as it then stands.
+fn command_line_run(machine: &str, snapshot: &Path, frames: u32, saved: &Path) {
+    let frames = frames.to_string();
+    command_line([
+        OsStr::new("run"),
+        snapshot.as_os_str(),
+        OsStr::new("--machine"),
+        OsStr::new(machine),
+        OsStr::new("--frames"),
+        OsStr::new(&frames),
+        OsStr::new("--save"),
+        saved.as_os_str(),
+    ]);
 }
 
 fn bytes_of(hexadecimal: &str) -> Vec<u8> {
@@ -4275,4 +4905,398 @@ fn the_firmwares_screen_is_the_6845s_reading_of_its_memory() {
             .count();
     }
     assert!(lit > 1000, "{lit} pixels of the firmware's text");
+}
+
+// A CPC's character matrices, as its firmware hands them out: TXT GET
+// MATRIX, at &BBA5, takes "the character whose matrix is to be found" in A
+// and returns with "HL contains the address of the matrix", and "Carry
+// false" if "the matrix is in the lower ROM", which is the first 16K of the
+// firmware's file; a matrix is "an 8 byte bit significant vector", whose
+// "first byte describes the top line of the character" and in which "bit 7
+// of a byte refers to the leftmost pixel" (SOFT 968, The Amstrad 6128
+// Firmware Manual, https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual).
+fn cpc_font(session: &mut Session, handle: &str, machine: &str) -> BTreeMap<[u8; 8], char> {
+    let rom = fs::read(firmware().join(format!("{machine}.rom"))).expect("the firmware");
+    (b' '..=b'~')
+        .map(|code| {
+            session.answer(
+                "call",
+                json!({ "handle": handle, "address": "&BBA5", "values": { "cpu.a": code } }),
+            );
+            let cpu = session.inspect(handle, "cpu");
+            assert_eq!(cpu["f"].as_u64().unwrap() & 1, 0, "{code} is in the ROM");
+            let at = usize::try_from(cpu["h"].as_u64().unwrap() * 256 + cpu["l"].as_u64().unwrap())
+                .unwrap();
+            (rom[at..at + 8].try_into().unwrap(), char::from(code))
+        })
+        .collect()
+}
+
+// The text a CPC shows in mode 1, read from its RAM as a snapshot saved from
+// it holds it, each character's matrix found in the font. "The screen memory
+// is divided into 8 blocks, each 2K bytes long", "each line of pixels on the
+// screen uses 80 consecutive bytes from a block", "the top line of the
+// screen comes from block 0, the second line from block 1 and so on", and
+// "a block wraps around from its last byte to its first byte"; in mode 1 the
+// leftmost of a byte's four pixels is "Bits 3,7" and the rightmost "Bits
+// 0,4", "the first bit given is most significant bit of the pixel" (SOFT
+// 968, section 6). The 6845's start address, R12 and R13, places the first
+// byte: its MA13 and MA12 reach A15 and A14, and MA9 to MA0 reach A10 to A1
+// ("Screen memory addressess", Kevin Thacker's cpctech,
+// https://cpctech.cpcwiki.de/docs/scraddr.html). A pixel of any pen but the
+// paper's, 0, is drawn; a cell no matrix matches reads as '?'.
+fn cpc_text(
+    session: &mut Session,
+    handle: &str,
+    scratch: &Roms,
+    font: &BTreeMap<[u8; 8], char>,
+) -> Vec<String> {
+    static TAKEN: AtomicU32 = AtomicU32::new(0);
+    let path = scratch.0.join(format!(
+        "screen-{}.sna",
+        TAKEN.fetch_add(1, Ordering::Relaxed)
+    ));
+    session.answer("snapshot_save", json!({ "handle": handle, "path": path }));
+    let ram = fs::read(&path).expect("the snapshot")[0x100..].to_vec();
+    assert_eq!(session.inspect(handle, "gate_array.mode"), 1);
+    let registers = session.inspect(handle, "crtc.registers");
+    let register = |number: usize| usize::try_from(registers[number].as_u64().unwrap()).unwrap();
+    let start = (register(12) << 8 | register(13)) & 0x3FFF;
+    let (base, offset) = ((start & 0x3000) << 2, (start & 0x3FF) << 1);
+    let drawn = |byte: u8| -> u8 {
+        (0..4).fold(0, |pixels, pixel| {
+            let pen = (byte >> (3 - pixel) & 1) << 1 | (byte >> (7 - pixel) & 1);
+            pixels << 1 | u8::from(pen != 0)
+        })
+    };
+    (0..25)
+        .map(|row| {
+            (0..40)
+                .map(|column| {
+                    let matrix: [u8; 8] = std::array::from_fn(|line| {
+                        let at = |byte: usize| {
+                            ram[base
+                                + line * 0x800
+                                + ((offset + row * 80 + column * 2 + byte) & 0x7FF)]
+                        };
+                        drawn(at(0)) << 4 | drawn(at(1))
+                    });
+                    font.get(&matrix).copied().unwrap_or('?')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+// PRINT 2+2 and RETURN typed at each CPC's BASIC, and p2+2 and ENTER at a
+// Spectrum's, whose K cursor makes the p PRINT, once the command line would
+// type them, and ten frames run after: the screen's memory is what the
+// command line's typing leaves there, byte for byte, as a snapshot of each
+// keeps it, a CPC's 16K from &C000 and a Spectrum's 6912 bytes of pixels and
+// attributes from 16384 (16K/48K reference). The rest of the machine is a
+// few ticks on from the command line's, whose typing began as its frames
+// ran out, where the server's began at the end of the instruction standing
+// there. The firmware answers 4, which a CPC prints on the line after the
+// sum, read in its own font, before Ready.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn text_typed_leaves_the_screen_the_command_lines_typing_leaves() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    for (machine, frames, text, frame, screen) in [
+        (
+            "cpc6128",
+            78,
+            "PRINT 2+2\n",
+            CPC_FRAME_TICKS,
+            0x100 + 0xC000..0x100 + 0x10000,
+        ),
+        (
+            "cpc664",
+            78,
+            "PRINT 2+2\n",
+            CPC_FRAME_TICKS,
+            0x100 + 0xC000..0x100 + 0x10000,
+        ),
+        (
+            "cpc464",
+            78,
+            "PRINT 2+2\n",
+            CPC_FRAME_TICKS,
+            0x100 + 0xC000..0x100 + 0x10000,
+        ),
+        (
+            "spectrum48",
+            128,
+            "p2+2\n",
+            SPECTRUM_FRAME_TICKS,
+            27..27 + 6912,
+        ),
+    ] {
+        let theirs = scratch.0.join(format!("{machine}-there.sna"));
+        let typed = text.replace('\n', "\\n");
+        command_line([
+            "boot",
+            "--machine",
+            machine,
+            "--frames",
+            &frames.to_string(),
+            "--type",
+            &typed,
+            "--wait",
+            "10",
+            "--save",
+            theirs.to_str().unwrap(),
+        ]);
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": frames * frame }));
+        session.answer("type", json!({ "handle": handle, "text": text }));
+        session.run(&handle, json!({ "ticks": 10 * frame }));
+        let ours = scratch.0.join(format!("{machine}-here.sna"));
+        session.answer("snapshot_save", json!({ "handle": handle, "path": ours }));
+        let (ours, theirs) = (fs::read(&ours).unwrap(), fs::read(&theirs).unwrap());
+        assert!(ours[screen.clone()] == theirs[screen.clone()], "{machine}");
+        if machine.starts_with("cpc") {
+            let font = cpc_font(&mut session, &handle, machine);
+            let text = cpc_text(&mut session, &handle, &scratch, &font);
+            let sum = text
+                .iter()
+                .position(|line| line == "PRINT 2+2")
+                .expect("the sum");
+            assert_eq!(
+                text[sum + 1..sum + 3],
+                [" 4", "Ready"],
+                "{machine}: {text:#?}"
+            );
+        }
+    }
+}
+
+// The Spectrum's answer, at the top left of its picture, in the ROM's own
+// font: CHARS, at 23606, is "256 less than address of character set (which
+// starts with space and carries on to the copyright symbol)" (ZX Spectrum
+// BASIC programming, ch. 25), and PIXEL-ADD, at &22AA, finds the bytes of
+// the top line's pixels from y 175 down
+// (a_spectrum_rom_routine_called_returns_what_its_disassembly_says).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_spectrum_typed_at_answers_in_its_own_font() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 128 * SPECTRUM_FRAME_TICKS }));
+    session.answer("type", json!({ "handle": handle, "text": "p2+2\n" }));
+    session.run(&handle, json!({ "frames": 10 }));
+    let chars = bytes_of(&session.peek(&handle, json!(23606), 2));
+    let font = u16::from_le_bytes([chars[0], chars[1]]) + 256;
+    let four = bytes_of(&session.peek(&handle, json!(font + 8 * u16::from(b'4' - b' ')), 8));
+    let shown: Vec<u8> = (0..8)
+        .map(|line| {
+            session.answer(
+                "call",
+                json!({
+                    "handle": handle,
+                    "address": "&22AA",
+                    "values": { "cpu.b": 175 - line, "cpu.c": 0 },
+                }),
+            );
+            let cpu = session.inspect(&handle, "cpu");
+            let at = cpu["h"].as_u64().unwrap() * 256 + cpu["l"].as_u64().unwrap();
+            bytes_of(&session.peek(&handle, json!(at), 1))[0]
+        })
+        .collect();
+    assert_eq!(shown, four);
+}
+
+// INKEY(47) asked again and again while keys are held: "the returned value
+// of -1" when the key is up, 0 when it is down with SHIFT and CONTROL up,
+// and 32 when it is down with SHIFT (CPC6128 User Instructions, ch. 3, INKEY,
+// https://archive.org/details/amstrad-cpc-6128-user-manual), 47 being SPACE
+// as the firmware numbers it. Each line printed while the last is printing
+// is whole once the next has begun.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn keys_held_through_a_run_are_the_keys_basic_reads() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.answer(
+        "type",
+        json!({ "handle": handle, "text": "10 PRINT INKEY(47):GOTO 10\nRUN\n" }),
+    );
+    let font = {
+        let reading = session.open("cpc6128");
+        session.run(&reading, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        cpc_font(&mut session, &reading, "cpc6128")
+    };
+    for (keys, read) in [
+        (json!(["SPACE"]), "0"),
+        (json!(["SPACE", "SHIFT"]), "32"),
+        (json!([]), "-1"),
+        (json!([47]), "0"),
+    ] {
+        session.run(&handle, json!({ "frames": 10, "keys": keys }));
+        let text = cpc_text(&mut session, &handle, &scratch, &font);
+        let printed: Vec<&String> = text.iter().filter(|line| !line.trim().is_empty()).collect();
+        assert_eq!(printed[printed.len() - 2].trim(), read, "{keys}: {text:#?}");
+    }
+}
+
+// CAPS SHIFT with SPACE "acts as a BREAK" (ZX Spectrum BASIC programming,
+// ch. 1), tested "after every statement", and "Report L - BREAK into program"
+// is RST &08 followed by &14 (The Complete Spectrum ROM Disassembly,
+// https://skoolkid.github.io/rom/asm/1B76.html), which ERR NR, at 23610,
+// holds as "1 less than the report code" (ch. 25).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_spectrum_held_at_break_breaks_into_its_program() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 128 * SPECTRUM_FRAME_TICKS }));
+    // 10, then GO TO in the K cursor's g, 10 and ENTER; then RUN, its r.
+    session.answer("type", json!({ "handle": handle, "text": "10g10\nr\n" }));
+    session.run(&handle, json!({ "frames": 10 }));
+    assert_eq!(session.peek(&handle, json!(23610), 1), "FF");
+    session.run(&handle, json!({ "frames": 10, "keys": ["CAPS", "SPACE"] }));
+    assert_eq!(session.peek(&handle, json!(23610), 1), "14");
+}
+
+// A blank DATA disc in a drive, a one-line program SAVEd to it and the disc
+// catalogued: AMSDOS shows what the CPC6128 User Instructions show, "Drive
+// A: user 0", "EXAMPLE.BAS 1K", "177K free" (Foundation Course, ch. 1, p.
+// 44), read here without its spaces, whose count the manual's scan does not keep.
+// The 6128 reads drive A, and the 664 drive B, as |B makes it: "Set default
+// drive to Drive B" (ch. 5), whose heading names B where the manual's names
+// A. What was written is the machine's: an image the emulator cannot read is
+// refused and the disc stays in the drive, and the file given, put in again,
+// is the blank disc it was.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
+    let scratch = Roms::new(&[]);
+    let blank = blank_data_disc();
+    let path = scratch.write("blank.dsk", &blank);
+    let not_a_disc = scratch.write("not.dsk", &[0; 512]);
+    let mut session = Session::reading(&firmware());
+    for (machine, drive) in [("cpc6128", "A"), ("cpc664", "B")] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        let font = cpc_font(&mut session, &handle, machine);
+        let given = |path: &Path| json!({ "handle": handle, "path": path, "drive": drive });
+        session.answer("disc_insert", given(&path));
+        if drive == "B" {
+            session.answer("type", json!({ "handle": handle, "text": "|B\n" }));
+            session.run(&handle, json!({ "frames": 50 }));
+        }
+        let catalogue = |session: &mut Session| {
+            session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
+            session.run(&handle, json!({ "frames": 250 }));
+            let text = cpc_text(session, &handle, &scratch, &font);
+            let typed = text.iter().rposition(|line| line == "CAT").expect("CAT");
+            let mut shown: Vec<String> = text[typed + 1..]
+                .iter()
+                .map(|line| line.replace(' ', ""))
+                .filter(|line| !line.is_empty())
+                .collect();
+            // The cursor, which no matrix draws, waits on the line after.
+            shown.truncate(
+                shown
+                    .iter()
+                    .position(|line| line == "Ready")
+                    .expect("Ready")
+                    + 1,
+            );
+            shown
+        };
+        session.answer(
+            "type",
+            json!({ "handle": handle, "text": "10 PRINT 2+2\nSAVE\"EXAMPLE\"\n" }),
+        );
+        session.run(&handle, json!({ "frames": 250 }));
+        let heading = format!("Drive{drive}:user0");
+        let saved = [heading.as_str(), "EXAMPLE.BAS1K", "177Kfree", "Ready"];
+        assert_eq!(catalogue(&mut session), saved, "{machine}");
+        session.refusal("disc_insert", given(&not_a_disc));
+        assert_eq!(catalogue(&mut session), saved, "{machine}");
+        session.answer("disc_insert", given(&path));
+        assert_eq!(
+            catalogue(&mut session),
+            [heading.as_str(), "178Kfree", "Ready"],
+            "{machine}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), blank);
+    }
+}
+
+// LOAD "", typed as the K cursor's j and two of SYM SHFT's P, reads a tape
+// the test writes. LD-BYTES, at &0556, is called for the header, "LOAD
+// seventeen bytes" (https://skoolkid.github.io/rom/asm/0605.html, LD_LOOK_H),
+// as ENTER goes down, inside the typing, and once more, for the program,
+// in the run after; the program stands where PROG, at 23635, the "Address
+// of BASIC program" (ZX Spectrum BASIC programming, ch. 25), points, and has
+// run from its autostart line.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn load_reads_a_program_from_a_tape_and_runs_it() {
+    let scratch = Roms::new(&[]);
+    let program = poking_program();
+    let path = scratch.write("program.tap", &program_tape(b"TEST      ", 10, &program));
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 128 * SPECTRUM_FRAME_TICKS }));
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    session.answer("type", json!({ "handle": handle, "text": "j\"\"\n" }));
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 600, "gather": [{ "execute": "&0556" }] }),
+    );
+    assert_eq!(ran["gathered"].as_array().unwrap().len(), 1, "{ran}");
+    let prog = bytes_of(&session.peek(&handle, json!(23635), 2));
+    let prog = u16::from_le_bytes([prog[0], prog[1]]);
+    assert_eq!(
+        bytes_of(&session.peek(&handle, json!(prog), u16::try_from(program.len()).unwrap())),
+        program
+    );
+    assert_eq!(session.peek(&handle, json!(30000), 1), "2A");
+}
+
+// A snapshot the server saves is the one the command line saves of the
+// same machine, and one the command line runs on from stands where the
+// server, opening it, runs on to.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_snapshot_saved_is_the_command_lines_and_runs_on_there() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    let mut cpc = cpc_snapshot(128, 1);
+    cpc[0x23..0x25].copy_from_slice(&0x4000u16.to_le_bytes());
+    let program = [&[LD_HL, 0x00, 0x80][..], &COUNTING_LOOP].concat();
+    cpc[0x100 + 0x4000..0x100 + 0x4000 + program.len()].copy_from_slice(&program);
+    let mut spectrum = spectrum_snapshot();
+    spectrum[25] = 1;
+    let program = [&[LD_HL, 0x00, 0xC0][..], &COUNTING_LOOP].concat();
+    spectrum[27 + 0x4000..27 + 0x4000 + program.len()].copy_from_slice(&program);
+    for (machine, snapshot, frame) in [
+        ("cpc6128", cpc, CPC_FRAME_TICKS),
+        ("spectrum48", spectrum, SPECTRUM_FRAME_TICKS),
+    ] {
+        let from = scratch.write(&format!("{machine}.sna"), &snapshot);
+        let mut previous = from;
+        for (round, frames) in [10, 5].into_iter().enumerate() {
+            let theirs = scratch.0.join(format!("{machine}-{round}-there.sna"));
+            command_line_run(machine, &previous, frames, &theirs);
+            let handle = session.open_from(machine, &previous);
+            session.run(&handle, json!({ "ticks": u64::from(frames) * frame }));
+            let ours = scratch.0.join(format!("{machine}-{round}-here.sna"));
+            session.answer("snapshot_save", json!({ "handle": handle, "path": ours }));
+            assert_eq!(
+                fs::read(&ours).unwrap(),
+                fs::read(&theirs).unwrap(),
+                "{machine}, round {round}"
+            );
+            previous = ours;
+        }
+    }
 }

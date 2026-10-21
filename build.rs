@@ -365,6 +365,8 @@ fn main() {
         .header(bridge.join("mcp.h").display().to_string())
         .header(machine.join("cpc_snapshot.h").display().to_string())
         .header(machine.join("spectrum_snapshot.h").display().to_string())
+        .header(machine.join("dsk.h").display().to_string())
+        .header(machine.join("tzx.h").display().to_string())
         .clang_arg(format!("-I{}", machine.display()))
         .clang_arg("-std=c99")
         // A field's comment is its description, wherever an answer carries
@@ -377,9 +379,12 @@ fn main() {
         // copied alone or with its CPC, would point at the drives of the one
         // it was copied from.
         .no_copy("(cpc_t|upd765_t|spectrum_t)")
-        .allowlist_function("(cpc|spectrum|mcp|floppy)_.*|gate_array_rgb|ula_rgb")
+        .allowlist_function(
+            "(cpc|spectrum|mcp|floppy|keyboard|tape|tzx|dsk)_.*|z80_instruction_complete|\
+             gate_array_rgb|ula_rgb",
+        )
         .allowlist_type("(cpc|spectrum|mcp)_.*")
-        .allowlist_var("(CPC|SPECTRUM|Z80|MCP)_.*")
+        .allowlist_var("(CPC|SPECTRUM|Z80|MCP|FLOPPY)_.*")
         .generate()
         .expect("bindgen reads the bridge's header")
         .to_string();
