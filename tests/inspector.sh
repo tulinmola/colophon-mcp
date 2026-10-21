@@ -39,8 +39,9 @@ for era in legacy modern; do
   case $tools in
   *'"schemaFindings"'*) fail "$era: tool schemas would not carry to every client: $tools" ;;
   esac
-  for tool in call disassemble inspect machine_close machine_list machine_open monitor peek poke \
-    run screen set step; do
+  for tool in call disassemble disc_insert inspect journal machine_close machine_list \
+    machine_open monitor peek poke run screen set snapshot_save state_drop state_keep \
+    state_restore step tape_insert type; do
     case $tools in
     *"\"name\":\"$tool\""*) ;;
     *) fail "$era: $tool is not listed: $tools" ;;

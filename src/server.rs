@@ -20,7 +20,9 @@ use crate::keys::Key;
 use crate::machine::{
     COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, READ, Run, UNTIL, WRITE,
 };
-use crate::machines::{self, Built, DISCS, FileRead, MACHINES, Machine, TAPES, Watched, Watching};
+use crate::machines::{
+    self, Built, DISCS, Entry, FileRead, MACHINES, Machine, TAPES, Watched, Watching,
+};
 use crate::picture;
 use crate::screen::{Asked, MOST_HEIGHT, MOST_RASTERS, MOST_WIDTH, Reading};
 
@@ -55,6 +57,13 @@ const MOST_CONDITIONS: usize = 16;
 // An instruction listed takes some 50 characters, so these come to about half
 // as many again as MOST_BYTES does.
 const MOST_INSTRUCTIONS_LISTED: u16 = 256;
+// A state holds the machine's struct, its RAM and its picture, some 450K on a
+// 6128, and a disc's own copy only where the disc changed since it was last
+// kept or restored, so these come to some 30MB of a machine whose discs stand
+// still; a client walking a game's rooms held thirty.
+const MOST_STATES: usize = 64;
+// The hexadecimal digits of MOST_BYTES, as many characters as peek answers.
+const MOST_JOURNAL_CHARACTERS: usize = 2 * MOST_BYTES as usize;
 
 // A machine holds raw pointers, a CPC's into itself, so it is not Send, and
 // the server must be. Each is built on a thread of its own, never leaves it,
@@ -74,22 +83,71 @@ impl MachineThread {
         drop(self.orders);
         let _ = self.thread.join();
     }
-
-    fn standing(&self) -> Standing {
-        Standing {
-            handle: self.handle.clone(),
-            machine: self.machine.name.to_owned(),
-        }
-    }
 }
 
+// The machines standing, in the order they were opened, and the states kept
+// from them, each beside the handle of its machine, in the order they were
+// kept; each has its number in the order of all that were ever opened or
+// kept. Each state is held on its machine's thread, and named here as well,
+// by that thread as it keeps it, until that thread lets it go or machine_close
+// puts the machine away, so that machine_list answers without waiting behind
+// a machine that runs.
 #[derive(Default)]
 struct Threads {
     opened: u64,
     standing: Vec<MachineThread>,
+    kept: u64,
+    held: Vec<(String, StateHeld)>,
 }
 
 impl Threads {
+    fn listed(&self, thread: &MachineThread) -> Standing {
+        Standing {
+            handle: thread.handle.clone(),
+            machine: thread.machine.name.to_owned(),
+            states: self
+                .held
+                .iter()
+                .filter(|(handle, _)| *handle == thread.handle)
+                .map(|(_, held)| held.clone())
+                .collect(),
+        }
+    }
+
+    fn states_of(&self, handle: &str) -> Vec<&str> {
+        self.held
+            .iter()
+            .filter(|(held, _)| held == handle)
+            .map(|(_, held)| held.state.as_str())
+            .collect()
+    }
+
+    // Whether a state of that name is held, kept from this machine, and if
+    // not what would do.
+    fn held_of(&self, handle: &str, state: &str) -> Result<(), String> {
+        match self.held.iter().find(|(_, held)| held.state == state) {
+            Some((held, _)) if held == handle => Ok(()),
+            Some((held, _)) => Err(format!(
+                "{state} was kept from {held}, and a state is restored into the machine it was \
+                 kept from and dropped from it alone"
+            )),
+            None => {
+                let states = self.states_of(handle);
+                Err(if states.is_empty() {
+                    format!(
+                        "no state is called {state}; no state is held of {handle}, and \
+                         state_keep keeps one"
+                    )
+                } else {
+                    format!(
+                        "no state is called {state}; the states kept from {handle} are {}",
+                        states.join(", ")
+                    )
+                })
+            }
+        }
+    }
+
     fn unknown(&self, handle: &str) -> String {
         let handles: Vec<&str> = self
             .standing
@@ -112,7 +170,7 @@ impl Threads {
 
 pub struct Server {
     roms: PathBuf,
-    threads: Mutex<Threads>,
+    threads: Arc<Mutex<Threads>>,
 }
 
 fn identity() -> Implementation {
@@ -164,7 +222,7 @@ fn any_value_schema(_: &mut SchemaGenerator) -> Schema {
     Schema::try_from(any_value()).expect("an object is a schema")
 }
 
-fn values_schema(_: &mut SchemaGenerator) -> Schema {
+pub(crate) fn values_schema(_: &mut SchemaGenerator) -> Schema {
     Schema::try_from(json!({ "type": "object", "additionalProperties": any_value() }))
         .expect("an object is a schema")
 }
@@ -172,7 +230,7 @@ fn values_schema(_: &mut SchemaGenerator) -> Schema {
 // An argument that may be left out is not one that may be null, or one whose
 // default is null, and a type that admits null does not carry to every
 // client.
-fn absent_not_null(schema: &mut Schema) {
+pub(crate) fn absent_not_null(schema: &mut Schema) {
     if schema.get("default") == Some(&Value::Null) {
         schema.remove("default");
     }
@@ -436,6 +494,12 @@ fn keys(machine: &Machine, given: Option<&Vec<Value>>) -> Result<Vec<Key>, Strin
         .collect()
 }
 
+// A request's arguments as the journal keeps them: as they were given, save
+// the handle, which names the machine whose journal it is.
+fn journaled<T: Serialize>(request: &T) -> Value {
+    serde_json::to_value(request).expect("a request's arguments serialize")
+}
+
 fn hexadecimal(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
@@ -480,45 +544,53 @@ struct CloseRequest {
     handle: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RunRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// How many times the monitor is to retrace, from 1 to 1500.
     #[schemars(range(min = 1, max = MOST_FRAMES))]
     #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<i64>,
     /// How many ticks to run, from 1 to the ticks of 1500 standard frames.
     #[schemars(range(min = 1))]
     #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
     /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
     /// Conditions whose matches are gathered as the run goes, written as until's are. The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
     /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
     /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are.
     #[schemars(schema_with = "keys_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<Value>>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CallRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// Where the routine begins.
     #[schemars(schema_with = "address_schema")]
@@ -527,32 +599,38 @@ struct CallRequest {
     #[schemars(schema_with = "values_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     values: Option<Map<String, Value>>,
     /// How many times the monitor may retrace before the call stops waiting for the routine to return, from 1 to 1500; 1500 if not given.
     #[schemars(range(min = 1, max = MOST_FRAMES))]
     #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<i64>,
     /// Conditions that stop the call at their first match, written as run's until takes them. The routine's first instruction is never stopped before. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
     /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
     /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TypeRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// What to type: "PRINT 2+2\n" on a CPC, "p2+2\n" on a Spectrum, whose ROM reads a letter typed where the cursor shows K as a keyword.
     text: String,
@@ -567,22 +645,25 @@ enum Drive {
     B,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiscRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// The disc image: its path on the file system the server runs on, a relative one read from the server's working directory.
     path: PathBuf,
     /// The drive the disc goes into; A if not given.
     #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<Drive>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TapeRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// The tape image: its path on the file system the server runs on, a relative one read from the server's working directory.
     path: PathBuf,
@@ -599,12 +680,41 @@ struct SaveRequest {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct KeepRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct StateRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The state, by the name state_keep gave it.
+    state: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JournalRequest {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The first entry to answer, counting from 0; 0 if not given.
+    #[schemars(range(min = 0))]
+    #[schemars(transform = absent_not_null)]
+    from: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct StepRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// How many instructions to run, from 1 to 100000; 1 if not given.
     #[schemars(range(min = 1, max = MOST_INSTRUCTIONS))]
     #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<i64>,
 }
 
@@ -618,10 +728,11 @@ struct InspectRequest {
     path: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SetRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// Each value to write, by its path: {"cpu.pc": 16384, "gate_array.inks[16]": 20}. A structure takes an object of some of its fields and an array an array of all its elements.
     #[schemars(schema_with = "values_schema")]
@@ -642,10 +753,11 @@ struct PeekRequest {
     length: Option<i64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PokeRequest {
     /// The handle machine_open gave the machine.
+    #[serde(skip_serializing)]
     handle: String,
     /// The first address to write.
     #[schemars(schema_with = "address_schema")]
@@ -716,6 +828,17 @@ struct Standing {
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
+    /// The states kept from it, in the order they were kept, if any are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    states: Vec<StateHeld>,
+}
+
+#[derive(Clone, Serialize, JsonSchema)]
+struct StateHeld {
+    /// The state's name.
+    state: String,
+    /// The machine's tick as it was kept.
+    tick: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -758,6 +881,58 @@ struct Saved {
     path: PathBuf,
     /// The SHA-256 of what was written, in hexadecimal.
     sha256: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Kept {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The state's name, which no other state of this server's is given.
+    state: String,
+    /// The machine's tick as it was kept.
+    tick: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Restored {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The state restored.
+    state: String,
+    /// The machine's tick, the state's.
+    tick: u64,
+    /// The program counter: where the next instruction is fetched.
+    pc: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Dropped {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The state dropped, whose name names nothing now.
+    state: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Journal {
+    /// The handle machine_open gave the machine.
+    handle: String,
+    /// The machine, by the name the emulator's command line gives it.
+    machine: String,
+    /// The build the machine ran on, as the server names itself.
+    build: String,
+    /// Every file the machine was built from, firmware first and the snapshot last, each named by what it held.
+    files: Vec<FileRead>,
+    /// How many entries the journal holds.
+    count: usize,
+    /// The first entry answered, counting from 0.
+    from: usize,
+    /// The entries, in the order their requests were made.
+    entries: Vec<Entry>,
+    /// Where the next page begins, if the journal runs on past this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    next: Option<usize>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1187,7 +1362,7 @@ impl Server {
     pub fn new(roms: PathBuf) -> Server {
         Server {
             roms,
-            threads: Mutex::default(),
+            threads: Arc::default(),
         }
     }
 
@@ -1285,7 +1460,7 @@ impl Server {
         Ok(Json(answer))
     }
 
-    /// The machines standing, each by its handle and its name, in the order they were opened.
+    /// The machines standing, each by its handle and its name, in the order they were opened, and the states kept from each, by name and tick, in the order they were kept.
     #[tool(input_schema = no_arguments(), annotations(read_only_hint = true, open_world_hint = false))]
     fn machine_list(&self, Parameters(_): Parameters<NoArguments>) -> Json<Listing> {
         let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1293,12 +1468,12 @@ impl Server {
             machines: threads
                 .standing
                 .iter()
-                .map(MachineThread::standing)
+                .map(|thread| threads.listed(thread))
                 .collect(),
         })
     }
 
-    /// Put a machine away, once whatever it was asked to do before is done. Its handle names nothing afterwards.
+    /// Put a machine away, once whatever it was asked to do before is done, and every state kept from it with it. Its handle names nothing afterwards, nor do the states' names.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1324,12 +1499,14 @@ impl Server {
         // done, so is everything sent before, and its thread ends at once.
         let _ = Server::ask(&request.handle, standing.orders.clone(), |_| ()).await;
         standing.close();
+        let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        threads.held.retain(|(handle, _)| *handle != request.handle);
         Ok(Json(Closed {
             handle: request.handle,
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1345,6 +1522,7 @@ impl Server {
             request.count.as_ref(),
         )?;
         let keys = keys(machine, request.keys.as_ref())?;
+        let arguments = journaled(&request);
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let ran = match (request.frames, request.ticks) {
@@ -1360,7 +1538,9 @@ impl Server {
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
+                    let tick = built.tick();
                     let (run, watched) = built.run(frames, limit, &watching(&conditions), &keys);
+                    built.record(tick, "run", arguments, None);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
                     } else {
@@ -1383,7 +1563,9 @@ impl Server {
                         )
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
+                    let tick = built.tick();
                     let (run, watched) = built.run(u32::MAX, ticks, &watching(&conditions), &keys);
+                    built.record(tick, "run", arguments, None);
                     Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering, counting)
                 })
                 .await?
@@ -1428,12 +1610,15 @@ impl Server {
         )?;
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
+        let arguments = journaled(&request);
         let values = request.values.unwrap_or_default();
         let (machine, orders) = self.thread(&request.handle)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
+            let tick = built.tick();
             let (run, watched) =
                 built.call(address, &values, frames, limit, &watching(&conditions))?;
+            built.record(tick, "call", arguments, None);
             let stopped = if run.frames >= frames {
                 Stopped::Frames
             } else {
@@ -1467,8 +1652,11 @@ impl Server {
                 )
             })?;
         let (_, orders) = self.thread(&request.handle)?;
+        let arguments = journaled(&request);
         let ran = Server::ask(&request.handle, orders, move |built| {
+            let tick = built.tick();
             let run = built.step(instructions);
+            built.record(tick, "step", arguments, None);
             Ran::of(run, built, Stopped::Instructions)
         })
         .await?;
@@ -1506,19 +1694,22 @@ impl Server {
         }
         let keystrokes = machine.keystrokes(&request.text)?;
         let (held, released) = machine.typing();
+        let arguments = journaled(&request);
         let ran = Server::ask(&request.handle, orders, move |built| {
+            let tick = built.tick();
             let run = built.r#type(&keystrokes, held, released);
+            built.record(tick, "type", arguments, None);
             Ran::of(run, built, Stopped::Typed)
         })
         .await?;
         Ok(Json(ran))
     }
 
-    /// Put a disc in a CPC's drive: a DSK image, of the original layout or the extended one, read whole from its path on the file system the server runs on and copied into the machine, with room for every track to be formatted again, as the emulator's command line gives a disc with --disc. What the machine writes lands in its copy and never in the file, and is gone once another disc takes the copy's place; nothing here writes a disc out. The disc takes the place of whatever disc the drive held, as a game's second side does when the game asks for it. A cpc664 and a cpc6128 take discs; a cpc464 is built here as the command line builds one given no disc, without the disc interface, and nothing here fits one afterwards, so its discs go to a cpc664 or a cpc6128; a Spectrum has no drive. An image the emulator cannot read is refused, with what is wrong with it, and the drive keeps the disc it had. The answer names the file by its SHA-256, with the machine's tick as the disc went in.
+    /// Put a disc in a CPC's drive: a DSK image, of the original layout or the extended one, read whole from its path on the file system the server runs on and copied into the machine, with room for every track to be formatted again, as the emulator's command line gives a disc with --disc. What the machine writes lands in its copy and never in the file, and is gone once another disc takes the copy's place, save what a state kept while it stood in the drive brings back as it stood then; nothing here writes a disc out. The disc takes the place of whatever disc the drive held, as a game's second side does when the game asks for it. A cpc664 and a cpc6128 take discs; a cpc464 is built here as the command line builds one given no disc, without the disc interface, and nothing here fits one afterwards, so its discs go to a cpc664 or a cpc6128; a Spectrum has no drive. An image the emulator cannot read is refused, with what is wrong with it, and the drive keeps the disc it had. The answer names the file by its SHA-256, with the machine's tick as the disc went in.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
-        idempotent_hint = true,
+        idempotent_hint = false,
         open_world_hint = false
     ))]
     async fn disc_insert(
@@ -1526,6 +1717,7 @@ impl Server {
         Parameters(request): Parameters<DiscRequest>,
     ) -> Result<Json<Inserted>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
+        let arguments = journaled(&request);
         let drive = request.drive.unwrap_or(Drive::A);
         let path = request.path;
         let read = path.clone();
@@ -1539,8 +1731,10 @@ impl Server {
             Drive::A => 0,
             Drive::B => 1,
         };
+        let given = file.clone();
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_disc(number, &contents)?;
+            built.record(built.tick(), "disc_insert", arguments, Some(given));
             Ok::<_, String>(built.tick())
         })
         .await?
@@ -1557,7 +1751,7 @@ impl Server {
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
-        idempotent_hint = true,
+        idempotent_hint = false,
         open_world_hint = false
     ))]
     async fn tape_insert(
@@ -1565,6 +1759,7 @@ impl Server {
         Parameters(request): Parameters<TapeRequest>,
     ) -> Result<Json<Inserted>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
+        let arguments = journaled(&request);
         let path = request.path;
         let read = path.clone();
         let (contents, file) = Server::blocking(path.display().to_string(), move || {
@@ -1573,8 +1768,10 @@ impl Server {
             Ok((contents, file))
         })
         .await?;
+        let given = file.clone();
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_tape(&contents)?;
+            built.record(built.tick(), "tape_insert", arguments, Some(given));
             Ok::<_, String>(built.tick())
         })
         .await?
@@ -1618,6 +1815,169 @@ impl Server {
         }))
     }
 
+    /// Keep a machine exactly as it stands, to be put back as it was with state_restore: everything it holds, inside an instruction if a run left it in a chain of prefixes, its picture, each disc as it has been written, the tape where it has played to, its tick and its journal. Nothing the machine does afterwards changes the state, and nothing of the machine is left out of it, where a snapshot keeps only what its format has room for. The answer names the state. A state is held in the server's memory, beside its machine, until state_drop lets it go or machine_close puts the machine away; the server stopping takes every state with it, and no state is written to a file, since it holds the machine's own pointers. At most 64 are held of one machine. A state is no record of how the machine came to stand there: its journal is, and a finding names the journal, which names the files and the build that make the machine again.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn state_keep(
+        &self,
+        Parameters(request): Parameters<KeepRequest>,
+    ) -> Result<Json<Kept>, String> {
+        let (_, orders) = self.thread(&request.handle)?;
+        let state = {
+            let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.kept += 1;
+            format!("state-{}", threads.kept)
+        };
+        let threads = Arc::clone(&self.threads);
+        let (handle, keeping) = (request.handle.clone(), state.clone());
+        let tick = Server::ask(&request.handle, orders, move |built| {
+            let full = {
+                let threads = threads.lock().unwrap_or_else(PoisonError::into_inner);
+                let states = threads.states_of(&handle);
+                (states.len() >= MOST_STATES).then(|| {
+                    format!(
+                        "{handle} has {MOST_STATES} states kept, the most one machine keeps; \
+                         state_drop lets one of them go: {}",
+                        states.join(", ")
+                    )
+                })
+            };
+            if let Some(full) = full {
+                return Err(full);
+            }
+            built.state_keep(keeping.clone());
+            let tick = built.tick();
+            let mut threads = threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.held.push((
+                handle,
+                StateHeld {
+                    state: keeping,
+                    tick,
+                },
+            ));
+            Ok(tick)
+        })
+        .await??;
+        Ok(Json(Kept {
+            handle: request.handle,
+            state,
+            tick,
+        }))
+    }
+
+    /// Put a machine back exactly as a state kept from it stood: everything it held, its picture, the discs it held then as they were, though another disc has taken a drive since or the program has written to them, a drive empty then emptied again, and its tape where it had played to. Its tick and its journal are the state's, and what is done from there is journaled after them. A state is restored into the machine it was kept from and no other. Restoring one lets no other state go: each is a branch to come back to, and this one stays, to restore again.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn state_restore(
+        &self,
+        Parameters(request): Parameters<StateRequest>,
+    ) -> Result<Json<Restored>, String> {
+        let (_, orders) = self.thread(&request.handle)?;
+        {
+            let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.held_of(&request.handle, &request.state)?;
+        }
+        let state = request.state.clone();
+        let (tick, pc) = Server::ask(&request.handle, orders, move |built| {
+            built.state_restore(&state)?;
+            Ok::<_, String>((built.tick(), built.pc()))
+        })
+        .await??;
+        Ok(Json(Restored {
+            handle: request.handle,
+            state: request.state,
+            tick,
+            pc,
+        }))
+    }
+
+    /// Let a state kept from a machine go, freeing the memory it held. Its name names nothing afterwards.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn state_drop(
+        &self,
+        Parameters(request): Parameters<StateRequest>,
+    ) -> Result<Json<Dropped>, String> {
+        let (_, orders) = self.thread(&request.handle)?;
+        {
+            let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.held_of(&request.handle, &request.state)?;
+        }
+        let threads = Arc::clone(&self.threads);
+        let state = request.state.clone();
+        Server::ask(&request.handle, orders, move |built| {
+            built.state_drop(&state)?;
+            let mut threads = threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.held.retain(|(_, held)| held.state != state);
+            Ok::<_, String>(())
+        })
+        .await??;
+        Ok(Json(Dropped {
+            handle: request.handle,
+            state: request.state,
+        }))
+    }
+
+    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, each with the machine's tick as it began and the arguments it was given, the first of them the machine_open that stood it up, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
+    async fn journal(
+        &self,
+        Parameters(request): Parameters<JournalRequest>,
+    ) -> Result<Json<Journal>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        let from = request.from.unwrap_or(0);
+        let handle = request.handle.clone();
+        let (files, count, from, entries) = Server::ask(&request.handle, orders, move |built| {
+            let count = built.journal_length();
+            let from = usize::try_from(from)
+                .ok()
+                .filter(|from| *from <= count)
+                .ok_or_else(|| {
+                    format!(
+                        "from is {from}, and the journal of {handle} holds {count} entries, so it \
+                         is answered from 0 to {count}"
+                    )
+                })?;
+            let mut characters = 0;
+            let mut entries = Vec::new();
+            for entry in built.journal().skip(from) {
+                characters += serde_json::to_string(entry)
+                    .expect("an entry serializes")
+                    .chars()
+                    .count();
+                if characters > MOST_JOURNAL_CHARACTERS && !entries.is_empty() {
+                    break;
+                }
+                entries.push(entry.clone());
+            }
+            Ok::<_, String>((built.files().to_vec(), count, from, entries))
+        })
+        .await??;
+        let next = Some(from + entries.len()).filter(|next| *next < count);
+        Ok(Json(Journal {
+            handle: request.handle,
+            machine: machine.name.to_owned(),
+            build: env!("COLOPHON_MCP_BUILD").to_owned(),
+            files,
+            count,
+            from,
+            entries,
+            next,
+        }))
+    }
+
     /// Read what a machine holds, by its path: the whole machine, or the part a path names, as a C expression names it on the emulator's struct for the machine (cpc_t or spectrum_t, in its headers): cpu.pc, crtc.registers[12], gate_array.inks, fdc.units[0].head. Fields keep the names their headers give them, numbers are numbers, and a C enum's value is the name of its enumerator. Pointers are not followed; peek reads memory. Some fields are the chips' registers and counters, and some are the emulator's own machinery for stepping them a tick at a time, which no silicon holds as such: the headers say which.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -1636,7 +1996,7 @@ impl Server {
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
-        idempotent_hint = true,
+        idempotent_hint = false,
         open_world_hint = false
     ))]
     async fn set(
@@ -1644,9 +2004,14 @@ impl Server {
         Parameters(request): Parameters<SetRequest>,
     ) -> Result<Json<Written>, String> {
         let (_, orders) = self.thread(&request.handle)?;
+        let arguments = journaled(&request);
         let values = request.values;
-        let written =
-            Server::ask(&request.handle, orders, move |built| built.set(&values)).await??;
+        let written = Server::ask(&request.handle, orders, move |built| {
+            let written = built.set(&values)?;
+            built.record(built.tick(), "set", arguments, None);
+            Ok::<_, String>(written)
+        })
+        .await??;
         Ok(Json(Written { values: written }))
     }
 
@@ -1773,7 +2138,7 @@ impl Server {
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
-        idempotent_hint = true,
+        idempotent_hint = false,
         open_world_hint = false
     ))]
     async fn poke(
@@ -1784,8 +2149,10 @@ impl Server {
         let bytes = bytes(&request.bytes)?;
         let length = span(address, i64::try_from(bytes.len()).unwrap_or(i64::MAX))?;
         let (_, orders) = self.thread(&request.handle)?;
+        let arguments = journaled(&request);
         Server::ask(&request.handle, orders, move |built| {
-            built.poke(address, &bytes)
+            built.poke(address, &bytes);
+            built.record(built.tick(), "poke", arguments, None);
         })
         .await?;
         Ok(Json(Poked { address, length }))

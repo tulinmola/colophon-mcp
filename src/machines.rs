@@ -1,23 +1,25 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use schemars::JsonSchema;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::disassembly;
 use crate::emulator::{
     CPC_FRAMEBUFFER_WIDTH, CPC_TICKS_PER_STANDARD_FRAME, SPECTRUM_FRAMEBUFFER_WIDTH,
-    SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE, SPECTRUM_TICKS_PER_FRAME, cpc_t,
-    keyboard_t, spectrum_t, z80_t,
+    SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE, SPECTRUM_SNAPSHOT_SIZE, SPECTRUM_TICKS_PER_FRAME,
+    keyboard_t, z80_t,
 };
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, COUNTS_PER_KIND, Condition, Cpc, KINDS, Kind, Match, Run, Spectrum, Watch,
-    gate_array_rgb, ula_rgb,
+    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Kind, Match, Run, Spectrum,
+    SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -236,11 +238,74 @@ enum Hardware {
     Spectrum(Spectrum),
 }
 
-// A machine as the server holds it: the hardware, and the ticks it has run
-// since it was stood up, which the core leaves to whoever runs it.
+enum HardwareState {
+    Cpc(CpcState),
+    Spectrum(SpectrumState),
+}
+
+// A request that stood a machine up or changed it.
+#[derive(Clone, Serialize, JsonSchema)]
+pub struct Entry {
+    /// The machine's tick as the request began.
+    pub tick: u64,
+    /// The tool asked.
+    pub tool: &'static str,
+    /// The arguments it was given, save the handle.
+    #[schemars(schema_with = "crate::server::values_schema")]
+    pub arguments: Value,
+    /// The snapshot, the disc or the tape it read, named by what it held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::server::absent_not_null)]
+    pub file: Option<FileRead>,
+}
+
+// What has been done to a machine, in the order it was done: the stretches
+// that states were kept at the end of, which they share, and the entries
+// since the last.
+#[derive(Clone)]
+struct Journal {
+    kept: Vec<Rc<[Entry]>>,
+    since: Vec<Entry>,
+}
+
+impl Journal {
+    fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.kept
+            .iter()
+            .flat_map(|kept| kept.iter())
+            .chain(&self.since)
+    }
+
+    fn len(&self) -> usize {
+        self.kept.iter().map(|kept| kept.len()).sum::<usize>() + self.since.len()
+    }
+
+    // The journal as a state keeps it, sharing what earlier states keep.
+    fn keep(&mut self) -> Journal {
+        if !self.since.is_empty() {
+            self.kept.push(std::mem::take(&mut self.since).into());
+        }
+        self.clone()
+    }
+}
+
+// A machine kept as it stood, with the ticks it had run and its journal then.
+struct State {
+    hardware: HardwareState,
+    tick: u64,
+    journal: Journal,
+}
+
+// A machine as the server holds it: the hardware, the ticks it has run since
+// it was stood up, which the core leaves to whoever runs it, the files it was
+// built from, what has been done to it since on the branch it stands on, and
+// the states kept of it, by name.
 pub struct Built {
     hardware: Hardware,
     tick: u64,
+    files: Vec<FileRead>,
+    journal: Journal,
+    states: BTreeMap<String, State>,
 }
 
 fn read(
@@ -473,6 +538,12 @@ impl Parts {
             }
             Memories::Spectrum { ram, rom } => Hardware::Spectrum(Spectrum::new(ram, rom)),
         };
+        let mut opening = Entry {
+            tick: 0,
+            tool: "machine_open",
+            arguments: json!({ "machine": machine.name }),
+            file: None,
+        };
         if let Some((path, bytes)) = self.snapshot {
             let loaded = match &mut hardware {
                 Hardware::Cpc(cpc) => cpc.snapshot_load(&bytes),
@@ -481,8 +552,19 @@ impl Parts {
             loaded.map_err(|problem| {
                 format!("{} {problem}; {}", path.display(), machine.snapshots())
             })?;
+            opening.arguments["snapshot"] = json!(path);
+            opening.file = Some(FileRead::of(&path, &bytes));
         }
-        Ok(Built { hardware, tick: 0 })
+        Ok(Built {
+            hardware,
+            tick: 0,
+            files: self.files,
+            journal: Journal {
+                kept: Vec::new(),
+                since: vec![opening],
+            },
+            states: BTreeMap::new(),
+        })
     }
 }
 
@@ -519,11 +601,13 @@ pub struct Watched {
 // stops before.
 const ROOM_PAST_FULL: u32 = 9;
 
-// The machine as it stood, put back when a call is refused after its values
-// were written.
-enum Kept {
-    Cpc(Box<cpc_t>),
-    Spectrum(Box<spectrum_t>),
+// A state named when it was asked for and dropped before the asking reached
+// the machine.
+fn gone(name: &str) -> String {
+    format!(
+        "{name} was dropped as it was asked for; machine_list names the states kept from each \
+         machine"
+    )
 }
 
 // Every write is made to a copy, so that a value refused leaves the machine
@@ -764,7 +848,7 @@ impl Built {
         limit: u64,
         watching: &Watching,
     ) -> Result<(Run, Watched), String> {
-        let kept = (!values.is_empty()).then(|| self.keep());
+        let kept = (!values.is_empty()).then(|| self.keep_hardware());
         if !values.is_empty() {
             self.set(values)?;
         }
@@ -778,7 +862,7 @@ impl Built {
         };
         if let Err(problem) = called {
             if let Some(kept) = kept {
-                self.restore(kept);
+                self.restore_hardware(&kept);
             }
             return Err(format!("cannot call &{address:04X}: {problem}"));
         }
@@ -790,29 +874,76 @@ impl Built {
         Ok((run, watched))
     }
 
-    fn keep(&self) -> Kept {
-        // SAFETY: as in written(): a copy of a machine's bytes owns nothing,
-        // and is moved back over the machine or dropped.
+    fn keep_hardware(&self) -> HardwareState {
         match &self.hardware {
-            Hardware::Cpc(cpc) => Kept::Cpc(Box::new(unsafe { std::ptr::read(cpc.machine()) })),
-            Hardware::Spectrum(spectrum) => {
-                Kept::Spectrum(Box::new(unsafe { std::ptr::read(spectrum.machine()) }))
-            }
+            Hardware::Cpc(cpc) => HardwareState::Cpc(cpc.state()),
+            Hardware::Spectrum(spectrum) => HardwareState::Spectrum(spectrum.state()),
         }
     }
 
-    fn restore(&mut self, kept: Kept) {
-        match (&mut self.hardware, kept) {
-            (Hardware::Cpc(cpc), Kept::Cpc(kept)) => {
-                *cpc.machine_mut() = *kept;
-                cpc.remap();
+    fn restore_hardware(&mut self, state: &HardwareState) {
+        match (&mut self.hardware, state) {
+            (Hardware::Cpc(cpc), HardwareState::Cpc(state)) => cpc.restore(state),
+            (Hardware::Spectrum(spectrum), HardwareState::Spectrum(state)) => {
+                spectrum.restore(state)
             }
-            (Hardware::Spectrum(spectrum), Kept::Spectrum(kept)) => {
-                *spectrum.machine_mut() = *kept;
-                spectrum.seek();
-            }
-            _ => unreachable!("a machine is kept as the machine it is"),
+            _ => unreachable!("a state is restored into the machine it was kept from"),
         }
+    }
+
+    // What changed the machine, at the tick it began, on the branch it
+    // stands on.
+    pub fn record(
+        &mut self,
+        tick: u64,
+        tool: &'static str,
+        arguments: Value,
+        file: Option<FileRead>,
+    ) {
+        self.journal.since.push(Entry {
+            tick,
+            tool,
+            arguments,
+            file,
+        });
+    }
+
+    pub fn journal(&self) -> impl Iterator<Item = &Entry> {
+        self.journal.entries()
+    }
+
+    pub fn journal_length(&self) -> usize {
+        self.journal.len()
+    }
+
+    pub fn files(&self) -> &[FileRead] {
+        &self.files
+    }
+
+    // Keeps the machine as it stands under a name, with its tick and its
+    // journal.
+    pub fn state_keep(&mut self, name: String) {
+        let state = State {
+            hardware: self.keep_hardware(),
+            tick: self.tick,
+            journal: self.journal.keep(),
+        };
+        self.states.insert(name, state);
+    }
+
+    // Puts the machine back as the state of that name kept it; the journal
+    // is the state's, and what is done from here on follows it.
+    pub fn state_restore(&mut self, name: &str) -> Result<(), String> {
+        let (name, state) = self.states.remove_entry(name).ok_or_else(|| gone(name))?;
+        self.restore_hardware(&state.hardware);
+        self.tick = state.tick;
+        self.journal = state.journal.clone();
+        self.states.insert(name, state);
+        Ok(())
+    }
+
+    pub fn state_drop(&mut self, name: &str) -> Result<(), String> {
+        self.states.remove(name).map(drop).ok_or_else(|| gone(name))
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {

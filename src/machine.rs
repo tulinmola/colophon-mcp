@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{PoisonError, RwLock};
 
 use crate::emulator::{
@@ -178,19 +180,117 @@ const FORMAT_ROOM: usize = FLOPPY_MAX_CYLINDERS as usize
     * FLOPPY_MAX_SIDES as usize
     * FLOPPY_BYTES_PER_REVOLUTION as usize;
 
-// A medium, and the image it borrows, which takes the machine's writes.
-type Disc = (Handed<floppy_t>, Handed<[u8]>);
+// A medium, and the image it borrows, which takes the machine's writes; the
+// drive holds it, and so does every state kept while it stood there. It
+// remembers what it held when it was last kept or restored, so that states
+// kept while it does not change share one copy.
+struct Disc {
+    floppy: Handed<floppy_t>,
+    image: Handed<[u8]>,
+    last: RefCell<Option<Rc<DiscContents>>>,
+}
+
+// A medium's bytes and its image's, as they stood.
+struct DiscContents {
+    floppy: Box<[u8]>,
+    image: Box<[u8]>,
+}
+
+// A disc as a state keeps it, which a restore writes back into the disc.
+struct DiscState {
+    disc: Rc<Disc>,
+    contents: Rc<DiscContents>,
+}
+
+impl Disc {
+    fn new(floppy: Handed<floppy_t>, image: Handed<[u8]>) -> Disc {
+        Disc {
+            floppy,
+            image,
+            last: RefCell::new(None),
+        }
+    }
+
+    fn kept(self: &Rc<Disc>) -> DiscState {
+        // SAFETY: the medium and its image stand beside the machine, which
+        // is not running. Every byte of the medium holds a value: it was
+        // allocated zeroed, and C has written it since, by its fields and by
+        // floppy_init's assignment, whose padding at worst costs a copy.
+        let (floppy, image) = unsafe {
+            let floppy = self.floppy.as_ptr();
+            let bytes = std::slice::from_raw_parts(floppy.cast::<u8>(), size_of::<floppy_t>());
+            (bytes, &(&*self.image.as_ptr())[..(*floppy).image_length])
+        };
+        let mut last = self.last.borrow_mut();
+        let contents = match &*last {
+            Some(contents) if *contents.floppy == *floppy && *contents.image == *image => {
+                Rc::clone(contents)
+            }
+            _ => Rc::new(DiscContents {
+                floppy: floppy.into(),
+                image: image.into(),
+            }),
+        };
+        *last = Some(Rc::clone(&contents));
+        DiscState {
+            disc: Rc::clone(self),
+            contents,
+        }
+    }
+}
+
+impl DiscState {
+    // The disc, as it was when it was kept. Past the image's length its
+    // buffer is room that a format fills whole before anything reads it.
+    fn restored(&self) -> Rc<Disc> {
+        // SAFETY: as for kept(); the image kept is no longer than the buffer,
+        // which never shrinks.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.contents.floppy.as_ptr(),
+                self.disc.floppy.as_ptr().cast::<u8>(),
+                self.contents.floppy.len(),
+            );
+            (&mut *self.disc.image.as_ptr())[..self.contents.image.len()]
+                .copy_from_slice(&self.contents.image);
+        }
+        *self.disc.last.borrow_mut() = Some(Rc::clone(&self.contents));
+        Rc::clone(&self.disc)
+    }
+}
 
 // The deck a Spectrum plays, and the reader it points at and asks for
 // pulses, as colophon-player's emulator/deck.h holds them
 // (https://github.com/tulinmola/colophon-player).
+#[derive(Clone, Copy)]
 struct Deck {
     tape: tape_t,
     reader: tzx_t,
 }
 
-// A deck, and the image its reader borrows.
-type Tape = (Handed<Deck>, Handed<[u8]>);
+// A deck, and the image its reader borrows, held as a disc is.
+struct Tape {
+    deck: Handed<Deck>,
+    _image: Handed<[u8]>,
+}
+
+// A CPC as a state keeps it, to be restored into the machine it was kept
+// from and no other: its struct points into itself and at buffers of that
+// machine's.
+pub struct CpcState {
+    machine: Box<cpc_t>,
+    ram: Box<[u8]>,
+    framebuffer: Box<[u8]>,
+    discs: [Option<DiscState>; 2],
+}
+
+// A Spectrum as a state keeps it, likewise.
+pub struct SpectrumState {
+    machine: Box<spectrum_t>,
+    ram: Box<[u8]>,
+    framebuffer: Box<[u8]>,
+    tape: Option<(Rc<Tape>, Deck)>,
+}
 
 // What a snapshot writer leaves behind: the bytes, or the core's sentence.
 fn saved(bytes: Vec<u8>, written: bool, sentence: *const c_char) -> Result<Vec<u8>, String> {
@@ -207,7 +307,7 @@ pub struct Cpc {
     ram: Handed<[u8]>,
     _lower_rom: Handed<[u8; 0x4000]>,
     framebuffer: Handed<[u8]>,
-    discs: [Option<Disc>; 2],
+    discs: [Option<Rc<Disc>>; 2],
 }
 
 impl Cpc {
@@ -323,8 +423,8 @@ impl Cpc {
 
     // Reads the image onto a medium of its own, with room to format every
     // track again, and puts it in drive 0 or 1 in place of the disc there,
-    // which is freed once the drive no longer points at it. A refused image
-    // leaves the drive as it was.
+    // which is freed once neither the drive nor any state holds it. A refused
+    // image leaves the drive as it was.
     pub fn insert_disc(&mut self, drive: u8, contents: &[u8]) -> Result<(), String> {
         assert!(drive < 2, "a CPC has drives 0 and 1, not {drive}");
         let length = contents.len();
@@ -348,14 +448,48 @@ impl Cpc {
             return Err(problem(sentence));
         }
         // SAFETY: the room given is as far as the image's buffer reaches, and
-        // the medium is held beside the machine until another takes its
-        // place in the drive.
+        // the medium is held beside the machine for as long as the drive or a
+        // state holds it.
         unsafe {
             floppy_give_room(floppy.as_ptr(), length + FORMAT_ROOM);
             cpc_insert_disc(self.machine.as_ptr(), drive, floppy.as_ptr());
         }
-        self.discs[usize::from(drive)] = Some((floppy, image));
+        self.discs[usize::from(drive)] = Some(Rc::new(Disc::new(floppy, image)));
         Ok(())
+    }
+
+    // The machine as it stands: inside an instruction if it stands there,
+    // with its picture and each disc as it has been written.
+    pub fn state(&self) -> CpcState {
+        CpcState {
+            // SAFETY: as for a copy set writes to: the struct owns nothing,
+            // and this one is only ever written back over its machine.
+            machine: Box::new(unsafe { std::ptr::read(self.machine()) }),
+            ram: self.ram().into(),
+            framebuffer: self.framebuffer().into(),
+            discs: self
+                .discs
+                .each_ref()
+                .map(|disc| disc.as_ref().map(Disc::kept)),
+        }
+    }
+
+    // Puts the machine back as a state of its own kept it, with the discs it
+    // held then, as they were, whatever the drives have held since.
+    pub fn restore(&mut self, state: &CpcState) {
+        for (disc, kept) in self.discs.iter_mut().zip(&state.discs) {
+            *disc = kept.as_ref().map(DiscState::restored);
+        }
+        // SAFETY: as for state(); every pointer in it is one the machine held
+        // when it was kept, at buffers held beside it since, its discs among
+        // them.
+        *self.machine_mut() = unsafe { std::ptr::read(&*state.machine) };
+        // SAFETY: as for ram() and framebuffer(), mutably.
+        unsafe {
+            (*self.ram.as_ptr()).copy_from_slice(&state.ram);
+            (*self.framebuffer.as_ptr()).copy_from_slice(&state.framebuffer);
+        }
+        self.remap();
     }
 
     // The machine as a version 1 snapshot.
@@ -420,10 +554,10 @@ impl Cpc {
 
 pub struct Spectrum {
     machine: Handed<spectrum_t>,
-    _ram: Handed<[u8]>,
+    ram: Handed<[u8]>,
     _rom: Handed<[u8; SPECTRUM_ROM_SIZE as usize]>,
     framebuffer: Handed<[u8]>,
-    tape: Option<Tape>,
+    tape: Option<Rc<Tape>>,
 }
 
 impl Spectrum {
@@ -452,7 +586,7 @@ impl Spectrum {
         }
         Spectrum {
             machine,
-            _ram: ram,
+            ram,
             _rom: rom,
             framebuffer,
             tape: None,
@@ -460,8 +594,8 @@ impl Spectrum {
     }
 
     // Opens the image as a Spectrum's tape, puts it in the deck in place of
-    // the tape there, which is freed once the machine no longer points at
-    // it, and presses PLAY. A refused image leaves the deck as it was.
+    // the tape there, which is freed once neither the deck nor any state
+    // holds it, and presses PLAY. A refused image leaves the deck as it was.
     pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
         let length = u32::try_from(contents.len()).expect("a tape of less than 4GB");
         let image = Handed::new(contents.to_vec().into_boxed_slice());
@@ -486,8 +620,8 @@ impl Spectrum {
             return Err(problem(sentence));
         }
         // SAFETY: the deck points at its reader in the same allocation, and
-        // the machine at the deck, which is held beside the machine until
-        // another takes its place.
+        // the machine at the deck, which is held beside the machine for as
+        // long as it or a state holds it.
         unsafe {
             tape_init(&raw mut (*deck_at).tape);
             tape_insert(
@@ -498,8 +632,43 @@ impl Spectrum {
             spectrum_insert_tape(self.machine.as_ptr(), &raw mut (*deck_at).tape);
             tape_play(&raw mut (*deck_at).tape);
         }
-        self.tape = Some((deck, image));
+        self.tape = Some(Rc::new(Tape {
+            deck,
+            _image: image,
+        }));
         Ok(())
+    }
+
+    // As a CPC's: the machine as it stands, its tape where it has played to.
+    pub fn state(&self) -> SpectrumState {
+        SpectrumState {
+            // SAFETY: as for a CPC's.
+            machine: Box::new(unsafe { std::ptr::read(self.machine()) }),
+            ram: self.ram().into(),
+            framebuffer: self.framebuffer().into(),
+            tape: self.tape.as_ref().map(|tape| {
+                // SAFETY: the deck stands beside the machine, which is not
+                // running.
+                (Rc::clone(tape), unsafe { *tape.deck.as_ptr() })
+            }),
+        }
+    }
+
+    // As a CPC's: the machine and the tape it held, where it had played to.
+    pub fn restore(&mut self, state: &SpectrumState) {
+        self.tape = state.tape.as_ref().map(|(tape, deck)| {
+            // SAFETY: as for state(); the deck's pointers are into itself and
+            // at the image held beside it.
+            unsafe { *tape.deck.as_ptr() = *deck };
+            Rc::clone(tape)
+        });
+        // SAFETY: as for a CPC's.
+        *self.machine_mut() = unsafe { std::ptr::read(&*state.machine) };
+        // SAFETY: as for a CPC's.
+        unsafe {
+            (*self.ram.as_ptr()).copy_from_slice(&state.ram);
+            (*self.framebuffer.as_ptr()).copy_from_slice(&state.framebuffer);
+        }
     }
 
     // The machine as a 48K snapshot, which leaves the machine as it stands:
@@ -595,6 +764,11 @@ impl Spectrum {
     pub fn machine(&self) -> &spectrum_t {
         // SAFETY: as for a CPC's.
         unsafe { &*self.machine.as_ptr() }
+    }
+
+    pub fn ram(&self) -> &[u8] {
+        // SAFETY: as for a CPC's.
+        unsafe { &*self.ram.as_ptr() }
     }
 
     pub fn framebuffer(&self) -> &[u8] {
@@ -1328,9 +1502,9 @@ mod tests {
             "#define FORMAT_ROOM ((size_t)FLOPPY_MAX_CYLINDERS * FLOPPY_MAX_SIDES * \
              FLOPPY_BYTES_PER_REVOLUTION)"
         ));
-        let (floppy, _) = cpc.discs[0].as_ref().expect("a disc in drive 0");
+        let disc = cpc.discs[0].as_ref().expect("a disc in drive 0");
         // SAFETY: the medium stands beside the machine, which is not running.
-        let capacity = unsafe { (*floppy.as_ptr()).image_capacity };
+        let capacity = unsafe { (*disc.floppy.as_ptr()).image_capacity };
         assert_eq!(capacity, one_track_image(0xE5).len() + FORMAT_ROOM);
         let mut spectrum = Spectrum::new(
             vec![0; SPECTRUM_RAM_48K as usize].into_boxed_slice(),
@@ -1345,6 +1519,69 @@ mod tests {
             spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
         }
         assert!(!spectrum.machine().tape.is_null());
+    }
+
+    // Under the sanitizers, a state kept with a disc in the drive, or a tape
+    // in the deck, puts it back though another has taken its place since,
+    // and the machine runs on, reading the drive or the deck, once the state
+    // itself is dropped.
+    #[test]
+    fn a_state_keeps_its_disc_and_its_tape_through_a_swap() {
+        let (workload, _) = cpc_workload();
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT));
+        cpc.fit_disc_interface(true);
+        cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
+        let state = cpc.state();
+        let kept = Rc::clone(cpc.discs[0].as_ref().expect("a disc"));
+        // SAFETY: the medium and its image stand beside the machine, which is
+        // not running.
+        let held = |cpc: &Cpc| unsafe {
+            let disc = cpc.discs[0].as_ref().expect("a disc");
+            (
+                (*disc.floppy.as_ptr()).write_protected,
+                (*disc.image.as_ptr())[0x100],
+            )
+        };
+        let as_kept = held(&cpc);
+        // SAFETY: as above.
+        unsafe {
+            (*kept.floppy.as_ptr()).write_protected = !as_kept.0;
+            (*kept.image.as_ptr())[0x100] = !as_kept.1;
+        }
+        cpc.insert_disc(0, &one_track_image(0x00)).unwrap();
+        cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
+        cpc.restore(&state);
+        drop(state);
+        let restored = cpc.discs[0].as_ref().expect("a disc");
+        assert!(Rc::ptr_eq(restored, &kept));
+        assert_eq!(cpc.machine().drives[0].floppy, kept.floppy.as_ptr());
+        assert_eq!(held(&cpc), as_kept);
+        cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
+        let mut spectrum = Spectrum::new(
+            vec![0; SPECTRUM_RAM_48K as usize].into_boxed_slice(),
+            rom(&spectrum_workload(), HALT),
+        );
+        let tape = [3, 0, 0xFF, 0x01, 0xFE];
+        spectrum.insert_tape(&tape).unwrap();
+        spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+        let state = spectrum.state();
+        let kept = Rc::clone(spectrum.tape.as_ref().expect("a tape"));
+        // SAFETY: the deck stands beside the machine, which is not running.
+        let played = unsafe { (*kept.deck.as_ptr()).tape.ticks_left };
+        spectrum.insert_tape(&tape).unwrap();
+        spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+        // SAFETY: as above.
+        unsafe { (*kept.deck.as_ptr()).tape.ticks_left = played + 1 };
+        spectrum.restore(&state);
+        drop(state);
+        assert!(Rc::ptr_eq(spectrum.tape.as_ref().expect("a tape"), &kept));
+        // SAFETY: only the address is taken.
+        let deck = unsafe { &raw mut (*kept.deck.as_ptr()).tape };
+        assert_eq!(spectrum.machine().tape, deck);
+        // SAFETY: as above.
+        assert_eq!(unsafe { (*kept.deck.as_ptr()).tape.ticks_left }, played);
+        spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
     }
 
     // Runs with a watch on every instruction, every access and every port,
@@ -1596,7 +1833,7 @@ mod tests {
             let ram = vec![0; size as usize].into_boxed_slice();
             let spectrum = Spectrum::new(ram, rom(&[], HALT));
             assert_eq!(spectrum.machine().ram_size, size);
-            assert_eq!(spectrum.machine().ram, spectrum._ram.as_ptr().cast());
+            assert_eq!(spectrum.machine().ram, spectrum.ram.as_ptr().cast());
         }
     }
 

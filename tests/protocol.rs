@@ -24,11 +24,12 @@ use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 17] = [
+const TOOLS: [&str; 21] = [
     "call",
     "disassemble",
     "disc_insert",
     "inspect",
+    "journal",
     "machine_close",
     "machine_list",
     "machine_open",
@@ -39,6 +40,9 @@ const TOOLS: [&str; 17] = [
     "screen",
     "set",
     "snapshot_save",
+    "state_drop",
+    "state_keep",
+    "state_restore",
     "step",
     "tape_insert",
     "type",
@@ -1162,8 +1166,8 @@ fn listed(tools: &Value, name: &str) -> Value {
 // effect on its environment" (idempotentHint); "If false, the tool's domain of
 // interaction is closed" (openWorldHint), which is true unless said: the
 // 2026-07-28 schema's ToolAnnotations. A machine's state overwritten is a
-// destructive update, and a machine stood up or a file written where none
-// was an additive one.
+// destructive update, and a machine stood up, a state kept or a file written
+// where none was an additive one.
 #[test]
 fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached() {
     let roms = Roms::all();
@@ -1174,6 +1178,7 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         let reads = [
             "disassemble",
             "inspect",
+            "journal",
             "machine_list",
             "monitor",
             "peek",
@@ -1182,18 +1187,20 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         .contains(&name);
         assert_eq!(annotations["readOnlyHint"], reads, "{name}: {annotations}");
         if !reads {
-            let destroys = !["machine_open", "snapshot_save"].contains(&name);
-            // A handle put away names nothing again, so putting it away
-            // again changes nothing; a disc or a tape given again is the same
-            // fresh copy of the same file; a snapshot asked for again at its
-            // path is refused, since a file is there.
+            let destroys = !["machine_open", "snapshot_save", "state_keep"].contains(&name);
+            // A machine stood up again is another machine, and a state kept
+            // again another state; every other request that changes a
+            // machine, save a restore, is entered in its journal, which a
+            // repeat lengthens. A handle put away names nothing again, so
+            // putting it away again changes nothing, and so does a state
+            // dropped; a state restored again makes the same machine and the
+            // same journal; a snapshot asked for again at its path is
+            // refused, since a file is there.
             let repeats = [
-                "set",
-                "poke",
                 "machine_close",
-                "disc_insert",
-                "tape_insert",
                 "snapshot_save",
+                "state_restore",
+                "state_drop",
             ]
             .contains(&name);
             assert_eq!(
@@ -4334,6 +4341,497 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
     assert!(!unsettled.exists());
 }
 
+// The picture an answer carries beside its JSON.
+fn picture_data(result: &Value) -> Value {
+    assert_eq!(result["isError"], false, "{result}");
+    let data = result["content"][1]["data"].clone();
+    assert!(data.is_string(), "{result}");
+    data
+}
+
+// Everything a client reads of a machine: every field, the memory as the
+// processor reads it, the picture on its monitor, and on a CPC the whole of
+// its RAM, read as a screen of one bit to a pixel, 64K at a time.
+fn everything(session: &mut Session, handle: &str) -> Vec<Value> {
+    let mut seen = vec![
+        session.inspect(handle, ""),
+        json!(memory_from(session, handle, 0)),
+        picture_data(&session.call("monitor", json!({ "handle": handle }))),
+    ];
+    if handle.starts_with("cpc") {
+        let ram_size = session.inspect(handle, "ram_size").as_u64().unwrap();
+        for base in (0..ram_size).step_by(0x10000) {
+            let read = session.call(
+                "screen",
+                json!({
+                    "handle": handle, "reading": "linear", "base": base,
+                    "width": 128, "height": 512, "mode": 2,
+                }),
+            );
+            seen.push(picture_data(&read));
+        }
+    }
+    seen
+}
+
+fn keep(session: &mut Session, handle: &str) -> String {
+    let kept = session.answer("state_keep", json!({ "handle": handle }));
+    kept["state"].as_str().expect("a state").to_owned()
+}
+
+fn restore(session: &mut Session, handle: &str, state: &str) -> Value {
+    session.answer("state_restore", json!({ "handle": handle, "state": state }))
+}
+
+// From HL on, round again incrementing the byte at HL and HL itself: on a
+// Spectrum from 16384, the first byte of the screen (16K/48K reference). On a
+// 6128, once its screen is standard, the same from &4000 in RAM configuration
+// 2, which puts the second 64K's blocks 4 to 7 in the processor's four
+// quarters, and from &C000, the screen, with IX in configuration 0 ("Ram
+// management", cpctech), by turns.
+fn spectrum_counting_on_its_screen() -> Vec<u8> {
+    [&[DI, LD_HL, 0x00, 0x40][..], &COUNTING_LOOP].concat()
+}
+
+fn cpc_counting_in_both_64ks() -> Vec<u8> {
+    let mut program = cpc_screen_program();
+    program.pop();
+    program.extend([LD_HL, 0x00, 0x40, PREFIX_DD, LD_HL, 0x00, 0xC0]);
+    program.extend([LD_BC, 0xC2, 0x7F, OUT_C_C[0], OUT_C_C[1], INC_AT_HL, INC_HL]);
+    program.extend([LD_BC, 0xC0, 0x7F, OUT_C_C[0], OUT_C_C[1]]);
+    program.extend([PREFIX_DD, INC_AT_HL, 0x00, PREFIX_DD, INC_HL, JR, 0xED]);
+    program
+}
+
+// A machine restored stands as it was kept, though it ran on since, and runs
+// on as it ran on from there: a Spectrum writing its screen, and a 6128
+// writing its screen and its second 64K.
+#[test]
+fn a_machine_restored_stands_as_kept_and_runs_on_as_it_ran_on() {
+    let roms = Roms::programmed("spectrum48.rom", &spectrum_counting_on_its_screen());
+    roms.write_at("cpc6128.rom", 0, &cpc_counting_in_both_64ks());
+    let mut session = Session::start(&roms);
+    for machine in ["spectrum48", "cpc6128"] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "frames": 3 }));
+        let state = keep(&mut session, &handle);
+        let kept = everything(&mut session, &handle);
+        let stretch = json!({ "frames": 2 });
+        session.run(&handle, stretch.clone());
+        let ran_on = everything(&mut session, &handle);
+        assert!(ran_on != kept, "{machine}");
+        let restored = restore(&mut session, &handle, &state);
+        assert_eq!(restored["state"], state.as_str());
+        assert!(everything(&mut session, &handle) == kept, "{machine}");
+        session.run(&handle, stretch);
+        assert!(everything(&mut session, &handle) == ran_on, "{machine}");
+    }
+}
+
+// Kept inside a chain of prefixes, a machine is kept inside its instruction,
+// where a snapshot has no place to keep it, and runs on from there alike.
+#[test]
+fn a_machine_kept_inside_an_instruction_runs_on_from_inside_it() {
+    let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x4000]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.fill(&handle, 0x4000, &[PREFIX_DD; 0xC000]);
+    let ran = session.run(&handle, json!({ "ticks": 100 }));
+    assert_eq!(ran["settled"], false, "{ran}");
+    let state = keep(&mut session, &handle);
+    let kept = everything(&mut session, &handle);
+    session.run(&handle, json!({ "ticks": 20000 }));
+    let ran_on = everything(&mut session, &handle);
+    let restored = restore(&mut session, &handle, &state);
+    assert_eq!(
+        (&restored["tick"], &restored["pc"]),
+        (&ran["tick"], &ran["pc"])
+    );
+    assert!(everything(&mut session, &handle) == kept);
+    session.run(&handle, json!({ "ticks": 20000 }));
+    assert!(everything(&mut session, &handle) == ran_on);
+}
+
+// What a stretch does, gathered and counted again from a state kept before
+// it, is what was gathered and counted as it ran.
+#[test]
+fn a_stretch_gathered_again_from_a_state_is_the_stretch_gathered_live() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 3000 }));
+    let state = keep(&mut session, &handle);
+    let stretch = json!({
+        "ticks": 20000,
+        "gather": [{ "write": "&9000", "to": "&9FFF" }],
+        "count": [{ "execute": "&0000", "to": "&3FFF" }],
+    });
+    let live = session.run(&handle, stretch.clone());
+    restore(&mut session, &handle, &state);
+    assert_eq!(session.run(&handle, stretch), live);
+}
+
+// Each state is a branch to come back to, and restoring one disturbs no
+// other; the journal is the branch's.
+#[test]
+fn branches_kept_from_one_machine_stand_apart() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let base = keep(&mut session, &handle);
+    session.poke(&handle, json!("&8000"), "11");
+    let first = keep(&mut session, &handle);
+    restore(&mut session, &handle, &base);
+    session.poke(&handle, json!("&8000"), "22");
+    session.poke(&handle, json!("&8001"), "33");
+    let second = keep(&mut session, &handle);
+    let journal = |session: &mut Session| -> Vec<Value> {
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        journal["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|entry| entry["arguments"].clone())
+            .collect()
+    };
+    for (state, memory, arguments) in [
+        (
+            &first,
+            "1100",
+            vec![json!({ "address": "&8000", "bytes": "11" })],
+        ),
+        (
+            &second,
+            "2233",
+            vec![
+                json!({ "address": "&8000", "bytes": "22" }),
+                json!({ "address": "&8001", "bytes": "33" }),
+            ],
+        ),
+        (&base, "0000", vec![]),
+        (
+            &first,
+            "1100",
+            vec![json!({ "address": "&8000", "bytes": "11" })],
+        ),
+    ] {
+        restore(&mut session, &handle, state);
+        assert_eq!(session.peek(&handle, json!("&8000"), 2), memory, "{state}");
+        assert_eq!(journal(&mut session), arguments, "{state}");
+    }
+}
+
+// A tape put in after a state was kept is taken out again by the restore,
+// and the tape that was in plays on from where it stood then. 265 frames
+// from its start it is silent, between its header and its program
+// (a_tape_plays_from_the_tick_it_goes_into_the_deck); 60 frames on it plays
+// its program's leader, and the tape put in since its own.
+#[test]
+fn a_tape_comes_back_with_a_state_where_it_had_played_to() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING_EDGES);
+    let path = roms.write(
+        "program.tap",
+        &program_tape(b"TEST      ", 10, &poking_program()),
+    );
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    session.run(&handle, json!({ "ticks": 265 * SPECTRUM_FRAME_TICKS }));
+    let state = keep(&mut session, &handle);
+    session.run(&handle, json!({ "ticks": 60 * SPECTRUM_FRAME_TICKS }));
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    restore(&mut session, &handle, &state);
+    let before = bytes_of(&session.peek(&handle, json!("&8000"), 2));
+    session.run(&handle, json!({ "ticks": 10 * SPECTRUM_FRAME_TICKS }));
+    assert_eq!(bytes_of(&session.peek(&handle, json!("&8000"), 2)), before);
+}
+
+#[test]
+fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    let cpc = session.open("cpc6128");
+    assert_eq!(
+        session.refusal(
+            "state_restore",
+            json!({ "handle": spectrum, "state": "state-1" })
+        ),
+        format!(
+            "no state is called state-1; no state is held of {spectrum}, and state_keep keeps \
+             one"
+        )
+    );
+    session.run(&spectrum, json!({ "ticks": 500 }));
+    let first = keep(&mut session, &spectrum);
+    let second = keep(&mut session, &spectrum);
+    let cpcs = keep(&mut session, &cpc);
+    assert_eq!(
+        session.answer("machine_list", json!({}))["machines"],
+        json!([
+            {
+                "handle": spectrum,
+                "machine": "spectrum48",
+                "states": [{ "state": first, "tick": 500 }, { "state": second, "tick": 500 }],
+            },
+            { "handle": cpc, "machine": "cpc6128", "states": [{ "state": cpcs, "tick": 0 }] },
+        ])
+    );
+    assert_eq!(
+        session.refusal("state_restore", json!({ "handle": cpc, "state": first })),
+        format!(
+            "{first} was kept from {spectrum}, and a state is restored into the machine it was \
+             kept from and dropped from it alone"
+        )
+    );
+    session.answer("state_drop", json!({ "handle": spectrum, "state": first }));
+    assert_eq!(
+        session.refusal(
+            "state_restore",
+            json!({ "handle": spectrum, "state": first })
+        ),
+        format!("no state is called {first}; the states kept from {spectrum} are {second}")
+    );
+    let mut names = BTreeSet::from([first.clone(), second.clone(), cpcs.clone()]);
+    for _ in 1..64 {
+        assert!(names.insert(keep(&mut session, &spectrum)));
+    }
+    let refused = session.refusal("state_keep", json!({ "handle": spectrum }));
+    assert!(
+        refused.starts_with(&format!(
+            "{spectrum} has 64 states kept, the most one machine keeps; state_drop lets one of \
+             them go: {second}, "
+        )),
+        "{refused}"
+    );
+    assert!(names.insert(keep(&mut session, &cpc)));
+    session.answer("machine_close", json!({ "handle": spectrum }));
+    let reopened = session.open("spectrum48");
+    assert_eq!(
+        session.refusal(
+            "state_restore",
+            json!({ "handle": reopened, "state": second })
+        ),
+        format!(
+            "no state is called {second}; no state is held of {reopened}, and state_keep keeps \
+             one"
+        )
+    );
+    assert!(names.insert(keep(&mut session, &reopened)));
+}
+
+// A page of the journal holds as many entries as fit in 8192 characters,
+// each as the answer writes it, and at least one while any remain, however
+// long: a poke of 4096 bytes is some 8200 characters on its own.
+#[test]
+fn the_journal_is_answered_a_page_at_a_time() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    // Entries of many lengths, so that some page's next entry would have
+    // fitted a budget even a little larger than the page's.
+    let lengths = [
+        vec![4096; 2],
+        (1..=150).collect(),
+        vec![4096],
+        (1..=150).rev().collect(),
+    ];
+    for bytes in lengths.concat() {
+        session.poke(&handle, json!("&8000"), &"00".repeat(bytes));
+    }
+    let mut entries = Vec::new();
+    let mut from = 0;
+    loop {
+        let journal = session.answer("journal", json!({ "handle": handle, "from": from }));
+        let page: Vec<Value> = journal["entries"].as_array().unwrap().clone();
+        let lengths: Vec<usize> = page
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap().chars().count())
+            .collect();
+        let fits = lengths.iter().sum::<usize>() <= 8192 || page.len() == 1;
+        assert!(fits && !page.is_empty(), "from {from}: {lengths:?}");
+        entries.extend(page);
+        if journal["next"].is_null() {
+            assert_eq!(journal["count"], entries.len());
+            break;
+        }
+        let next = journal["next"].as_u64().unwrap() as usize;
+        assert_eq!(next, entries.len());
+        let following = session.answer("journal", json!({ "handle": handle, "from": next }));
+        let first = serde_json::to_string(&following["entries"][0])
+            .unwrap()
+            .chars()
+            .count();
+        assert!(lengths.iter().sum::<usize>() + first > 8192, "from {from}");
+        from = next;
+    }
+    assert_eq!(entries.len(), 304);
+    let count = entries.len();
+    let end = session.answer("journal", json!({ "handle": handle, "from": count }));
+    assert_eq!(
+        (end["entries"].clone(), end["next"].clone()),
+        (json!([]), Value::Null)
+    );
+    assert_eq!(
+        session.refusal("journal", json!({ "handle": handle, "from": count + 1 })),
+        format!(
+            "from is {}, and the journal of {handle} holds {count} entries, so it is answered \
+             from 0 to {count}",
+            count + 1
+        )
+    );
+}
+
+// The journal names the build and the files a machine was built from, and
+// lists what stood it up and changed it, each with its arguments as given and
+// the tick it began at; a request refused is not entered. The same requests
+// made in its order, the first of them its machine_open, make a machine that
+// stands as the first stands, a branch abandoned by a restore left out.
+#[test]
+fn the_journal_made_again_makes_the_machine_again() {
+    let roms = routine("cpc6128.rom", &COUNTING_FROM_9000);
+    let disc = roms.write("blank.dsk", &blank_data_disc());
+    let not_a_disc = roms.write("not.dsk", &[0; 512]);
+    let mut session = Session::start(&roms);
+    let opened = session.answer("machine_open", json!({ "machine": "cpc6128" }));
+    let handle = opened["handle"].as_str().unwrap().to_owned();
+    let ask = |session: &mut Session, handle: &str, tool: &str, arguments: &Value| {
+        let mut arguments = arguments.clone();
+        arguments["handle"] = json!(handle);
+        session.answer(tool, arguments)
+    };
+    let mut asked = vec![(
+        json!("machine_open"),
+        json!({ "machine": "cpc6128" }),
+        json!(0),
+    )];
+    let mut now = json!(0);
+    for (tool, arguments) in [
+        ("set", json!({ "values": { "cpu.b": 7 } })),
+        ("poke", json!({ "address": "&9800", "bytes": "AABB" })),
+        ("run", json!({ "ticks": 5000, "keys": ["Q", "(FIRE 2)"] })),
+        ("disc_insert", json!({ "path": disc, "drive": "B" })),
+        ("type", json!({ "text": "a\n" })),
+        (
+            "call",
+            json!({ "address": "&0100", "values": { "cpu.a": 1, "cpu.sp": 0xC000 } }),
+        ),
+        ("step", json!({ "instructions": 10 })),
+        (
+            "run",
+            json!({
+                "frames": 2,
+                "until": [{ "write": "&9100" }],
+                "gather": [{ "write": "&9000", "to": "&9010" }],
+            }),
+        ),
+    ] {
+        asked.push((json!(tool), arguments.clone(), now.clone()));
+        let answer = ask(&mut session, &handle, tool, &arguments);
+        if !answer["tick"].is_null() {
+            now = answer["tick"].clone();
+        }
+    }
+    let state = keep(&mut session, &handle);
+    ask(
+        &mut session,
+        &handle,
+        "poke",
+        &json!({ "address": "&9900", "bytes": "CC" }),
+    );
+    restore(&mut session, &handle, &state);
+    let count = session.answer("journal", json!({ "handle": handle }))["count"].clone();
+    for (tool, arguments) in [
+        ("set", json!({ "values": { "cpu.pc": 65536 } })),
+        ("disc_insert", json!({ "path": not_a_disc })),
+        (
+            "call",
+            json!({ "address": "&0100", "values": { "cpu.sp": 2 } }),
+        ),
+        ("type", json!({ "text": "£" })),
+    ] {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.refusal(tool, arguments);
+    }
+    assert_eq!(
+        session.answer("journal", json!({ "handle": handle }))["count"],
+        count
+    );
+    asked.push((json!("run"), json!({ "ticks": 300 }), now));
+    ask(&mut session, &handle, "run", &json!({ "ticks": 300 }));
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(journal["files"], opened["files"]);
+    let named = session.call("machine_list", json!({}));
+    assert_eq!(
+        journal["build"],
+        named["_meta"]["io.modelcontextprotocol/serverInfo"]["version"]
+    );
+    let entries = journal["entries"].as_array().unwrap().clone();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (
+                entry["tool"].clone(),
+                entry["arguments"].clone(),
+                entry["tick"].clone()
+            ))
+            .collect::<Vec<_>>(),
+        asked
+    );
+    assert_eq!(entries[4]["file"]["sha256"], sha256(&blank_data_disc()));
+    let again = session.answer("machine_open", entries[0]["arguments"].clone())["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for entry in &entries[1..] {
+        ask(
+            &mut session,
+            &again,
+            entry["tool"].as_str().unwrap(),
+            &entry["arguments"],
+        );
+    }
+    assert_eq!(
+        session.run(&again, json!({ "ticks": 1 }))["tick"],
+        session.run(&handle, json!({ "ticks": 1 }))["tick"]
+    );
+    assert!(everything(&mut session, &again) == everything(&mut session, &handle));
+}
+
+// A Spectrum's journal names the snapshot it was opened from and the tape it
+// was given, each by its hash.
+#[test]
+fn the_journal_names_the_snapshot_and_the_tape_by_their_hashes() {
+    let roms = Roms::all();
+    let snapshot = spectrum_snapshot();
+    let from = roms.write("spectrum.sna", &snapshot);
+    let tape = program_tape(b"TEST      ", 10, &poking_program());
+    let path = roms.write("program.tap", &tape);
+    let mut session = Session::start(&roms);
+    let handle = session.open_from("spectrum48", &from);
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        journal["entries"],
+        json!([
+            {
+                "tick": 0,
+                "tool": "machine_open",
+                "arguments": { "machine": "spectrum48", "snapshot": from },
+                "file": { "path": from, "sha256": sha256(&snapshot) },
+            },
+            {
+                "tick": 0,
+                "tool": "tape_insert",
+                "arguments": { "path": path },
+                "file": { "path": path, "sha256": sha256(&tape) },
+            },
+        ])
+    );
+}
+
 // The firmware tier: the emulator's own fetched firmware and its command line,
 // which `make test-firmware` asks for.
 
@@ -5299,4 +5797,91 @@ fn a_snapshot_saved_is_the_command_lines_and_runs_on_there() {
             previous = ours;
         }
     }
+}
+
+// A CPC kept while AMSDOS saves to its disc, its disc controller inside a
+// command, runs on from a restore to the machine it ran on to, and catalogues
+// the disc the same; a disc swapped in since, and the writes since, are undone by
+// restoring a state kept before them, and the catalogue shows the disc as it
+// was then (amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_alike() {
+    let scratch = Roms::new(&[]);
+    let path = scratch.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    let font = cpc_font(&mut session, &handle, "cpc6128");
+    session.answer("disc_insert", json!({ "handle": handle, "path": path }));
+    let blank = keep(&mut session, &handle);
+    session.answer(
+        "type",
+        json!({ "handle": handle, "text": "10 PRINT 2+2\nSAVE\"EXAMPLE\"\n" }),
+    );
+    session.run(&handle, json!({ "frames": 100 }));
+    assert_eq!(
+        session.inspect(&handle, "fdc.phase"),
+        "UPD765_PHASE_EXECUTION"
+    );
+    let writing = keep(&mut session, &handle);
+    let kept = everything(&mut session, &handle);
+    session.run(&handle, json!({ "frames": 250 }));
+    let saved = everything(&mut session, &handle);
+    restore(&mut session, &handle, &writing);
+    assert!(everything(&mut session, &handle) == kept);
+    session.run(&handle, json!({ "frames": 250 }));
+    assert!(everything(&mut session, &handle) == saved);
+    let catalogue = |session: &mut Session| {
+        session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
+        session.run(&handle, json!({ "frames": 250 }));
+        let text = cpc_text(session, &handle, &scratch, &font);
+        let typed = text.iter().rposition(|line| line == "CAT").expect("CAT");
+        text[typed + 1..]
+            .iter()
+            .map(|line| line.replace(' ', ""))
+            .find(|line| line.ends_with("free"))
+            .expect("a catalogue")
+    };
+    assert_eq!(catalogue(&mut session), "177Kfree");
+    let saved = keep(&mut session, &handle);
+    session.answer("disc_insert", json!({ "handle": handle, "path": path }));
+    assert_eq!(catalogue(&mut session), "178Kfree");
+    restore(&mut session, &handle, &saved);
+    assert_eq!(catalogue(&mut session), "177Kfree");
+    restore(&mut session, &handle, &blank);
+    assert_eq!(catalogue(&mut session), "178Kfree");
+}
+
+// A Spectrum kept partway through LOAD "", inside the ROM's LD-BYTES, from
+// &0556 to &0604 (The Complete Spectrum ROM Disassembly), its tape playing,
+// runs on from a restore to the machine it ran on to, the program loaded and
+// run (load_reads_a_program_from_a_tape_and_runs_it).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_alike() {
+    let scratch = Roms::new(&[]);
+    let path = scratch.write(
+        "program.tap",
+        &program_tape(b"TEST      ", 10, &poking_program()),
+    );
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "ticks": 128 * SPECTRUM_FRAME_TICKS }));
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    session.answer("type", json!({ "handle": handle, "text": "j\"\"\n" }));
+    let ran = session.run(&handle, json!({ "frames": 200 }));
+    assert!(
+        (0x0556..0x0605).contains(&ran["pc"].as_u64().unwrap()),
+        "{ran}"
+    );
+    let loading = keep(&mut session, &handle);
+    let kept = everything(&mut session, &handle);
+    session.run(&handle, json!({ "frames": 400 }));
+    let loaded = everything(&mut session, &handle);
+    assert_eq!(session.peek(&handle, json!(30000), 1), "2A");
+    restore(&mut session, &handle, &loading);
+    assert!(everything(&mut session, &handle) == kept);
+    session.run(&handle, json!({ "frames": 400 }));
+    assert!(everything(&mut session, &handle) == loaded);
 }
