@@ -134,9 +134,17 @@ impl Session {
     }
 
     fn reading(roms: &Path) -> Session {
-        let mut child = server()
-            .arg("--roms")
-            .arg(roms)
+        Session::spawned(server().arg("--roms").arg(roms))
+    }
+
+    // A server whose working directory is the stand-ins', so that a relative
+    // path, its own --roms among them, names a file beside them.
+    fn beside(roms: &Roms) -> Session {
+        Session::spawned(server().arg("--roms").arg(".").current_dir(&roms.0))
+    }
+
+    fn spawned(server: &mut Command) -> Session {
+        let mut child = server
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1063,6 +1071,7 @@ const PREFIX_DD: u8 = 0xDD;
 const PUSH_AF: u8 = 0xF5;
 const PUSH_HL: u8 = 0xE5;
 const RET: u8 = 0xC9;
+const RETN: [u8; 2] = [0xED, 0x45];
 
 // A standard frame is 312 lines of 64µs, "exactly 19968 μsec" (ch. 4.1), and
 // the Gate Array "clocks the Z80A at 4 MHz" (ch. 4.4.4): "The Amstrad CPC
@@ -1082,6 +1091,27 @@ const CONTENDED_LOOP: [u8; 8] = [DI, LD_A, 0x40, LD_I_A[0], LD_I_A[1], INC_BC, J
 
 // From HL on, round again incrementing the byte at HL and HL itself.
 const COUNTING_LOOP: [u8; 4] = [INC_AT_HL, INC_HL, JR, 0xFC];
+
+// An address or a port as an answer gives it, in hexadecimal after &.
+fn ampersand(address: u16) -> Value {
+    json!(format!("&{address:04X}"))
+}
+
+// The number an answer gives in hexadecimal after &, in the digits it writes
+// for that kind of number: four for an address or a port, two for a byte.
+fn after_ampersand(value: &Value, digits: usize) -> u64 {
+    let written = value
+        .as_str()
+        .and_then(|text| text.strip_prefix('&'))
+        .filter(|written| {
+            written.len() == digits
+                && written
+                    .chars()
+                    .all(|digit| digit.is_ascii_digit() || ('A'..='F').contains(&digit))
+        })
+        .unwrap_or_else(|| panic!("{value} is no {digits} hexadecimal digits after &"));
+    u64::from_str_radix(written, 16).expect("hexadecimal")
+}
 
 impl Session {
     fn run(&mut self, handle: &str, arguments: Value) -> Value {
@@ -1126,6 +1156,15 @@ impl Session {
             json!({ "machine": machine, "snapshot": snapshot }),
         );
         opened["handle"].as_str().expect("a handle").to_owned()
+    }
+
+    // Runs a program to the HALT it ends on with interrupts disabled, where
+    // its machine waits for good and a run stops, then the frames asked,
+    // which run whole from there.
+    fn run_past_its_halt(&mut self, handle: &str, frames: u32) -> Value {
+        let halting = self.run(handle, json!({ "frames": frames }));
+        assert_eq!(halting["stopped"], "halted", "{halting}");
+        self.run(handle, json!({ "frames": frames }))
     }
 
     // Sends a call and answers its id, without waiting for the answer.
@@ -1220,12 +1259,18 @@ fn a_run_by_frames_ends_at_a_retrace_and_one_by_ticks_runs_exactly_that_many() {
     let roms = Roms::programmed("spectrum48.rom", &[DI, HALT]);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
+    // Halted for good, where every run runs as asked.
+    let halting = session.step(&handle, 2)["tick"].as_u64().unwrap();
     // The monitor locks on over the first two.
     let first = session.run(&handle, json!({ "frames": 2 }));
     assert_eq!(first["frames"], 2, "{first}");
     assert_eq!(first["settled"], true, "{first}");
     assert_eq!(first["stopped"], "frames", "{first}");
-    assert_eq!(first["tick"], first["ticks"], "{first}");
+    assert_eq!(
+        first["tick"],
+        halting + first["ticks"].as_u64().unwrap(),
+        "{first}"
+    );
     // Halted in the ROM, it fetches where nothing is contended, four T-states
     // at a time, so every count here is a whole number of fetches.
     let second = session.run(&handle, json!({ "frames": 1 }));
@@ -1239,7 +1284,7 @@ fn a_run_by_frames_ends_at_a_retrace_and_one_by_ticks_runs_exactly_that_many() {
     );
     assert_eq!(
         ticked["tick"].as_u64(),
-        Some(first["ticks"].as_u64().unwrap() + SPECTRUM_FRAME_TICKS + ticks)
+        Some(first["tick"].as_u64().unwrap() + SPECTRUM_FRAME_TICKS + ticks)
     );
 }
 
@@ -1291,13 +1336,13 @@ fn a_step_runs_whole_instructions() {
     let one = session.answer("step", json!({ "handle": handle }));
     assert_eq!(
         (&one["ticks"], &one["pc"], &one["stopped"]),
-        (&json!(10), &json!(3), &json!("instructions")),
+        (&json!(10), &ampersand(3), &json!("instructions")),
         "{one}"
     );
     let two = session.step(&handle, 2);
     assert_eq!(
         (&two["ticks"], &two["pc"]),
-        (&json!(23 + 4), &json!(6)),
+        (&json!(23 + 4), &ampersand(6)),
         "{two}"
     );
     assert_eq!(two["tick"], 10 + 23 + 4, "{two}");
@@ -1580,12 +1625,12 @@ fn set_writes_what_a_machine_holds_and_it_runs_from_there() {
     let roms = Roms::programmed("spectrum48.rom", &program);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
-    let written = session.set(&handle, json!({ "cpu.pc": 3, "cpu.b": 7 }));
+    let written = session.set(&handle, json!({ "cpu.pc": "&0003", "cpu.b": 7 }));
     assert_eq!(written, json!({ "values": { "cpu.pc": 3, "cpu.b": 7 } }));
     let step = session.step(&handle, 1);
     assert_eq!(
         (&step["ticks"], &step["pc"]),
-        (&json!(23), &json!(5)),
+        (&json!(23), &ampersand(5)),
         "{step}"
     );
     assert_eq!(session.inspect(&handle, "cpu.b"), 7);
@@ -1599,7 +1644,9 @@ fn a_spectrum_written_a_tick_of_its_frame_stands_its_beam_there() {
     let mut session = Session::start(&roms);
     let run = session.open("spectrum48");
     let written = session.open("spectrum48");
-    session.run(&run, json!({ "ticks": 23456 }));
+    session.step(&run, 2);
+    let ran = session.run(&run, json!({ "ticks": 23456 }));
+    assert_eq!(ran["stopped"], "ticks", "{ran}");
     let ula = session.inspect(&run, "ula");
     session.set(&written, json!({ "ula.frame_tick": ula["frame_tick"] }));
     assert_eq!(session.inspect(&written, "ula.line"), ula["line"]);
@@ -1632,7 +1679,8 @@ fn set_writes_every_value_or_none() {
             "set",
             json!({ "handle": handle, "values": { "cpu.a": 5, "cpu.pc": 65536 } })
         ),
-        "cpu.pc: expects an integer from 0 to 65535, not 65536"
+        "cpu.pc: expects an integer from 0 to 65535, or hexadecimal from &0000 to &FFFF, written \
+         with &, #, $ or 0x before it, not 65536"
     );
     assert_eq!(session.inspect(&handle, "cpu.a"), before);
 }
@@ -1760,6 +1808,88 @@ fn memory_ends_at_ffff_and_says_so() {
     }
 }
 
+// A CPC's RAM read by its own addresses, as its video hardware reads it:
+// under the lower ROM at &0000, and the second 64K's first bank, which RAM
+// configuration 4 pages in at &4000 (cpctech's "Ram management"), at &10000
+// whatever is paged in.
+#[test]
+fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
+    let roms = Roms::programmed("cpc6128.rom", &[0x11]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.poke(&handle, json!(0), "AA");
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(&handle, json!("&4000"), "BB");
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    let peek = |session: &mut Session, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("peek", arguments)
+    };
+    assert_eq!(
+        peek(&mut session, json!({ "address": 0 })),
+        json!({ "address": "&0000", "bytes": "11" })
+    );
+    assert_eq!(
+        peek(&mut session, json!({ "ram": 0 })),
+        json!({ "ram": "&0000", "bytes": "AA" })
+    );
+    assert_eq!(
+        peek(&mut session, json!({ "ram": "&10000", "length": 2 })),
+        json!({ "ram": "&10000", "bytes": "BB00" })
+    );
+    assert_eq!(
+        peek(&mut session, json!({ "ram": "&1FFFF" })),
+        json!({ "ram": "&1FFFF", "bytes": "00" })
+    );
+    assert_eq!(
+        peek(&mut session, json!({ "ram": 65535 })),
+        json!({ "ram": "&FFFF", "bytes": "00" })
+    );
+    let refused = |session: &mut Session, handle: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.refusal("peek", arguments)
+    };
+    assert_eq!(
+        refused(
+            &mut session,
+            &handle,
+            json!({ "ram": "&1FFFF", "length": 2 })
+        ),
+        "2 bytes from &1FFFF run past &1FFFF, where the machine's RAM ends; 1 fit from there"
+    );
+    assert_eq!(
+        refused(&mut session, &handle, json!({ "ram": 0, "length": 4097 })),
+        "4097 bytes is not from 1 to 4096"
+    );
+    let either = "peek reads from address or from ram, one of the two: {\"address\": \"&C000\"} \
+                  reads as the processor does, through the banking and the ROMs, and {\"ram\": \
+                  \"&1C000\"} reads a CPC's RAM by its own addresses";
+    assert_eq!(refused(&mut session, &handle, json!({})), either);
+    assert_eq!(
+        refused(&mut session, &handle, json!({ "address": 0, "ram": 0 })),
+        either
+    );
+    assert!(
+        refused(&mut session, &handle, json!({ "ram": "&20000" })).ends_with(
+            "an address in the RAM is a number from 0 to 131071, or hexadecimal from &0000 to \
+             &1FFFF, written with &, #, $ or 0x before it"
+        )
+    );
+    let cpc464 = session.open("cpc464");
+    assert_eq!(
+        refused(&mut session, &cpc464, json!({ "ram": "&10000" })),
+        "&10000 is past &FFFF, where the machine's RAM ends"
+    );
+    let spectrum = session.open("spectrum48");
+    assert_eq!(
+        refused(&mut session, &spectrum, json!({ "ram": "&4000" })),
+        "ram reads a CPC's RAM by its own addresses, past its banking and its ROMs; a Spectrum's \
+         RAM stands at &4000 to &FFFF, where address reads it"
+    );
+}
+
 // A snapshot of version 1, laid out by "Snapshot (.SNA) file format" (Kevin
 // Thacker's cpctech), https://cpctech.cpcwiki.de/docs/snapshot.html, each
 // register a value of its own: the processor's from &11, "IFF0" and "IFF1" —
@@ -1804,6 +1934,70 @@ fn cpc_snapshot(kilobytes: u16, version: u8) -> Vec<u8> {
         snapshot[0x100 + 0x10000 + 0x0123] = 0xB4;
     }
     snapshot
+}
+
+// A CPC's snapshot is read for the fields of version 1, and the counters a
+// version 3 carries are not, among them the 6845's character, row and line
+// counters at &A9, &AB and &AC, and the Gate Array's interrupt counter at &B3
+// ("Snapshot (.SNA) file format", cpctech). The machine starts its frame from
+// the top, those counters and the monitor's beam at 0. The snapshot programs
+// the firmware's screen: lines of 64 characters (R0 63), 64µs, 256 ticks at
+// the Gate Array's 4MHz (Compendium ch. 4.1 and 4.4.4), rows of eight lines
+// (R9 7), and the 6845's vertical sync at row 30 (R7), line 240. The Gate
+// Array's frame sync begins a pixel after the end of the second of the
+// 6845's line syncs within it, character 60 of line 241 (R2 46 and R3's
+// width 14, ch. 16.2.2 and 16.2.3), and the monitor retraces once it has held
+// a sync for 12µs (ch. 16.2.4, CPC_FRAME_SYNC_SAMPLES in the emulator's
+// src/cpc.h), at character 8 of line 242, where the first run by frames ends
+// with the NOP it stands in; the next takes a standard frame. The beam's
+// line is 0 from the retrace until the monitor sees a line's sync begin
+// again, at character 52 of line 242, where the line pulse the frame sync
+// inverts ends (ch. 16.2.2), and from line 246 at character 48, two after
+// the 6845's; so it counts 312 - 242 + 1 = 71 lines past the 6845's line
+// once a line's sync has begun, and 70 before it. Before the retrace it
+// counts one past for the line's sync, and one more for a line sync the Gate
+// Array raises two characters after the load, its own counter H06 counting
+// from 0 as it stands at power-on (the emulator's src/gate_array.c).
+#[test]
+fn a_cpc_opened_from_its_snapshot_starts_its_frame_from_the_top() {
+    let roms = Roms::all();
+    let mut snapshot = cpc_snapshot(64, 3);
+    for (offset, counter) in [(0xA9, 20), (0xAB, 10), (0xAC, 3), (0xB3, 30)] {
+        snapshot[offset] = counter;
+    }
+    let path = roms.write("program.sna", &snapshot);
+    let mut session = Session::start(&roms);
+    let handle = session.open_from("cpc464", &path);
+    let counters = ["crtc.c0", "crtc.c4", "crtc.c9", "gate_array.r52"];
+    for path in counters.iter().chain(&["monitor.beam_x", "monitor.beam_y"]) {
+        assert_eq!(session.inspect(&handle, path), 0, "{path}");
+    }
+    let beam_past_the_6845 = |session: &mut Session| {
+        let line = session.inspect(&handle, "crtc.c4").as_u64().unwrap() * 8
+            + session.inspect(&handle, "crtc.c9").as_u64().unwrap();
+        (session.inspect(&handle, "monitor.beam_y").as_u64().unwrap() + 312 - line) % 312
+    };
+    for _ in 0..5 {
+        session.run(&handle, json!({ "ticks": 11111 }));
+        assert!((1..=2).contains(&beam_past_the_6845(&mut session)));
+    }
+    let first = session.run(&handle, json!({ "frames": 1 }));
+    assert_eq!(first["frames"], 1, "{first}");
+    let retrace = 242 * 256 + 8 * 4;
+    assert!(
+        (retrace..retrace + 5).contains(&first["tick"].as_u64().unwrap()),
+        "{first}"
+    );
+    for _ in 0..5 {
+        session.run(&handle, json!({ "ticks": 11111 }));
+        assert!((70..=71).contains(&beam_past_the_6845(&mut session)));
+    }
+    session.run(&handle, json!({ "frames": 1 }));
+    let standard = session.run(&handle, json!({ "frames": 1 }));
+    assert!(
+        (CPC_FRAME_TICKS..CPC_FRAME_TICKS + 4).contains(&standard["ticks"].as_u64().unwrap()),
+        "{standard}"
+    );
 }
 
 // The 48K format of "Emulator file formats" (World of Spectrum FAQ),
@@ -1939,7 +2133,7 @@ fn a_cpc_opens_from_its_snapshot_of(version: u8) {
     // The RET there returns to the word on the stack at &C000, which is 0.
     assert_eq!(
         (&step["pc"], &step["tick"]),
-        (&json!(0), &step["ticks"]),
+        (&ampersand(0), &step["ticks"]),
         "{step}"
     );
 }
@@ -2081,8 +2275,12 @@ fn seen(list: &Value) -> Vec<(&'static str, u64, Option<u64>, Option<u64>)> {
                 .into_iter()
                 .find(|kind| seen.get(*kind).is_some())
                 .expect("a kind");
-            let address = seen[kind].as_u64().expect("an address");
-            (kind, address, seen["value"].as_u64(), seen["pc"].as_u64())
+            (
+                kind,
+                after_ampersand(&seen[kind], 4),
+                seen.get("value").map(|value| after_ampersand(value, 2)),
+                seen.get("pc").map(|pc| after_ampersand(pc, 4)),
+            )
         })
         .collect()
 }
@@ -2105,7 +2303,7 @@ fn a_write_names_the_instruction_that_made_it() {
             { "write": "&9000", "to": "&90FF" },
         ]);
         let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
-        assert_eq!(ran["stopped"], "ticks", "{ran}");
+        assert_eq!(ran["stopped"], "halted", "{ran}");
         assert_eq!(
             seen(&ran["gathered"]),
             [
@@ -2142,7 +2340,7 @@ fn a_write_names_the_instruction_that_made_it() {
         );
         assert_eq!(
             (&stopped["stopped"], &stopped["pc"]),
-            (&json!("matched"), &json!(0x000D)),
+            (&json!("matched"), &ampersand(0x000D)),
             "{machine}: {stopped}"
         );
         assert_eq!(
@@ -2198,7 +2396,7 @@ fn a_run_stopped_before_an_instruction_runs_it_first_when_it_runs_on() {
         let first = session.run(&handle, json!({ "ticks": 10000, "until": until }));
         assert_eq!(
             (&first["stopped"], &first["pc"]),
-            (&json!("matched"), &json!(4)),
+            (&json!("matched"), &ampersand(4)),
             "{machine}: {first}"
         );
         assert_eq!(
@@ -2335,7 +2533,7 @@ fn a_gathering_fills_at_the_end_of_the_instruction_that_filled_it() {
         "{ran}"
     );
     assert_eq!(writes[127].3, writes[128].3, "{ran}");
-    assert_eq!(ran["pc"], 8, "{ran}");
+    assert_eq!(ran["pc"], ampersand(8), "{ran}");
 }
 
 // A CPC's Gate Array answers &7Fxx, A15 low and A14 high ("The Gate Array",
@@ -2383,7 +2581,11 @@ fn a_port_matches_on_the_bits_its_device_decodes() {
     );
     // The byte read is the one IN A,(n) left in A.
     let read = &ran["gathered"][1]["value"];
-    assert_eq!(&session.inspect(&handle, "cpu.a"), read, "{ran}");
+    assert_eq!(
+        json!(after_ampersand(read, 2)),
+        session.inspect(&handle, "cpu.a"),
+        "{ran}"
+    );
 }
 
 // Interrupt mode 1 pushes the program counter and runs from &0038 (UM0080),
@@ -2428,14 +2630,110 @@ fn a_halted_processor_begins_no_instruction_while_it_idles() {
         let gathering = json!([{ "execute": 0, "to": "&FFFF" }]);
         let ran = session.run(&handle, json!({ "ticks": 1000, "gather": gathering }));
         assert_eq!(
-            seen(&ran["gathered"]),
-            [("execute", 0, None, None), ("execute", 1, None, None)],
+            (&ran["stopped"], seen(&ran["gathered"])),
+            (
+                &json!("halted"),
+                vec![("execute", 0, None, None), ("execute", 1, None, None)]
+            ),
             "{machine}: {ran}"
+        );
+        let idled = session.run(&handle, json!({ "ticks": 1000, "gather": gathering }));
+        assert_eq!(
+            (&idled["stopped"], &idled["gathered"]),
+            (&json!("ticks"), &json!([])),
+            "{machine}: {idled}"
         );
         let until = json!([{ "execute": 0, "to": "&FFFF" }]);
         let idled = session.run(&handle, json!({ "ticks": 1000, "until": until }));
         assert_eq!(idled["stopped"], "ticks", "{machine}: {idled}");
     }
+}
+
+// HALT with interrupts disabled waits for good on either machine: IFF1 shuts
+// out INT, and neither raises NMI. A run stops at the end of it and says so,
+// and one that begins there runs as asked; with interrupts enabled, an
+// interrupt wakes the processor, and a run goes on. DI 4 T-states, LD A,n 7
+// and HALT 4 (UM0080), from a Spectrum's ROM, where nothing is contended.
+#[test]
+fn a_run_stops_where_its_processor_halts_for_good() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &[DI, LD_A, 0x05, HALT]);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let halted = session.run(&handle, json!({ "frames": 5 }));
+        assert_eq!(
+            (&halted["stopped"], &halted["frames"], &halted["settled"]),
+            (&json!("halted"), &json!(0), &json!(true)),
+            "{machine}: {halted}"
+        );
+        if machine == "spectrum48" {
+            assert_eq!(halted["ticks"], 4 + 7 + 4, "{halted}");
+        }
+        assert_eq!(session.inspect(&handle, "cpu.halted"), true, "{machine}");
+        let ran = session.run(&handle, json!({ "ticks": 1000 }));
+        assert_eq!(
+            (&ran["stopped"], &ran["pc"]),
+            (&json!("ticks"), &halted["pc"]),
+            "{machine}: {ran}"
+        );
+        // A halted processor idles on fetches of 4 T-states (UM0080, HALT
+        // Exit), a microsecond each on a CPC too.
+        assert_eq!(ran["ticks"], 1000, "{machine}: {ran}");
+    }
+    // IFF1 gates INT and IFF2 only keeps a copy of it, which accepting an NMI
+    // leaves as it clears IFF1 (UM0080, Interrupt Enable/Disable), so IFF2
+    // set beside IFF1 clear, as an NMI taken with interrupts enabled leaves
+    // them, wakes nothing.
+    let roms = Roms::programmed("spectrum48.rom", &[HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.set(&handle, json!({ "cpu.iff2": true }));
+    let halted = session.run(&handle, json!({ "frames": 2 }));
+    assert_eq!(halted["stopped"], "halted", "{halted}");
+    // An NMI written in with set wakes a processor halted for good: it
+    // answers from &0066 (UM0080, Nonmaskable Interrupt Response), where RETN
+    // returns to the address pushed, past the HALT, since the emulator's
+    // z80.c holds the program counter after the HALT's fetch, and the next
+    // HALT with interrupts disabled stops the run as it stops any.
+    let roms = Roms::programmed("spectrum48.rom", &[DI, HALT, NOP, DI, HALT]);
+    roms.write_at("spectrum48.rom", 0x66, &RETN);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let first = session.run(&handle, json!({ "ticks": 1000 }));
+    session.set(&handle, json!({ "cpu.nmi_pending": true }));
+    let second = session.run(&handle, json!({ "ticks": 1000 }));
+    assert_eq!(
+        (&first["stopped"], &second["stopped"]),
+        (&json!("halted"), &json!("halted")),
+        "{first} {second}"
+    );
+    assert!(after_ampersand(&second["pc"], 4) > after_ampersand(&first["pc"], 4));
+    // With IFF1 set, each frame's interrupt wakes the processor, and its
+    // handler returns to a JR back to the HALT, which halts it again.
+    let roms = Roms::programmed("spectrum48.rom", &[IM_1[0], IM_1[1], EI, HALT, JR, 0xFD]);
+    roms.write_at("spectrum48.rom", 0x38, &[EI, RET]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let ran = session.run(&handle, json!({ "frames": 3 }));
+    assert_eq!(ran["stopped"], "frames", "{ran}");
+}
+
+// The 128th execute gathered is a HALT that leaves interrupts disabled, so
+// the gathering fills and the processor halts for good at the same
+// instruction's end; the answer gives the halt, since gathering on from there
+// would gather nothing.
+#[test]
+fn a_halt_for_good_is_answered_before_a_gathering_it_fills() {
+    let mut program = vec![DI];
+    program.extend([NOP; 126]);
+    program.push(HALT);
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let gathering = json!([{ "execute": 0, "to": "&FFFF" }]);
+    let ran = session.run(&handle, json!({ "ticks": 10000, "gather": gathering }));
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(ran["gathered"].as_array().unwrap().len(), 128, "{ran}");
 }
 
 // LD SP,0 and back to &0000: the machine comes to &0000 with its stack
@@ -2473,9 +2771,10 @@ fn a_called_routine_returns_with_its_registers_and_leaves_the_machine_where_it_w
                 "values": { "cpu.a": 2, "cpu.b": 3, "cpu.sp": 0x8000 },
             }),
         );
+        let pc = u16::try_from(before["pc"].as_u64().unwrap()).unwrap();
         assert_eq!(
             (&called["stopped"], &called["pc"]),
-            (&json!("returned"), &before["pc"]),
+            (&json!("returned"), &ampersand(pc)),
             "{machine}: {called}"
         );
         // ADD A,r 4 T-states and RET 10 (UM0080), from a Spectrum's ROM, where
@@ -2492,7 +2791,7 @@ fn a_called_routine_returns_with_its_registers_and_leaves_the_machine_where_it_w
         );
         // It runs on from where it stood, at INC HL.
         let stepped = session.step(&handle, 1);
-        assert_eq!(stepped["pc"], 6, "{machine}: {stepped}");
+        assert_eq!(stepped["pc"], ampersand(6), "{machine}: {stepped}");
     }
 }
 
@@ -2518,10 +2817,10 @@ fn a_call_counts_what_its_routine_does() {
     assert_eq!(
         called["counted"],
         json!([
-            { "execute": 0x0100, "count": 1 },
-            { "execute": 0x0101, "count": 1 },
-            { "read": 0x7FFE, "count": 1 },
-            { "read": 0x7FFF, "count": 1 },
+            { "execute": "&0100", "count": 1 },
+            { "execute": "&0101", "count": 1 },
+            { "read": "&7FFE", "count": 1 },
+            { "read": "&7FFF", "count": 1 },
         ])
     );
 }
@@ -2546,7 +2845,7 @@ fn a_call_ends_at_its_own_return_and_not_at_another_arrival_there() {
     );
     assert_eq!(
         (&called["stopped"], &called["pc"]),
-        (&json!("returned"), &json!(512)),
+        (&json!("returned"), &ampersand(0x0200)),
         "{called}"
     );
     assert_eq!(session.inspect(&handle, "cpu.a"), 0x42);
@@ -2568,6 +2867,35 @@ fn a_processor_halted_when_called_is_halted_again_once_the_routine_returns() {
     assert_eq!(session.inspect(&handle, "cpu.a"), 2);
     assert_eq!(session.inspect(&handle, "cpu.halted"), true);
     assert_eq!(session.inspect(&handle, "cpu.pc"), pc);
+}
+
+// A routine that waits on HALT for the next frame, called where IFF1 is
+// clear, as from inside an interrupt's handler, waits for good, and the call
+// stops there rather than at its frames, with the return address still on
+// the stack. LD A,n 7 T-states and HALT 4 (UM0080).
+#[test]
+fn a_call_stops_where_its_routine_halts_for_good() {
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &[DI, HALT]);
+        roms.write_at(file, 0x0100, &[LD_A, 0x05, HALT, RET]);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let called = session.answer(
+            "call",
+            json!({ "handle": handle, "address": "&0100", "values": { "cpu.sp": "&8000" } }),
+        );
+        assert_eq!(
+            (&called["stopped"], &called["frames"]),
+            (&json!("halted"), &json!(0)),
+            "{machine}: {called}"
+        );
+        if machine == "spectrum48" {
+            assert_eq!(called["ticks"], 7 + 4, "{called}");
+        }
+        assert_eq!(session.inspect(&handle, "cpu.a"), 5, "{machine}");
+        assert_eq!(session.inspect(&handle, "cpu.halted"), true, "{machine}");
+        assert_eq!(session.inspect(&handle, "cpu.sp"), 0x7FFE, "{machine}");
+    }
 }
 
 #[test]
@@ -2646,7 +2974,7 @@ fn a_call_runs_the_interrupts_handlers_within_it_and_gathers_what_they_do() {
     );
     assert_eq!(
         (&called["stopped"], &called["pc"]),
-        (&json!("returned"), &json!(6)),
+        (&json!("returned"), &ampersand(6)),
         "{called}"
     );
     let writes = seen(&called["gathered"]);
@@ -2675,7 +3003,7 @@ fn a_routine_that_has_not_returned_runs_on_with_the_next_run() {
         json!({ "handle": handle, "address": 256, "frames": 1 }),
     );
     assert_eq!(called["stopped"], "frames", "{called}");
-    let pc = called["pc"].as_u64().unwrap();
+    let pc = after_ampersand(&called["pc"], 4);
     assert!(
         (0x0100..0x010C).contains(&pc) || (0x0038..0x0041).contains(&pc),
         "{called}"
@@ -2684,7 +3012,7 @@ fn a_routine_that_has_not_returned_runs_on_with_the_next_run() {
     let ran = session.run(&handle, json!({ "frames": 10, "until": until }));
     assert_eq!(
         (&ran["stopped"], &ran["pc"]),
-        (&json!("matched"), &json!(6)),
+        (&json!("matched"), &ampersand(6)),
         "{ran}"
     );
     assert_eq!(session.inspect(&handle, "cpu.sp"), 0x8000);
@@ -2955,7 +3283,7 @@ fn a_picture_comes_with_its_answer_told_as_text_first() {
     let roms = Roms::programmed("spectrum48.rom", &[DI, HALT]);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
-    let ran = session.run(&handle, json!({ "frames": 2 }));
+    let ran = session.run_past_its_halt(&handle, 2);
     let (shown, _) = session.pictured("monitor", json!({ "handle": handle }));
     assert_eq!(
         (&shown["handle"], &shown["machine"], &shown["tick"]),
@@ -3018,11 +3346,16 @@ fn the_monitor_shows_what_the_machine_put_on_the_cable() {
     let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
     let mut session = Session::start(&roms);
     let cpc = session.open("cpc464");
-    session.run(&cpc, json!({ "frames": 3 }));
+    session.run_past_its_halt(&cpc, 3);
     let (shown, monitor) = session.pictured("monitor", json!({ "handle": cpc }));
     assert_eq!(
-        (&shown["width"], &shown["height"], &shown["beam_y"]),
-        (&json!(768), &json!(544), &json!(0))
+        (
+            &shown["width"],
+            &shown["height"],
+            &shown["beam_y"],
+            &shown["whole"]
+        ),
+        (&json!(768), &json!(544), &json!(0), &json!(true))
     );
     for (inkr, colour) in GATE_ARRAY_COLOURS {
         assert_eq!(
@@ -3042,11 +3375,16 @@ fn the_monitor_shows_what_the_machine_put_on_the_cable() {
     let spectrum = session.open("spectrum48");
     // The first character's attribute: bright, white paper, black ink.
     session.poke(&spectrum, json!("&5800"), "78");
-    session.run(&spectrum, json!({ "frames": 2 }));
+    session.run_past_its_halt(&spectrum, 2);
     let (shown, monitor) = session.pictured("monitor", json!({ "handle": spectrum }));
     assert_eq!(
-        (&shown["width"], &shown["height"], &shown["beam_y"]),
-        (&json!(352), &json!(264), &json!(0))
+        (
+            &shown["width"],
+            &shown["height"],
+            &shown["beam_y"],
+            &shown["whole"]
+        ),
+        (&json!(352), &json!(264), &json!(0), &json!(true))
     );
     let picture = (144 - 96, 56 - 20);
     assert_eq!(monitor.at(0, 0), 5);
@@ -3071,6 +3409,51 @@ fn the_monitor_shows_what_the_machine_put_on_the_cable() {
         )
     );
     assert!(shown["beam_y"].as_u64() > Some(0), "{shown}");
+}
+
+// The monitor paints the sample its beam stands on and then steps the beam
+// (the emulator's src/monitor.c, monitor_receive), so no pass is partway
+// through the picture while the beam stands at or before its first sample,
+// or past its last: on a CPC sample 208 of line 34 and sample 975 of line
+// 305, on a Spectrum sample 96 of line 20 and sample 447 of line 283, the
+// window the emulator's command line crops to (CPC_CROP_* and SPECTRUM_CROP_*
+// in its cli/main.c).
+#[test]
+fn the_monitor_says_whether_its_beam_is_partway_through_its_picture() {
+    let roms = Roms::programmed("spectrum48.rom", &[DI, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let whole = |session: &mut Session, handle: &str| {
+        session.pictured("monitor", json!({ "handle": handle })).0["whole"].clone()
+    };
+    session.run_past_its_halt(&handle, 2);
+    assert_eq!(whole(&mut session, &handle), true);
+    let partway = session.run(&handle, json!({ "ticks": 20000 }));
+    assert_eq!(whole(&mut session, &handle), false, "{partway}");
+    let cpc = session.open("cpc464");
+    for (handle, first, last) in [
+        (&handle, (20, 96), (283, 447)),
+        (&cpc, (34, 208), (305, 975)),
+    ] {
+        for ((line, sample), one_frame) in [
+            ((first.0 - 1, last.1), true),
+            (first, true),
+            ((first.0, first.1 + 1), false),
+            (last, false),
+            ((last.0, last.1 + 1), true),
+            ((last.0 + 1, 0), true),
+        ] {
+            session.set(
+                handle,
+                json!({ "monitor.beam_y": line, "monitor.beam_x": sample }),
+            );
+            assert_eq!(
+                whole(&mut session, handle),
+                one_frame,
+                "{handle}: sample {sample} of line {line}"
+            );
+        }
+    }
 }
 
 // The monitor's picture where the display falls, held to the memory the 6845
@@ -3123,7 +3506,7 @@ fn the_screen_follows_the_6845_wherever_it_starts_and_however_it_counts() {
     let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
     let mut session = Session::start(&roms);
     let handle = session.open("cpc464");
-    session.run(&handle, json!({ "frames": 3 }));
+    session.run_past_its_halt(&handle, 3);
     session.fill(&handle, 0x8000, &varied(0x8000));
     for (registers, expected) in [
         (
@@ -3156,7 +3539,11 @@ fn the_screen_follows_the_6845_wherever_it_starts_and_however_it_counts() {
         let drawn = the_screen_is_the_monitors_picture(&mut session, &handle);
         assert_eq!(
             (&drawn["base"], &drawn["height"], &drawn["rasters"]),
-            (&json!(expected.0), &json!(expected.1), &json!(expected.2))
+            (
+                &ampersand(expected.0),
+                &json!(expected.1),
+                &json!(expected.2)
+            )
         );
     }
 }
@@ -3171,7 +3558,7 @@ fn the_screen_the_6845_displays_is_the_picture_on_the_monitor_in_every_mode() {
     let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
     let mut session = Session::start(&roms);
     let handle = session.open("cpc464");
-    session.run(&handle, json!({ "frames": 3 }));
+    session.run_past_its_halt(&handle, 3);
     session.fill(&handle, 0xC000, &varied(0x4000));
     for mode in 0..4 {
         // The mode in force is read, and not one written and still to come.
@@ -3191,7 +3578,7 @@ fn the_screen_the_6845_displays_is_the_picture_on_the_monitor_in_every_mode() {
                 "machine": "cpc464",
                 "tick": drawn["tick"],
                 "reading": "video",
-                "base": 0xC000,
+                "base": "&C000",
                 "width": 80,
                 "height": 200,
                 "rasters": 8,
@@ -3366,7 +3753,7 @@ fn a_screen_reads_a_6128s_second_64k_at_its_own_addresses() {
                 "height": 1, "mode": 2,
             }),
         );
-        assert_eq!(drawn["base"], 0x10000);
+        assert_eq!(drawn["base"], "&10000");
         assert_eq!(picture.indices[..8], [1, 0, 0, 0, 0, 0, 0, 0]);
     }
 }
@@ -3422,7 +3809,7 @@ fn screen_says_what_would_have_worked() {
     assert_eq!(
         refused(&mut session, json!({ "base": "&200000" })),
         "\"&200000\" is no address in the RAM; an address in the RAM is a number from 0 to \
-         131071, or hexadecimal from &00000 to &1FFFF, written with &, #, $ or 0x before it"
+         131071, or hexadecimal from &0000 to &1FFFF, written with &, #, $ or 0x before it"
     );
     assert_eq!(
         refused(&mut session, json!({ "width": 129 })),
@@ -3465,12 +3852,12 @@ fn a_listing_reads_memory_as_the_processor_would() {
     assert_eq!(
         listed,
         json!({ "instructions": [
-            { "address": 0, "bytes": "F3", "text": "DI" },
-            { "address": 1, "bytes": "213412", "text": "LD HL,&1234" },
-            { "address": 4, "bytes": "DD217856", "text": "LD IX,&5678" },
-            { "address": 8, "bytes": "18FE", "text": "JR &0008" },
-            { "address": 10, "bytes": "DD7EFB", "text": "LD A,(IX-&05)" },
-            { "address": 13, "bytes": "EDFF", "text": "BRK" },
+            { "address": "&0000", "bytes": "F3", "text": "DI" },
+            { "address": "&0001", "bytes": "213412", "text": "LD HL,&1234" },
+            { "address": "&0004", "bytes": "DD217856", "text": "LD IX,&5678" },
+            { "address": "&0008", "bytes": "18FE", "text": "JR &0008" },
+            { "address": "&000A", "bytes": "DD7EFB", "text": "LD A,(IX-&05)" },
+            { "address": "&000D", "bytes": "EDFF", "text": "BRK" },
         ]})
     );
     for (asked, given) in [(None, 16), (Some(256), 256)] {
@@ -3497,8 +3884,8 @@ fn a_listing_runs_past_ffff_as_the_program_counter_does() {
     assert_eq!(
         listed,
         json!({ "instructions": [
-            { "address": 0xFFFF, "bytes": "213412", "text": "LD HL,&1234" },
-            { "address": 2, "bytes": "00", "text": "NOP" },
+            { "address": "&FFFF", "bytes": "213412", "text": "LD HL,&1234" },
+            { "address": "&0002", "bytes": "00", "text": "NOP" },
         ]})
     );
 }
@@ -3517,10 +3904,10 @@ fn a_chain_of_prefixes_is_listed_as_the_one_instruction_a_step_runs() {
     );
     assert_eq!(
         listed["instructions"],
-        json!([{ "address": 0x8000, "bytes": "FDDDFD213412", "text": "LD IY,&1234" }])
+        json!([{ "address": "&8000", "bytes": "FDDDFD213412", "text": "LD IY,&1234" }])
     );
     let stepped = session.step(&handle, 1);
-    assert_eq!(stepped["pc"], 0x8006, "{stepped}");
+    assert_eq!(stepped["pc"], "&8006", "{stepped}");
     assert_eq!(
         (
             session.inspect(&handle, "cpu.iyh"),
@@ -3586,8 +3973,10 @@ fn places(list: &Value) -> Vec<((usize, u64), u64)> {
                 .iter()
                 .position(|kind| counted.get(*kind).is_some())
                 .expect("a kind");
-            let address = counted[KINDS[kind]].as_u64().expect("an address");
-            ((kind, address), counted["count"].as_u64().unwrap())
+            (
+                (kind, after_ampersand(&counted[KINDS[kind]], 4)),
+                counted["count"].as_u64().unwrap(),
+            )
         })
         .collect()
 }
@@ -3697,20 +4086,23 @@ fn a_count_counts_each_place_by_its_whole_address_however_often() {
     assert_eq!(
         ran["counted"],
         json!([
-            { "execute": 0, "count": 1 },
-            { "execute": 1, "count": 1 },
-            { "execute": 3, "count": 1 },
-            { "execute": 5, "count": 1 },
-            { "execute": 7, "count": 1 },
-            { "out": 0x05FE, "count": 1 },
-            { "out": 0x06FE, "count": 1 },
+            { "execute": "&0000", "count": 1 },
+            { "execute": "&0001", "count": 1 },
+            { "execute": "&0003", "count": 1 },
+            { "execute": "&0005", "count": 1 },
+            { "execute": "&0007", "count": 1 },
+            { "out": "&05FE", "count": 1 },
+            { "out": "&06FE", "count": 1 },
         ])
     );
     let jump = json!([{ "execute": 9 }]);
     let ran = session.run(&handle, json!({ "ticks": 12000, "count": jump }));
     assert_eq!(
         (&ran["ticks"], &ran["counted"]),
-        (&json!(12000), &json!([{ "execute": 9, "count": 1000 }])),
+        (
+            &json!(12000),
+            &json!([{ "execute": "&0009", "count": 1000 }])
+        ),
         "{ran}"
     );
     let ran = session.run(
@@ -3718,7 +4110,7 @@ fn a_count_counts_each_place_by_its_whole_address_however_often() {
         json!({ "ticks": 120, "count": jump, "gather": jump }),
     );
     assert_eq!(seen(&ran["gathered"]).len(), 10, "{ran}");
-    assert_eq!(ran["counted"], json!([{ "execute": 9, "count": 10 }]));
+    assert_eq!(ran["counted"], json!([{ "execute": "&0009", "count": 10 }]));
 }
 
 // The stand-in firmware is zeros, NOPs from &0000 on, each beginning at an
@@ -3733,11 +4125,11 @@ fn a_count_that_fills_stops_and_the_next_run_counts_on() {
         let ran = session.run(&handle, json!({ "frames": 1, "count": counting }));
         assert_eq!(
             (&ran["stopped"], &ran["pc"]),
-            (&json!("full"), &json!(first + 512)),
+            (&json!("full"), &ampersand(first + 512)),
             "{ran}"
         );
         let expected: Vec<Value> = (first..first + 512)
-            .map(|address| json!({ "execute": address, "count": 1 }))
+            .map(|address| json!({ "execute": ampersand(address), "count": 1 }))
             .collect();
         assert_eq!(ran["counted"], json!(expected));
     }
@@ -3891,6 +4283,28 @@ fn a_typed_key_is_held_and_let_go_for_the_frames_the_command_line_takes() {
     session.run(&twin, json!({ "frames": 1 }));
     let ran = session.run(&twin, json!({ "ticks": 18 * SPECTRUM_FRAME_TICKS }));
     assert_eq!(typed["ticks"], ran["ticks"], "{typed}");
+}
+
+// Typing takes its ticks whatever the program does: one that halts for good
+// partway through the last stretch, a key's letting go, does not end the
+// typing there. The loop counts BC down from &3495, 26 T-states a pass
+// (UM0080), some five frames, and a key is held for 3 and let go for 6.
+#[test]
+fn typing_takes_its_ticks_though_the_processor_halts_for_good() {
+    let program = [
+        DI, LD_BC, 0x95, 0x34, DEC_BC, LD_A_B, OR_C, JR_NZ, 0xFB, HALT,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let typed = session.answer("type", json!({ "handle": handle, "text": "a" }));
+    assert_eq!(typed["stopped"], "typed", "{typed}");
+    let ticks = typed["ticks"].as_u64().unwrap();
+    assert!(
+        (9 * SPECTRUM_FRAME_TICKS..9 * SPECTRUM_FRAME_TICKS + 4).contains(&ticks),
+        "{typed}"
+    );
+    assert_eq!(session.inspect(&handle, "cpu.halted"), true);
 }
 
 // A stretch of typing that ends in a chain of prefixes ends the typing
@@ -4105,8 +4519,11 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
     let refused = refusal(&mut session, &cpc6128, &missing, "A");
     assert!(
         refused.starts_with(&format!("cannot read {}: ", missing.display()))
-            && refused
-                .ends_with("; a disc is named by its path on the file system the server runs on"),
+            && refused.ends_with(&format!(
+                "; a disc is named by its path on the file system the server runs on, and a \
+                 relative path is taken from the server's working directory, {}",
+                std::env::current_dir().unwrap().display()
+            )),
         "{refused}"
     );
     let refused = refusal(&mut session, &cpc6128, &not_a_disc, "C");
@@ -4305,10 +4722,12 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
     );
     assert!(
         refused.starts_with(&format!("cannot write {}: ", nowhere.display()))
-            && refused.ends_with(
+            && refused.ends_with(&format!(
                 "; a file is written at a path on the file system the server runs on, in a \
-                 directory that is there"
-            ),
+                 directory that is there, and a relative path is taken from the server's working \
+                 directory, {}",
+                std::env::current_dir().unwrap().display()
+            )),
         "{refused}"
     );
     let unsettled = roms.0.join("unsettled.sna");
@@ -4684,10 +5103,11 @@ fn the_journal_is_answered_a_page_at_a_time() {
 }
 
 // The journal names the build and the files a machine was built from, and
-// lists what stood it up and changed it, each with its arguments as given and
-// the tick it began at; a request refused is not entered. The same requests
-// made in its order, the first of them its machine_open, make a machine that
-// stands as the first stands, a branch abandoned by a restore left out.
+// lists what stood it up and changed it, each with its arguments, addresses
+// after & and paths absolute, and the tick it began at; a request refused is
+// not entered. The same requests made in its order, the first of them its
+// machine_open, make a machine that stands as the first stands, a branch
+// abandoned by a restore left out.
 #[test]
 fn the_journal_made_again_makes_the_machine_again() {
     let roms = routine("cpc6128.rom", &COUNTING_FROM_9000);
@@ -4829,6 +5249,138 @@ fn the_journal_names_the_snapshot_and_the_tape_by_their_hashes() {
                 "file": { "path": path, "sha256": sha256(&tape) },
             },
         ])
+    );
+}
+
+// The journal writes every address after &, whatever form a request gave it
+// in, so that a finding reads alike however it was asked for; a range of one
+// address is that address, and a port keeps its mask. Values set are kept as
+// given.
+#[test]
+fn the_journal_writes_addresses_after_an_ampersand() {
+    let roms = routine("spectrum48.rom", &[DI, HALT]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!(32768), "11");
+    let poked = session.answer(
+        "poke",
+        json!({ "handle": handle, "address": "0x8001", "bytes": "22" }),
+    );
+    assert_eq!(poked, json!({ "address": "&8001", "length": 1 }));
+    let ran = json!({
+        "ticks": 100,
+        "until": [{ "execute": 4096, "to": "#1FFF" }],
+        "gather": [{ "write": "$9000", "to": "&9000" }, { "out": 254, "mask": 1 }],
+        "count": [{ "in": "#FE", "mask": "0x1" }],
+    });
+    session.run(&handle, ran);
+    session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": 256,
+            "values": { "cpu.sp": "&8000", "cpu.b": 2 },
+            "count": [{ "read": "0X7FFE", "to": 32767 }],
+        }),
+    );
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    let arguments: Vec<Value> = journal["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|entry| entry["arguments"].clone())
+        .collect();
+    assert_eq!(
+        arguments,
+        [
+            json!({ "address": "&8000", "bytes": "11" }),
+            json!({ "address": "&8001", "bytes": "22" }),
+            json!({
+                "ticks": 100,
+                "until": [{ "execute": "&1000", "to": "&1FFF" }],
+                "gather": [{ "write": "&9000" }, { "out": "&00FE", "mask": "&0001" }],
+                "count": [{ "in": "&00FE", "mask": "&0001" }],
+            }),
+            json!({
+                "address": "&0100",
+                "values": { "cpu.sp": "&8000", "cpu.b": 2 },
+                "count": [{ "read": "&7FFE", "to": "&7FFF" }],
+            }),
+        ]
+    );
+}
+
+// A relative path is taken from the server's working directory, and the
+// answers and the journal name each file by its absolute path, so that a
+// journal is made again from anywhere.
+#[test]
+fn a_relative_path_is_taken_from_the_working_directory_and_answered_absolute() {
+    let roms = Roms::all();
+    roms.write("spectrum.sna", &spectrum_snapshot());
+    roms.write(
+        "program.tap",
+        &program_tape(b"TEST      ", 10, &poking_program()),
+    );
+    roms.write("blank.dsk", &blank_data_disc());
+    let directory = fs::canonicalize(&roms.0).unwrap();
+    let mut session = Session::beside(&roms);
+    let opened = session.answer(
+        "machine_open",
+        json!({ "machine": "spectrum48", "snapshot": "spectrum.sna" }),
+    );
+    let handle = opened["handle"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (&opened["files"][0]["path"], &opened["files"][1]["path"]),
+        (
+            &json!(directory.join("spectrum48.rom")),
+            &json!(directory.join("spectrum.sna"))
+        )
+    );
+    let inserted = session.answer(
+        "tape_insert",
+        json!({ "handle": handle, "path": "program.tap" }),
+    );
+    assert_eq!(inserted["path"], json!(directory.join("program.tap")));
+    let saved = session.answer(
+        "snapshot_save",
+        json!({ "handle": handle, "path": "saved.sna" }),
+    );
+    assert_eq!(saved["path"], json!(directory.join("saved.sna")));
+    assert!(directory.join("saved.sna").is_file());
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        (
+            &journal["entries"][0]["arguments"]["snapshot"],
+            &journal["entries"][1]["arguments"]["path"]
+        ),
+        (
+            &json!(directory.join("spectrum.sna")),
+            &json!(directory.join("program.tap"))
+        )
+    );
+    let cpc = session.open("cpc6128");
+    let inserted = session.answer("disc_insert", json!({ "handle": cpc, "path": "blank.dsk" }));
+    assert_eq!(inserted["path"], json!(directory.join("blank.dsk")));
+    let journal = session.answer("journal", json!({ "handle": cpc }));
+    assert_eq!(
+        journal["entries"][1]["arguments"]["path"],
+        json!(directory.join("blank.dsk"))
+    );
+    let refused = session.refusal(
+        "machine_open",
+        json!({ "machine": "spectrum48", "snapshot": "missing.sna" }),
+    );
+    assert!(
+        refused.starts_with(&format!(
+            "cannot read {}: ",
+            directory.join("missing.sna").display()
+        )) && refused.ends_with(&format!(
+            "; a snapshot is named by its path on the file system the server runs on, and a \
+             relative path is taken from the server's working directory, {}",
+            directory.display()
+        )),
+        "{refused}"
     );
 }
 
@@ -5164,7 +5716,7 @@ fn the_spectrums_frame_count_is_written_by_its_interrupt_handler() {
     let stopped = session.run(&handle, json!({ "frames": 2, "until": frames }));
     assert_eq!(
         (&stopped["stopped"], &stopped["pc"]),
-        (&json!("matched"), &json!(0x0041)),
+        (&json!("matched"), &ampersand(0x0041)),
         "{stopped}"
     );
 }
@@ -5191,7 +5743,7 @@ fn the_spectrums_interrupt_handler_is_counted_once_a_frame() {
     );
     assert_eq!(
         ran["counted"],
-        json!([{ "execute": 0x0038, "count": 50 }, { "execute": 0x003E, "count": 50 }]),
+        json!([{ "execute": "&0038", "count": 50 }, { "execute": "&003E", "count": 50 }]),
         "{ran}"
     );
     assert_eq!(frames(&mut session), before.wrapping_add(50));
@@ -5280,9 +5832,10 @@ fn a_spectrum_rom_routine_called_returns_what_its_disassembly_says() {
             "values": { "cpu.b": 175, "cpu.c": 13 },
         }),
     );
+    let pc = u16::try_from(before["pc"].as_u64().unwrap()).unwrap();
     assert_eq!(
         (&called["stopped"], &called["pc"]),
-        (&json!("returned"), &before["pc"]),
+        (&json!("returned"), &ampersand(pc)),
         "{called}"
     );
     let cpu = session.inspect(&handle, "cpu");
@@ -5380,7 +5933,7 @@ fn the_firmwares_screen_is_the_6845s_reading_of_its_memory() {
             &drawn["width"],
             &drawn["height"]
         ),
-        (&json!(0xC000), &json!(1), &json!(80), &json!(200))
+        (&ampersand(0xC000), &json!(1), &json!(80), &json!(200))
     );
     let inks: Vec<u8> = drawn["palette"]
         .as_array()
@@ -5872,7 +6425,7 @@ fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_alike() {
     session.answer("type", json!({ "handle": handle, "text": "j\"\"\n" }));
     let ran = session.run(&handle, json!({ "frames": 200 }));
     assert!(
-        (0x0556..0x0605).contains(&ran["pc"].as_u64().unwrap()),
+        (0x0556..0x0605).contains(&after_ampersand(&ran["pc"], 4)),
         "{ran}"
     );
     let loading = keep(&mut session, &handle);

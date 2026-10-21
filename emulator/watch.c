@@ -144,6 +144,8 @@ void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monito
   }
 }
 
+bool mcp_z80_halted_for_good(const z80_t *cpu) { return cpu->halted && !cpu->iff1; }
+
 bool mcp_watch_stopping(const mcp_watch_t *watch) {
   return watch != NULL && (watch->matched || watch->full || watch->returned);
 }

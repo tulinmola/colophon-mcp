@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
@@ -12,10 +13,11 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
+use crate::fields::hexadecimal_number;
 use crate::keys::Key;
 use crate::machine::{
     COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, READ, Run, UNTIL, WRITE,
@@ -273,21 +275,6 @@ fn address_schema(generator: &mut SchemaGenerator) -> Schema {
     generator.subschema_for::<AddressForms>()
 }
 
-// Hexadecimal of up to so many digits, after the &, #, $ or 0x that marks it.
-fn hexadecimal_number(value: &Value, most_digits: usize) -> Option<u32> {
-    let digits = value.as_str().and_then(|text| {
-        ["&", "#", "$", "0x", "0X"]
-            .iter()
-            .find_map(|prefix| text.strip_prefix(prefix))
-    });
-    digits
-        .filter(|digits| {
-            (1..=most_digits).contains(&digits.len())
-                && digits.chars().all(|digit| digit.is_ascii_hexdigit())
-        })
-        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
-}
-
 fn address(value: &Value) -> Result<u16, String> {
     if let Some(number) = value.as_u64() {
         return u16::try_from(number)
@@ -299,7 +286,7 @@ fn address(value: &Value) -> Result<u16, String> {
 }
 
 const RAM_ADDRESS_FORMS: &str = "an address in the RAM is a number from 0 to 131071, or \
-                                 hexadecimal from &00000 to &1FFFF, written with &, #, $ or 0x \
+                                 hexadecimal from &0000 to &1FFFF, written with &, #, $ or 0x \
                                  before it";
 
 fn ram_address_schema(_: &mut SchemaGenerator) -> Schema {
@@ -315,8 +302,8 @@ fn ram_address_schema(_: &mut SchemaGenerator) -> Schema {
 fn ram_address(value: &Value) -> Result<u32, String> {
     value
         .as_u64()
-        .and_then(|number| u32::try_from(number).ok())
         .or_else(|| hexadecimal_number(value, 5))
+        .and_then(|number| u32::try_from(number).ok())
         .filter(|address| *address <= 0x1FFFF)
         .ok_or_else(|| format!("{value} is no address in the RAM; {RAM_ADDRESS_FORMS}"))
 }
@@ -365,18 +352,19 @@ fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
     })
 }
 
+const KIND_NAMES: [(&str, Kind); 5] = [
+    ("execute", EXECUTE),
+    ("read", READ),
+    ("write", WRITE),
+    ("in", IN),
+    ("out", OUT),
+];
+
 fn condition(value: &Value, list: List) -> Result<Condition, String> {
     let fields = value
         .as_object()
         .ok_or_else(|| format!("{value} is not an object"))?;
-    let kinds = [
-        ("execute", EXECUTE),
-        ("read", READ),
-        ("write", WRITE),
-        ("in", IN),
-        ("out", OUT),
-    ];
-    let named: Vec<_> = kinds
+    let named: Vec<_> = KIND_NAMES
         .iter()
         .filter(|(name, _)| fields.contains_key(*name))
         .collect();
@@ -500,7 +488,102 @@ fn journaled<T: Serialize>(request: &T) -> Value {
     serde_json::to_value(request).expect("a request's arguments serialize")
 }
 
-fn hexadecimal(bytes: &[u8]) -> String {
+// Each list of conditions a request gave, as the journal keeps it, whatever
+// form it was given in: its addresses after &, and a range of one address as
+// that address.
+fn journal_conditions(arguments: &mut Value, conditions: &[Condition]) {
+    let written = |condition: &Condition| {
+        let (name, _) = KIND_NAMES
+            .iter()
+            .find(|(_, kind)| *kind == condition.kind)
+            .expect("every kind is named");
+        let mut fields = Map::new();
+        fields.insert(
+            (*name).to_owned(),
+            json!(Hexadecimal::address(condition.first)),
+        );
+        if condition.kind == IN || condition.kind == OUT {
+            fields.insert(
+                "mask".to_owned(),
+                json!(Hexadecimal::address(condition.mask)),
+            );
+        } else if condition.last != condition.first {
+            fields.insert("to".to_owned(), json!(Hexadecimal::address(condition.last)));
+        }
+        Value::Object(fields)
+    };
+    for (field, list) in [("until", UNTIL), ("gather", GATHER), ("count", COUNT)] {
+        if let Some(listed) = arguments.get_mut(field) {
+            *listed = conditions
+                .iter()
+                .filter(|condition| condition.list == list)
+                .map(written)
+                .collect();
+        }
+    }
+}
+
+// A number as a CPC's own documentation writes it, in hexadecimal after &:
+// an address or a port in four digits, a byte in two, and an address in a
+// 6128's second 64K in five.
+struct Hexadecimal {
+    value: u32,
+    digits: usize,
+}
+
+impl Hexadecimal {
+    fn address(address: u16) -> Hexadecimal {
+        Hexadecimal {
+            value: address.into(),
+            digits: 4,
+        }
+    }
+
+    fn byte(byte: u8) -> Hexadecimal {
+        Hexadecimal {
+            value: byte.into(),
+            digits: 2,
+        }
+    }
+
+    fn ram(address: u32) -> Hexadecimal {
+        Hexadecimal {
+            value: address,
+            digits: if address > 0xFFFF { 5 } else { 4 },
+        }
+    }
+}
+
+impl fmt::Display for Hexadecimal {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "&{:0digits$X}", self.value, digits = self.digits)
+    }
+}
+
+impl Serialize for Hexadecimal {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+// A string, which each field's description says is hexadecimal after &. No
+// answer's schema carries a pattern: the tests hold every answer to its
+// schema by the keywords they read, and a pattern is not among them.
+impl JsonSchema for Hexadecimal {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "Hexadecimal".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string" })
+    }
+}
+
+fn digit_pairs(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
@@ -528,7 +611,7 @@ struct OpenRequest {
     /// The machine, by the name the emulator's command line gives it.
     #[schemars(schema_with = "machine_names")]
     machine: String,
-    /// A snapshot to load into the machine once it is built: its path on the file system the server runs on, a relative one read from the server's working directory.
+    /// A snapshot to load into the machine once it is built: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
     #[schemars(transform = absent_not_null)]
     snapshot: Option<PathBuf>,
 }
@@ -651,7 +734,7 @@ struct DiscRequest {
     /// The handle machine_open gave the machine.
     #[serde(skip_serializing)]
     handle: String,
-    /// The disc image: its path on the file system the server runs on, a relative one read from the server's working directory.
+    /// The disc image: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
     path: PathBuf,
     /// The drive the disc goes into; A if not given.
     #[schemars(transform = absent_not_null)]
@@ -665,7 +748,7 @@ struct TapeRequest {
     /// The handle machine_open gave the machine.
     #[serde(skip_serializing)]
     handle: String,
-    /// The tape image: its path on the file system the server runs on, a relative one read from the server's working directory.
+    /// The tape image: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
     path: PathBuf,
 }
 
@@ -674,7 +757,7 @@ struct TapeRequest {
 struct SaveRequest {
     /// The handle machine_open gave the machine.
     handle: String,
-    /// Where to write the snapshot: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory.
+    /// Where to write the snapshot: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory, which the answer names absolute.
     path: PathBuf,
 }
 
@@ -734,7 +817,7 @@ struct SetRequest {
     /// The handle machine_open gave the machine.
     #[serde(skip_serializing)]
     handle: String,
-    /// Each value to write, by its path: {"cpu.pc": 16384, "gate_array.inks[16]": 20}. A structure takes an object of some of its fields and an array an array of all its elements.
+    /// Each value to write, by its path: {"cpu.pc": "&4000", "gate_array.inks[16]": 20}. A structure takes an object of some of its fields and an array an array of all its elements.
     #[schemars(schema_with = "values_schema")]
     values: Map<String, Value>,
 }
@@ -744,10 +827,17 @@ struct SetRequest {
 struct PeekRequest {
     /// The handle machine_open gave the machine.
     handle: String,
-    /// The first address to read.
+    /// The first address to read, as the processor reaches it, through the banking and the ROMs. Give this or ram.
     #[schemars(schema_with = "address_schema")]
-    address: Value,
-    /// How many bytes to read, from 1 to 4096, none of them past &FFFF; 1 if not given.
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    address: Option<Value>,
+    /// The first address to read in a CPC's RAM, by the RAM's own addresses, as screen's base counts them, whatever is paged in: a 6128's second 64K is &10000 to &1FFFF. Give this or address.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    ram: Option<Value>,
+    /// How many bytes to read, from 1 to 4096, none of them past &FFFF, or for ram past the end of the machine's RAM; 1 if not given.
     #[schemars(range(min = 1, max = MOST_BYTES))]
     #[schemars(transform = absent_not_null)]
     length: Option<i64>,
@@ -877,7 +967,7 @@ struct Saved {
     handle: String,
     /// The machine's tick as it was saved.
     tick: u64,
-    /// Where the snapshot was written.
+    /// Where the snapshot was written, an absolute path.
     path: PathBuf,
     /// The SHA-256 of what was written, in hexadecimal.
     sha256: String,
@@ -901,8 +991,8 @@ struct Restored {
     state: String,
     /// The machine's tick, the state's.
     tick: u64,
-    /// The program counter: where the next instruction is fetched.
-    pc: u16,
+    /// The program counter, in hexadecimal after &: where the next instruction is fetched.
+    pc: Hexadecimal,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -960,6 +1050,8 @@ enum Stopped {
     Matched,
     /// The gathering came to 128 matches, or the count to 512 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end.
     Full,
+    /// The processor halted on HALT with interrupts disabled, where it waits for good: IFF1 shuts out INT, and nothing on either machine raises the NMI that would wake it. A run from here runs as asked, halted throughout, unless set has written in an NMI; call wakes the processor for its routine alone, and set or state_restore takes it past the HALT.
+    Halted,
     /// The routine called returned.
     Returned,
 }
@@ -968,34 +1060,34 @@ enum Stopped {
 struct Matched {
     /// The machine's tick: as an instruction is about to begin, or once the tick that put an access on the bus has run.
     tick: u64,
-    /// An instruction about to begin, by its address.
+    /// An instruction about to begin, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    execute: Option<u16>,
-    /// A byte the program read as data, by its address.
+    execute: Option<Hexadecimal>,
+    /// A byte the program read as data, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    read: Option<u16>,
-    /// A byte the processor wrote, by its address.
+    read: Option<Hexadecimal>,
+    /// A byte the processor wrote, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    write: Option<u16>,
-    /// A port the processor read, by its address.
+    write: Option<Hexadecimal>,
+    /// A port the processor read, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    r#in: Option<u16>,
-    /// A port the processor wrote, by its address.
+    r#in: Option<Hexadecimal>,
+    /// A port the processor wrote, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    out: Option<u16>,
-    /// The byte read or written; for a port read, the byte the processor took.
+    out: Option<Hexadecimal>,
+    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    value: Option<u8>,
-    /// Where the instruction that made the access begins; not given for an instruction about to begin, whose address is its own, or when the response to an interrupt made the access.
+    value: Option<Hexadecimal>,
+    /// Where the instruction that made the access begins, in hexadecimal after &; not given for an instruction about to begin, whose address is its own, or when the response to an interrupt made the access.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    pc: Option<u16>,
+    pc: Option<Hexadecimal>,
     /// The monitor's beam across its line, as monitor.beam_x counts it, in samples: a line's picture is monitor.width of them, and the count runs on past it until a sync ends the line.
     beam_x: u16,
     /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines, of which monitor.height make a frame.
@@ -1004,7 +1096,7 @@ struct Matched {
 
 impl Matched {
     fn of(seen: &Match) -> Matched {
-        let at = |kind| (seen.kind == kind).then_some(seen.address);
+        let at = |kind| (seen.kind == kind).then_some(Hexadecimal::address(seen.address));
         let access = seen.kind != EXECUTE;
         Matched {
             tick: seen.tick,
@@ -1013,8 +1105,8 @@ impl Matched {
             write: at(WRITE),
             r#in: at(IN),
             out: at(OUT),
-            value: access.then_some(seen.value),
-            pc: (access && !seen.response).then_some(seen.pc),
+            value: access.then_some(Hexadecimal::byte(seen.value)),
+            pc: (access && !seen.response).then_some(Hexadecimal::address(seen.pc)),
             beam_x: seen.beam_x,
             beam_y: seen.beam_y,
         }
@@ -1023,33 +1115,33 @@ impl Matched {
 
 #[derive(Serialize, JsonSchema)]
 struct Counted {
-    /// Where instructions began.
+    /// Where instructions began, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    execute: Option<u16>,
-    /// A byte the program read as data, by its address.
+    execute: Option<Hexadecimal>,
+    /// A byte the program read as data, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    read: Option<u16>,
-    /// A byte the processor wrote, by its address.
+    read: Option<Hexadecimal>,
+    /// A byte the processor wrote, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    write: Option<u16>,
-    /// A port the processor read, by its address.
+    write: Option<Hexadecimal>,
+    /// A port the processor read, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    r#in: Option<u16>,
-    /// A port the processor wrote, by its address.
+    r#in: Option<Hexadecimal>,
+    /// A port the processor wrote, by its address, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
-    out: Option<u16>,
+    out: Option<Hexadecimal>,
     /// How many times it matched.
     count: u32,
 }
 
 impl Counted {
     fn of(&(kind, address, count): &(Kind, u16, u32)) -> Counted {
-        let at = |listed| (kind == listed).then_some(address);
+        let at = |listed| (kind == listed).then_some(Hexadecimal::address(address));
         Counted {
             execute: at(EXECUTE),
             read: at(READ),
@@ -1067,8 +1159,8 @@ struct Ran {
     run: Run,
     /// The ticks the machine has run since it was stood up, from power-on or from its snapshot.
     tick: u64,
-    /// The program counter: where the next instruction is fetched.
-    pc: u16,
+    /// The program counter, in hexadecimal after &: where the next instruction is fetched.
+    pc: Hexadecimal,
     /// Why the run ended.
     stopped: Stopped,
     /// What matched the conditions of until as the run stopped: the matching accesses of the instruction it stopped after, with those of an interrupt's response taken at its end, and the instruction it then stands before, if that matched.
@@ -1095,20 +1187,23 @@ impl Ran {
             },
             run,
             tick: machine.tick(),
-            pc: machine.pc(),
+            pc: Hexadecimal::address(machine.pc()),
             matched: None,
             gathered: None,
             counted: None,
         }
     }
 
-    // What the run's watch saw, and why it stopped the run if it did.
+    // What the run's watch saw, and why the run stopped if the watch or a
+    // halt for good stopped it.
     fn watched(mut self, watched: &Watched, gathering: bool, counting: bool) -> Ran {
         if self.run.settled {
             if watched.returned {
                 self.stopped = Stopped::Returned;
             } else if watched.matched {
                 self.stopped = Stopped::Matched;
+            } else if watched.halted {
+                self.stopped = Stopped::Halted;
             } else if watched.full {
                 self.stopped = Stopped::Full;
             }
@@ -1146,16 +1241,22 @@ struct Written {
 
 #[derive(Serialize, JsonSchema)]
 struct Peeked {
-    /// The first address read.
-    address: u16,
+    /// The first address read, as the processor reaches it, in hexadecimal after &; given when address was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    address: Option<Hexadecimal>,
+    /// The first address read in the RAM, in hexadecimal after &; given when ram was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
     /// The bytes, as pairs of hexadecimal digits.
     bytes: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Poked {
-    /// The first address written.
-    address: u16,
+    /// The first address written, in hexadecimal after &.
+    address: Hexadecimal,
     /// How many bytes were written.
     length: u16,
 }
@@ -1176,6 +1277,8 @@ struct Monitored {
     beam_x: u16,
     /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines of the whole raster, of which the picture is a window.
     beam_y: u16,
+    /// Whether the beam stands outside the picture, at or before its first pixel or past its last, as it does after a run by frames that ran all its frames: false while the beam is partway through it, where the lines above the beam, and its own line to its left, are of the frame it is painting and the rest of the passes before. A line that a frame shorter than the picture never reaches keeps what an earlier pass left there, whatever whole says.
+    whole: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1188,8 +1291,8 @@ struct Drawn {
     tick: u64,
     /// Where the bytes of the picture were read.
     reading: Reading,
-    /// The address the first byte was read from, in the RAM.
-    base: u32,
+    /// The address the first byte was read from, in the RAM, in hexadecimal after &.
+    base: Hexadecimal,
     /// Bytes across.
     width: u32,
     /// Lines down.
@@ -1210,8 +1313,8 @@ struct Drawn {
 
 #[derive(Serialize, JsonSchema)]
 struct Listed {
-    /// Where the instruction begins.
-    address: u16,
+    /// Where the instruction begins, in hexadecimal after &.
+    address: Hexadecimal,
     /// Its bytes, as pairs of hexadecimal digits.
     bytes: String,
     /// What it says.
@@ -1295,12 +1398,16 @@ fn asked(request: &ScreenRequest) -> Result<Asked, String> {
     })
 }
 
-// A span of memory that ends at &FFFF or before it.
-fn span(address: u16, length: i64) -> Result<u16, String> {
-    let length = u16::try_from(length)
+fn bytes_asked(length: i64) -> Result<u16, String> {
+    u16::try_from(length)
         .ok()
         .filter(|length| (1..=MOST_BYTES).contains(length))
-        .ok_or_else(|| format!("{length} bytes is not from 1 to {MOST_BYTES}"))?;
+        .ok_or_else(|| format!("{length} bytes is not from 1 to {MOST_BYTES}"))
+}
+
+// A span of memory that ends at &FFFF or before it.
+fn span(address: u16, length: i64) -> Result<u16, String> {
+    let length = bytes_asked(length)?;
     let room = 0x10000 - u32::from(address);
     if u32::from(length) > room {
         return Err(format!(
@@ -1366,7 +1473,7 @@ impl Server {
         }
     }
 
-    /// Build a machine, powered on and standing before its first instruction, or standing where a snapshot was taken, and give it a handle. It stands until machine_close puts it away or the server stops, and this server never gives its handle to another machine. The answer names every file the machine was built from by its SHA-256. A snapshot is loaded as the emulator's command line loads one, into the machine named, after its firmware is fitted. A CPC's is an SNA of version 1, 2 or 3, of which only the fields of version 1 are read: none keeps the disc controller, and the 6845's counters a version 3 carries are not read, so the machine starts its frame from the top and must not have been taken inside a disc access. A Spectrum's is the 48K .sna, which keeps no beam position either. The machine's tick starts at 0 from either.
+    /// Build a machine, powered on and standing before its first instruction, or standing where a snapshot was taken, and give it a handle. It stands until machine_close puts it away or the server stops, and this server never gives its handle to another machine. The answer names every file the machine was built from by its SHA-256. A snapshot is loaded as the emulator's command line loads one, into the machine named, after its firmware is fitted. A CPC's is an SNA of version 1, 2 or 3, of which only the fields of version 1 are read: none keeps the disc controller, so the machine must not have been taken inside a disc access, and the 6845's counters a version 3 carries are not read, so the machine starts its frame from the top, with the 6845's counters, the Gate Array's interrupt counter and the monitor's beam all at 0. Its first run by frames therefore ends early, at the retrace the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen; until then monitor.beam_y runs up to three lines past the 6845's line, and from then on, on the firmware's screen, 70 or 71 past it, the border above the picture. A Spectrum's is the 48K .sna, which keeps no beam position either. The machine's tick starts at 0 from either.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -1391,10 +1498,15 @@ impl Server {
             threads.opened += 1;
             threads.opened
         };
+        let snapshot = request
+            .snapshot
+            .as_deref()
+            .map(machines::absolute)
+            .transpose()?;
         let roms = self.roms.clone();
         let parts = Server::blocking(
             format!("the files {} is built from", machine.name),
-            move || machine.parts(&roms, request.snapshot.as_deref()),
+            move || machine.parts(&roms, snapshot.as_deref()),
         )
         .await?;
         let files = parts.files.clone();
@@ -1506,7 +1618,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1522,7 +1634,8 @@ impl Server {
             request.count.as_ref(),
         )?;
         let keys = keys(machine, request.keys.as_ref())?;
-        let arguments = journaled(&request);
+        let mut arguments = journaled(&request);
+        journal_conditions(&mut arguments, &conditions);
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let ran = match (request.frames, request.ticks) {
@@ -1581,7 +1694,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
+    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. A routine that halts on HALT with interrupts disabled stops the call there, halted, as it stops a run: one that waits on HALT for the next frame, called with IFF1 clear, as inside an interrupt's handler or after DI, waits for good. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1610,7 +1723,9 @@ impl Server {
         )?;
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
-        let arguments = journaled(&request);
+        let mut arguments = journaled(&request);
+        arguments["address"] = json!(Hexadecimal::address(address));
+        journal_conditions(&mut arguments, &conditions);
         let values = request.values.unwrap_or_default();
         let (machine, orders) = self.thread(&request.handle)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
@@ -1663,7 +1778,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Type text at a machine as the emulator's command line types it with --type: each character's key held down, with the shift it needs, for 3 standard frames, then let go for 3 on a CPC and 6 on a Spectrum, long enough for each machine's firmware to see a key go down and come up, and to take the same key twice. Keys are pressed, not characters handed over, so what arrives is what the firmware makes of them: on a Spectrum a letter typed where the cursor shows K is a keyword, so "p" at the start of a line is PRINT, and "j" then two of "\"" is LOAD "". Keys the keyboard holds already, as set writes them, stay held through the typing, where the command line lets every key go. A newline is RETURN on a CPC and ENTER on a Spectrum; on a CPC a tab is TAB, an escape, \u001b, ESC, and a backspace, \b, DEL. Keys that type no character, such as COPY, the function keys and the joysticks, and a character outside ASCII, such as a CPC's £, SHIFT with ^, are held by run's keys. A text is ASCII, and one holding a character no key types, alone or with a shift, is refused before a key goes down. The firmware takes no key until it has started, and the command line waits 78 frames for a CPC's and 128 for a Spectrum's, whose ROM takes none before frame 85; a program reading the keyboard only now and then loses the keys pressed between, so type at it a character at a time, with runs between that stop where it reads the keyboard. At most 250 characters on a CPC and 166 on a Spectrum, 1500 frames' worth. Each key goes down and comes up between instructions, a few ticks at most from where the command line puts it, counting from where the typing began, and the typing ends at the end of the instruction standing as its frames' ticks run out, so the answer is a run's that took those ticks and a few more. A stretch that ends inside a chain of prefixes ends the typing there, unsettled, as it ends a run.
+    /// Type text at a machine as the emulator's command line types it with --type: each character's key held down, with the shift it needs, for 3 standard frames, then let go for 3 on a CPC and 6 on a Spectrum, long enough for each machine's firmware to see a key go down and come up, and to take the same key twice. Type at a machine once its firmware has started, as it takes no key before: the command line waits 78 frames for a CPC's and 128 for a Spectrum's, whose ROM takes none before frame 85. Keys are pressed, not characters handed over, so what arrives is what the firmware makes of them: on a Spectrum a letter typed where the cursor shows K is a keyword, so "p" at the start of a line is PRINT, and "j" then two of "\"" is LOAD "". Keys the keyboard holds already, as set writes them, stay held through the typing, where the command line lets every key go. A newline is RETURN on a CPC and ENTER on a Spectrum; on a CPC a tab is TAB, an escape, \u001b, ESC, and a backspace, \b, DEL. Keys that type no character, such as COPY, the function keys and the joysticks, and a character outside ASCII, such as a CPC's £, SHIFT with ^, are held by run's keys. A text is ASCII, and one holding a character no key types, alone or with a shift, is refused before a key goes down. A program reading the keyboard only now and then loses the keys pressed between, so type at it a character at a time, with runs between that stop where it reads the keyboard. At most 250 characters on a CPC and 166 on a Spectrum, 1500 frames' worth. Each key goes down and comes up between instructions, a few ticks at most from where the command line puts it, counting from where the typing began, and the typing ends at the end of the instruction standing as its frames' ticks run out, so the answer is a run's that took those ticks and a few more. A stretch that ends inside a chain of prefixes ends the typing there, unsettled, as it ends a run; a HALT that leaves interrupts disabled does not, and the typing takes its ticks whatever the program does.
     #[tool(
         name = "type",
         annotations(
@@ -1714,9 +1829,10 @@ impl Server {
     ))]
     async fn disc_insert(
         &self,
-        Parameters(request): Parameters<DiscRequest>,
+        Parameters(mut request): Parameters<DiscRequest>,
     ) -> Result<Json<Inserted>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
+        request.path = machines::absolute(&request.path)?;
         let arguments = journaled(&request);
         let drive = request.drive.unwrap_or(Drive::A);
         let path = request.path;
@@ -1756,9 +1872,10 @@ impl Server {
     ))]
     async fn tape_insert(
         &self,
-        Parameters(request): Parameters<TapeRequest>,
+        Parameters(mut request): Parameters<TapeRequest>,
     ) -> Result<Json<Inserted>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
+        request.path = machines::absolute(&request.path)?;
         let arguments = journaled(&request);
         let path = request.path;
         let read = path.clone();
@@ -1796,13 +1913,13 @@ impl Server {
         Parameters(request): Parameters<SaveRequest>,
     ) -> Result<Json<Saved>, String> {
         let (_, orders) = self.thread(&request.handle)?;
+        let path = machines::absolute(&request.path)?;
         let handle = request.handle.clone();
         let (bytes, tick) = Server::ask(&request.handle, orders, |built| {
             Ok::<_, String>((built.snapshot_save()?, built.tick()))
         })
         .await?
         .map_err(|problem| format!("{handle} {problem}"))?;
-        let path = request.path;
         let written = Server::blocking(path.display().to_string(), move || {
             machines::write_new(&path, &bytes)
         })
@@ -1895,7 +2012,7 @@ impl Server {
             handle: request.handle,
             state: request.state,
             tick,
-            pc,
+            pc: Hexadecimal::address(pc),
         }))
     }
 
@@ -1930,7 +2047,7 @@ impl Server {
         }))
     }
 
-    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, each with the machine's tick as it began and the arguments it was given, the first of them the machine_open that stood it up, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a range of one address as that address, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn journal(
         &self,
@@ -1992,7 +2109,7 @@ impl Server {
         Ok(Json(Inspected { path, value }))
     }
 
-    /// Write what a machine holds, by the paths inspect reads. Every value is written, or none: a value of the wrong kind, or one the emulator could not run from, such as a pen past the seventeen the Gate Array has, is refused, and the machine is left as it stood. A CPC's memory map is worked out again afterwards, as it is when its own processor writes the registers behind it, and a Spectrum's ULA stood at the tick of the frame its frame_tick names, from which its beam is reckoned. The answer gives each path as it now reads. Writing the emulator's machinery, rather than the chips' registers, can leave a machine in a state no silicon could reach.
+    /// Write what a machine holds, by the paths inspect reads. A field of unsigned integers takes a number, or hexadecimal after &, #, $ or 0x, as an address does; a signed field takes a number. Every value is written, or none: a value of the wrong kind, or one the emulator could not run from, such as a pen past the seventeen the Gate Array has, is refused, and the machine is left as it stood. A CPC's memory map is worked out again afterwards, as it is when its own processor writes the registers behind it, and a Spectrum's ULA stood at the tick of the frame its frame_tick names, from which its beam is reckoned. The answer gives each path as it now reads. Writing the emulator's machinery, rather than the chips' registers, can leave a machine in a state no silicon could reach.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2015,26 +2132,50 @@ impl Server {
         Ok(Json(Written { values: written }))
     }
 
-    /// Read a machine's memory as its processor would, through the banking and the ROMs standing in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. From 1 to 4096 bytes, none past &FFFF.
+    /// Read a machine's memory. By address, as its processor would, through the banking and the ROMs standing in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. By ram, a CPC's RAM itself, by the RAM's own addresses, as screen's base counts them, whatever is paged in: &0000 is the RAM under that ROM, and a 6128's second 64K is &10000 to &1FFFF. From 1 to 4096 bytes, none past &FFFF, or past the end of the RAM.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn peek(
         &self,
         Parameters(request): Parameters<PeekRequest>,
     ) -> Result<Json<Peeked>, String> {
-        let address = address(&request.address)?;
-        let length = span(address, request.length.unwrap_or(1))?;
+        let length = request.length.unwrap_or(1);
         let (_, orders) = self.thread(&request.handle)?;
-        let bytes = Server::ask(&request.handle, orders, move |built| {
-            built.peek(address, length)
-        })
-        .await?;
+        let (address, ram, bytes) = match (&request.address, &request.ram) {
+            (Some(given), None) => {
+                let address = address(given)?;
+                let length = span(address, length)?;
+                let bytes = Server::ask(&request.handle, orders, move |built| {
+                    built.peek(address, length)
+                })
+                .await?;
+                (Some(Hexadecimal::address(address)), None, bytes)
+            }
+            (None, Some(given)) => {
+                let ram = ram_address(given)?;
+                let length = bytes_asked(length)?;
+                let bytes = Server::ask(&request.handle, orders, move |built| {
+                    built.peek_ram(ram, length)
+                })
+                .await??;
+                (None, Some(Hexadecimal::ram(ram)), bytes)
+            }
+            _ => {
+                return Err(
+                    "peek reads from address or from ram, one of the two: {\"address\": \
+                     \"&C000\"} reads as the processor does, through the banking and the ROMs, \
+                     and {\"ram\": \"&1C000\"} reads a CPC's RAM by its own addresses"
+                        .to_owned(),
+                );
+            }
+        };
         Ok(Json(Peeked {
             address,
-            bytes: hexadecimal(&bytes),
+            ram,
+            bytes: digit_pairs(&bytes),
         }))
     }
 
-    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step, a call or typing, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before. A machine not yet run shows a picture never painted.
+    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step, a call or typing, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before, and the answer's whole says whether the beam is partway through the picture. A machine not yet run shows a picture never painted.
     #[tool(
         output_schema = schema_for_output::<Monitored>(),
         annotations(read_only_hint = true, open_world_hint = false)
@@ -2056,6 +2197,7 @@ impl Server {
             height: shown.picture.height,
             beam_x: shown.beam_x,
             beam_y: shown.beam_y,
+            whole: shown.whole,
         };
         Ok(Pictured {
             answer,
@@ -2084,7 +2226,7 @@ impl Server {
             machine: machine.name.to_owned(),
             tick,
             reading: screen.reading,
-            base: screen.base,
+            base: Hexadecimal::ram(screen.base),
             width: screen.width,
             height: screen.height,
             rasters: (screen.reading == Reading::Video).then_some(screen.rasters),
@@ -2126,8 +2268,8 @@ impl Server {
             instructions: listed
                 .into_iter()
                 .map(|(address, bytes, text)| Listed {
-                    address,
-                    bytes: hexadecimal(&bytes),
+                    address: Hexadecimal::address(address),
+                    bytes: digit_pairs(&bytes),
                     text,
                 })
                 .collect(),
@@ -2149,13 +2291,17 @@ impl Server {
         let bytes = bytes(&request.bytes)?;
         let length = span(address, i64::try_from(bytes.len()).unwrap_or(i64::MAX))?;
         let (_, orders) = self.thread(&request.handle)?;
-        let arguments = journaled(&request);
+        let mut arguments = journaled(&request);
+        arguments["address"] = json!(Hexadecimal::address(address));
         Server::ask(&request.handle, orders, move |built| {
             built.poke(address, &bytes);
             built.record(built.tick(), "poke", arguments, None);
         })
         .await?;
-        Ok(Json(Poked { address, length }))
+        Ok(Json(Poked {
+            address: Hexadecimal::address(address),
+            length,
+        }))
     }
 }
 

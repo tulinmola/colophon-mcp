@@ -41,11 +41,14 @@ static void finish(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
 
 mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch) {
   mcp_run_t run = {0};
-  while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch)) {
+  bool halting_stops = !mcp_z80_halted_for_good(&cpc->cpu);
+  while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&
+         !(halting_stops && mcp_z80_halted_for_good(&cpc->cpu))) {
     if (!tick(cpc, &run, watch)) {
       run.settled = true;
       return run;
     }
+    halting_stops = halting_stops || !mcp_z80_halted_for_good(&cpc->cpu);
   }
   finish(cpc, &run, watch);
   return run;

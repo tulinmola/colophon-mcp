@@ -44,11 +44,14 @@ static void finish(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch) {
   mcp_run_t run = {0};
-  while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch)) {
+  bool halting_stops = !mcp_z80_halted_for_good(&spectrum->cpu);
+  while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&
+         !(halting_stops && mcp_z80_halted_for_good(&spectrum->cpu))) {
     if (!tick(spectrum, &run, watch)) {
       run.settled = true;
       return run;
     }
+    halting_stops = halting_stops || !mcp_z80_halted_for_good(&spectrum->cpu);
   }
   finish(spectrum, &run, watch);
   return run;

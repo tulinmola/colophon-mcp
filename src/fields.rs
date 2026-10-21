@@ -103,6 +103,21 @@ fn set_fields<T: Fields>(structure: &mut T, name: &str, value: &Value) -> Result
     Ok(())
 }
 
+// Hexadecimal of up to so many digits, after the &, #, $ or 0x that marks it.
+pub fn hexadecimal_number(value: &Value, most_digits: usize) -> Option<u64> {
+    let digits = value.as_str().and_then(|text| {
+        ["&", "#", "$", "0x", "0X"]
+            .iter()
+            .find_map(|prefix| text.strip_prefix(prefix))
+    });
+    digits
+        .filter(|digits| {
+            (1..=most_digits).contains(&digits.len())
+                && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+        })
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+}
+
 macro_rules! unsigned {
     ($($type:ty),*) => {$(
         impl Fields for $type {
@@ -118,11 +133,19 @@ macro_rules! unsigned {
                 if !path.is_empty() {
                     return Err(inside_a_value(path));
                 }
+                let digits = 2 * size_of::<$type>();
                 *self = value
                     .as_u64()
+                    .or_else(|| hexadecimal_number(value, digits))
                     .and_then(|number| <$type>::try_from(number).ok())
                     .ok_or_else(|| {
-                        format!("expects an integer from 0 to {}, not {value}", <$type>::MAX)
+                        format!(
+                            "expects an integer from 0 to {}, or hexadecimal from &{:0digits$X} \
+                             to &{:X}, written with &, #, $ or 0x before it, not {value}",
+                            <$type>::MAX,
+                            0,
+                            <$type>::MAX
+                        )
                     })?;
                 Ok(())
             }
@@ -467,11 +490,24 @@ mod tests {
             |path: &str, value: Value| copy.set(&parse(path).unwrap(), &value).unwrap_err();
         assert_eq!(
             refusal("cpu.pc", Value::from(65536)),
-            "expects an integer from 0 to 65535, not 65536"
+            "expects an integer from 0 to 65535, or hexadecimal from &0000 to &FFFF, written \
+             with &, #, $ or 0x before it, not 65536"
         );
         assert_eq!(
             refusal("cpu.a", Value::from(-1)),
-            "expects an integer from 0 to 255, not -1"
+            "expects an integer from 0 to 255, or hexadecimal from &00 to &FF, written with &, \
+             #, $ or 0x before it, not -1"
+        );
+        // A field takes no more digits than it has, as an address takes four.
+        assert_eq!(
+            refusal("cpu.a", Value::from("&005")),
+            "expects an integer from 0 to 255, or hexadecimal from &00 to &FF, written with &, \
+             #, $ or 0x before it, not \"&005\""
+        );
+        assert_eq!(
+            refusal("cpu.a", Value::from("&100")),
+            "expects an integer from 0 to 255, or hexadecimal from &00 to &FF, written with &, \
+             #, $ or 0x before it, not \"&100\""
         );
         assert_eq!(
             refusal("fdc.sector", Value::from(1u64 << 31)),
@@ -491,8 +527,36 @@ mod tests {
         );
         assert_eq!(
             refusal("cpu", serde_json::json!({ "a": 1, "pc": "high" })),
-            "pc: expects an integer from 0 to 65535, not \"high\""
+            "pc: expects an integer from 0 to 65535, or hexadecimal from &0000 to &FFFF, \
+             written with &, #, $ or 0x before it, not \"high\""
         );
+        assert_eq!(
+            refusal("pins", Value::from("0x1FFFFFFFFFFFFFFFF")),
+            "expects an integer from 0 to 18446744073709551615, or hexadecimal from \
+             &0000000000000000 to &FFFFFFFFFFFFFFFF, written with &, #, $ or 0x before it, not \
+             \"0x1FFFFFFFFFFFFFFFF\""
+        );
+    }
+
+    // As a CPC's own documentation writes them, after &, and as assemblers
+    // do, after #, $ or 0x.
+    #[test]
+    fn an_unsigned_value_is_written_in_hexadecimal_too() {
+        let cpc = cpc();
+        // SAFETY: as above.
+        let mut copy = unsafe { std::ptr::read(cpc.machine()) };
+        for (path, given, read) in [
+            ("cpu.pc", "&BB06", 0xBB06),
+            ("cpu.sp", "#C000", 0xC000),
+            ("cpu.a", "$7f", 0x7F),
+            ("cpu.hl_", "0x4000", 0x4000),
+            ("crtc.registers[12]", "0X30", 0x30),
+            ("cpu.b", "&5", 5),
+        ] {
+            copy.set(&parse(path).unwrap(), &Value::from(given))
+                .unwrap();
+            assert_eq!(copy.get(&parse(path).unwrap()).unwrap(), read, "{path}");
+        }
     }
 
     #[test]

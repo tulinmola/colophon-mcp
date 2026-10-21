@@ -149,10 +149,21 @@ typedef struct {
  * at the end of the instruction whose match fills the gathering or the
  * count, or once a call has returned; the ends are reached as the run's own
  * end is. The instruction a run begins on is matched only as it begins,
- * since the run that stopped before it has matched it already. */
+ * since the run that stopped before it has matched it already.
+ *
+ * A run also stops at the end of a HALT that leaves the processor halted for
+ * good, as mcp_z80_halted_for_good tells, watched or not, once the
+ * processor has stood anywhere else in the run: one that begins halted so
+ * runs as asked, unless an NMI written in from outside wakes it first. */
 mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch);
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch);
+
+/* Whether the processor waits on HALT with IFF1 clear, which it does for good
+ * on either machine: INT is refused while IFF1 is clear, and neither drives
+ * NMI, the only other way out of HALT but a reset, so only an NMI written in
+ * from outside wakes it. */
+bool mcp_z80_halted_for_good(const z80_t *cpu);
 
 /* Call the routine at this address: push the program counter, as the
  * processor's CALL does, and jump. NULL if called, or a sentence saying why

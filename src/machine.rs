@@ -16,11 +16,12 @@ use crate::emulator::{
     cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, floppy_give_room, floppy_t,
     gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
     mcp_cpc_check, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call, mcp_spectrum_check,
-    mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t, spectrum_connect_monitor,
-    spectrum_init, spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek,
-    spectrum_poke, spectrum_snapshot_load, spectrum_snapshot_save, spectrum_snapshot_size,
-    spectrum_t, tape_init, tape_insert, tape_play, tape_t, tzx_machine_TZX_SPECTRUM,
-    tzx_next_pulse, tzx_open, tzx_t, ula_rgb as core_ula_rgb, z80_instruction_complete,
+    mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t, mcp_z80_halted_for_good,
+    spectrum_connect_monitor, spectrum_init, spectrum_insert_tape, spectrum_instruction_complete,
+    spectrum_peek, spectrum_poke, spectrum_snapshot_load, spectrum_snapshot_save,
+    spectrum_snapshot_size, spectrum_t, tape_init, tape_insert, tape_play, tape_t,
+    tzx_machine_TZX_SPECTRUM, tzx_next_pulse, tzx_open, tzx_t, ula_rgb as core_ula_rgb,
+    z80_instruction_complete, z80_t,
 };
 
 pub use crate::emulator::{
@@ -163,6 +164,13 @@ fn problem(sentence: *const c_char) -> String {
     unsafe { CStr::from_ptr(sentence) }
         .to_string_lossy()
         .into_owned()
+}
+
+impl z80_t {
+    pub fn halted_for_good(&self) -> bool {
+        // SAFETY: the bridge reads two fields of the processor.
+        unsafe { mcp_z80_halted_for_good(self) }
+    }
 }
 
 impl keyboard_t {
@@ -867,9 +875,11 @@ mod tests {
     }
 
     // Past the frames that fall while the 6845 is being programmed, and
-    // standing just after a retrace.
+    // standing just after a retrace, halted for good: the first run stops at
+    // the HALT, and those from there run as asked.
     fn cpc_on_the_standard_screen() -> Cpc {
         let mut cpc = Cpc::new(sixty_four_k(), rom(&standard_screen(), HALT));
+        assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None).frames, 0);
         assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None).frames, 2);
         cpc
     }
@@ -891,8 +901,10 @@ mod tests {
         (cpc, start)
     }
 
+    // As cpc_on_the_standard_screen.
     fn spectrum_after_a_retrace() -> Spectrum {
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[DI], HALT));
+        assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 0);
         assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 2);
         spectrum
     }
@@ -1120,6 +1132,43 @@ mod tests {
             assert_eq!((step.ticks, step.settled), (4, true));
             assert_eq!(spectrum.machine().cpu.pc, halted_at);
         }
+    }
+
+    // HALT with IFF1 clear waits for good, as neither machine raises NMI: a
+    // run stops at the end of it, watched or not, and one that begins there
+    // runs as asked. With IFF1 set, an interrupt wakes the processor and the
+    // run goes on. DI, NOP and HALT take four T-states each (UM0080), and a
+    // CPC stops where a twin stands once stepped through the three.
+    #[test]
+    fn a_run_stops_where_its_processor_halts_for_good() {
+        let elsewhere = [Condition {
+            kind: EXECUTE,
+            first: 0x8000,
+            last: 0x8000,
+            mask: 0,
+            list: UNTIL,
+        }];
+        for watched in [false, true] {
+            // SAFETY: all-zero bytes are a value of every field of a match.
+            let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 16];
+            let mut watch = Watch::new(&elsewhere, &mut matches, &mut [], 1, 0);
+            let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[DI, NOP, HALT], NOP));
+            let run = spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, watched.then_some(&mut watch));
+            assert_eq!((run.ticks, run.frames, run.settled), (12, 0, true));
+            assert!(spectrum.machine().cpu.halted_for_good());
+            assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 2);
+        }
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP));
+        let mut twin = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP));
+        let run = cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
+        assert_eq!(
+            (run.ticks, run.frames, run.settled),
+            (twin.step(3).ticks, 0, true)
+        );
+        assert!(cpc.machine().cpu.halted_for_good());
+        let program = [IM_1[0], IM_1[1], EI, HALT];
+        let mut spectrum = Spectrum::new(forty_eight_k(), rom(&program, NOP));
+        assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 2);
     }
 
     // In mode 1 the processor answers an interrupt with a restart at &0038,

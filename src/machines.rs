@@ -125,7 +125,7 @@ pub fn named(name: &str) -> Option<&'static Machine> {
 // A file read for a machine or written from one, named by what it holds.
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct FileRead {
-    /// Where the file was read.
+    /// Where the file was read, an absolute path.
     pub path: PathBuf,
     /// The SHA-256 of what it held, in hexadecimal.
     pub sha256: String,
@@ -144,6 +144,34 @@ impl FileRead {
 pub const DISCS: &str = "a disc is a DSK image, of the original layout or the extended one";
 pub const TAPES: &str = "a tape is a .tap, of bare blocks at the ROM's own timings, or a .tzx";
 
+// Where a relative path is taken from, said beside a file that could not be
+// reached by it.
+fn working_directory_clause() -> String {
+    match std::env::current_dir() {
+        Ok(directory) => format!(
+            "a relative path is taken from the server's working directory, {}",
+            directory.display()
+        ),
+        Err(error) => format!(
+            "the server's working directory cannot be read ({error}), so a path is given absolute"
+        ),
+    }
+}
+
+// A path as the file system the server runs on takes it, from the server's
+// working directory if relative, so that an answer or a journal names the
+// same file wherever it is read.
+pub fn absolute(path: &Path) -> Result<PathBuf, String> {
+    // Quoted, since the path refused may be empty.
+    std::path::absolute(path).map_err(|error| {
+        format!(
+            "cannot make {path:?} absolute: {error}; a file is named by its path on the file \
+             system the server runs on, and {}",
+            working_directory_clause()
+        )
+    })
+}
+
 // A file read whole, refused by its size before it is read, so that neither
 // a pipe nor a device can hold the server up; `what` names it and `takes`
 // says what would be read.
@@ -151,8 +179,9 @@ fn read_whole(path: &Path, largest: u64, what: &str, takes: &str) -> Result<Vec<
     let unreadable = |error: io::Error| {
         format!(
             "cannot read {}: {error}; {what} is named by its path on the file system the server \
-             runs on",
-            path.display()
+             runs on, and {}",
+            path.display(),
+            working_directory_clause()
         )
     };
     let metadata = fs::metadata(path).map_err(unreadable)?;
@@ -192,8 +221,9 @@ pub fn write_new(path: &Path, contents: &[u8]) -> Result<FileRead, String> {
             } else {
                 format!(
                     "cannot write {}: {error}; a file is written at a path on the file system \
-                     the server runs on, in a directory that is there",
-                    path.display()
+                     the server runs on, in a directory that is there, and {}",
+                    path.display(),
+                    working_directory_clause()
                 )
             }
         })?;
@@ -314,7 +344,7 @@ fn read(
     size: usize,
     files: &mut Vec<FileRead>,
 ) -> Result<Vec<u8>, String> {
-    let path = roms.join(file);
+    let path = absolute(&roms.join(file))?;
     // A pipe or a device under the firmware's name could keep its reader
     // waiting for good.
     if path.exists() && !path.is_file() {
@@ -327,8 +357,9 @@ fn read(
     let contents = fs::read(&path).map_err(|error| {
         format!(
             "cannot read {}: {error}; the emulator's `make roms` fetches the firmware into its \
-             roms directory, and --roms names the directory it is read from",
-            path.display()
+             roms directory; --roms names the directory it is read from, and {}",
+            path.display(),
+            working_directory_clause()
         )
     })?;
     if contents.len() != size {
@@ -574,6 +605,7 @@ pub struct Shown {
     pub picture: Picture,
     pub beam_x: u16,
     pub beam_y: u16,
+    pub whole: bool,
 }
 
 // What a run watches for, and how many matches it gathers and places it
@@ -586,13 +618,15 @@ pub struct Watching<'a> {
 
 // What a run saw, when it watched: every match, in the order it happened,
 // its tick counted from the machine's start, and every place counted, by kind
-// and then by address.
+// and then by address; and whether the processor halting for good stopped
+// it, which a run watched or not may.
 pub struct Watched {
     pub matches: Vec<Match>,
     pub counts: Vec<(Kind, u16, u32)>,
     pub matched: bool,
     pub full: bool,
     pub returned: bool,
+    pub halted: bool,
 }
 
 // Past the match that fills a gathering, a run sees out the instruction under
@@ -714,17 +748,21 @@ impl Built {
         typed
     }
 
+    // A stretch stopped short where the processor halts for good runs on
+    // from there, as a run begun there does, so that typing takes its ticks
+    // whatever the program does.
     fn run_until(&mut self, until: u64, typed: &mut Run) {
         let nothing = Watching {
             conditions: &[],
             most_gathered: 0,
             most_counted: 0,
         };
-        let limit = until.saturating_sub(typed.ticks);
-        let (run, _) = self.watched(u32::MAX, limit, &nothing, None);
-        typed.ticks += run.ticks;
-        typed.frames += run.frames;
-        typed.settled = run.settled;
+        while typed.settled && typed.ticks < until {
+            let (run, _) = self.watched(u32::MAX, until - typed.ticks, &nothing, None);
+            typed.ticks += run.ticks;
+            typed.frames += run.frames;
+            typed.settled = run.settled;
+        }
     }
 
     // Machine::disc and Machine::tape read a file only for a machine that
@@ -833,6 +871,13 @@ impl Built {
             matched: watch.matched,
             full: watch.full,
             returned: watch.returned,
+            // Short of its frames and its limit, a settled run was stopped
+            // by its watch or by a halt for good, which may coincide with a
+            // gathering or a count filling.
+            halted: run.settled
+                && run.frames < frames
+                && run.ticks < limit
+                && self.cpu().halted_for_good(),
         };
         (run, watched)
     }
@@ -1002,6 +1047,36 @@ impl Built {
             .collect()
     }
 
+    // A CPC's RAM by its own addresses, as screen's base counts them, past the
+    // banking and the ROMs; refused on a Spectrum, whose RAM the processor
+    // reaches whole.
+    pub fn peek_ram(&self, ram: u32, length: u16) -> Result<Vec<u8>, String> {
+        let Hardware::Cpc(cpc) = &self.hardware else {
+            return Err(
+                "ram reads a CPC's RAM by its own addresses, past its banking and its ROMs; a \
+                 Spectrum's RAM stands at &4000 to &FFFF, where address reads it"
+                    .to_owned(),
+            );
+        };
+        let memory = cpc.ram();
+        let start = ram as usize;
+        let last = memory.len() - 1;
+        memory
+            .get(start..start + usize::from(length))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                if start > last {
+                    format!("&{ram:04X} is past &{last:04X}, where the machine's RAM ends")
+                } else {
+                    format!(
+                        "{length} bytes from &{ram:04X} run past &{last:04X}, where the \
+                         machine's RAM ends; {} fit from there",
+                        memory.len() - start
+                    )
+                }
+            })
+    }
+
     // The picture the monitor holds, cut to the window and drawn as the
     // emulator's command line draws its screenshots, each pixel's index the
     // colour the machine put on the cable.
@@ -1036,6 +1111,15 @@ impl Built {
                 indices.extend(&row);
             }
         }
+        // The beam stands on the sample it paints next (monitor.c's
+        // monitor_receive), so no pass is partway through the window where
+        // the beam stands at or before its first sample, or past its last.
+        let beam = (usize::from(monitor.beam_y), usize::from(monitor.beam_x));
+        let first = (window.top, window.left);
+        let last = (
+            window.top + window.height - 1,
+            window.left + window.width - 1,
+        );
         Shown {
             picture: Picture {
                 width: window.width as u32,
@@ -1045,6 +1129,7 @@ impl Built {
             },
             beam_x: monitor.beam_x,
             beam_y: monitor.beam_y,
+            whole: beam <= first || beam > last,
         }
     }
 
