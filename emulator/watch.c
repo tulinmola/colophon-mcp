@@ -15,11 +15,28 @@ static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t a
   return address >= condition->first && address <= condition->last;
 }
 
-/* Counts a place matched, and fills the count at its last new place. */
-static void count(mcp_watch_t *watch, mcp_kind_t kind, uint16_t address) {
-  uint32_t *counted = &watch->counts[(uint32_t)kind * MCP_COUNTS_PER_KIND + address];
-  if (*counted == 0 && ++watch->counted >= watch->most_counted) {
-    watch->full = true;
+/* Where the match counted as this one is kept, if below room. */
+static uint32_t kept_at(const mcp_watch_t *watch, uint32_t match) {
+  return watch->gathers_last ? match % watch->room : match;
+}
+
+/* Counts a place matched, keeps it as it is first matched, and fills the
+   count at its last new place. An instruction is counted only as it begins,
+   where the pc is its own address. */
+static void count(mcp_watch_t *watch, const mcp_match_t *match) {
+  uint16_t place = watch->counts_by_pc ? match->pc : match->address;
+  uint32_t *counted = &watch->counts[(uint32_t)match->kind * MCP_COUNTS_PER_KIND + place];
+  if (*counted == 0) {
+    if (watch->counted < watch->place_room) {
+      mcp_place_t *kept = &watch->places[watch->counted];
+      *kept = (mcp_place_t){.first = *match};
+      if (match->kind == MCP_EXECUTE) {
+        watch->fetching = kept;
+      }
+    }
+    if (++watch->counted >= watch->most_counted) {
+      watch->full = true;
+    }
   }
   (*counted)++;
 }
@@ -39,30 +56,40 @@ static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp
       counts |= condition->list == MCP_COUNT && may_gather;
     }
   }
-  if (counts) {
-    count(watch, kind, address);
+  mcp_match_t match = {
+      .tick = tick,
+      .kind = kind,
+      .address = address,
+      .value = value,
+      .pc = watch->pc,
+      .response = kind != MCP_EXECUTE && watch->responding,
+      .beam_x = monitor->beam_x,
+      .beam_y = monitor->beam_y,
+      .stops = stops,
+      .gathers = gathers,
+  };
+  if (counts && !(watch->counts_by_pc && match.response)) {
+    count(watch, &match);
   }
   if (!stops && !gathers) {
     return;
   }
-  if (watch->match_count < watch->room) {
-    watch->matches[watch->match_count] = (mcp_match_t){
-        .tick = tick,
-        .kind = kind,
-        .address = address,
-        .value = value,
-        .pc = watch->pc,
-        .response = kind != MCP_EXECUTE && watch->responding,
-        .beam_x = monitor->beam_x,
-        .beam_y = monitor->beam_y,
-        .stops = stops,
-        .gathers = gathers,
-    };
+  uint32_t slot = kept_at(watch, watch->match_count);
+  if (slot < watch->room) {
+    watch->matches[slot] = match;
   }
   watch->match_count++;
   watch->matched |= stops;
-  if (gathers && ++watch->gathered >= watch->most_gathered) {
+  if (gathers && ++watch->gathered >= watch->most_gathered && !watch->gathers_last) {
     watch->full = true;
+  }
+}
+
+/* A byte of the instruction under way, kept where it was first matched. */
+static void fetch(mcp_watch_t *watch, uint8_t value) {
+  mcp_place_t *place = watch->fetching;
+  if (place != NULL && place->length < MCP_INSTRUCTION_BYTES) {
+    place->bytes[place->length++] = value;
   }
 }
 
@@ -84,9 +111,11 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
   if (!settled) {
     if (first) {
       watch->pc = cpu->pc;
+      watch->fetched = true;
     }
-    /* Neither machine drives NMI, so the only response is to INT, which
-       begins with its acknowledge. */
+    /* The response to INT begins with its acknowledge; the response to an
+       NMI, which neither machine drives but set may write in, is told by
+       mcp_watch_after. */
     if (z80_next_cycle(cpu) == Z80_CYCLE_INTERRUPT) {
       watch->responding = true;
     }
@@ -94,6 +123,8 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
   }
   watch->pc = cpu->pc;
   watch->responding = false;
+  watch->fetching = NULL;
+  watch->fetched = false;
   if (!first && arrived(watch, cpu, monitor, tick)) {
     return true;
   }
@@ -122,17 +153,29 @@ void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *moni
   } else if (watch->port_read_held) {
     watch->matches[watch->port_read_match].value = value;
   }
+  bool opcode = (pins & Z80_M1) != 0;
   if (began(before, pins, Z80_MREQ | Z80_RD)) {
-    if ((pins & Z80_M1) == 0 && !z80_reading_operand(cpu)) {
+    if (opcode && watch->fetched && cpu->prefix == 0) {
+      /* An instruction's opcodes after its first are fetched with a prefix
+         pending, since a prefix has not finished until the instruction it
+         modifies has run (z80.h), so this is the response to an NMI, whose
+         acknowledge "is an ordinary opcode fetch whose byte is discarded"
+         (z80.c, on z80_t.accepting). */
+      watch->responding = true;
+    } else if (opcode || z80_reading_operand(cpu)) {
+      watch->fetched |= opcode;
+      fetch(watch, value);
+    } else {
       see(watch, monitor, tick, MCP_READ, address, value, true, true);
     }
   } else if (began(before, pins, Z80_MREQ | Z80_WR)) {
     see(watch, monitor, tick, MCP_WRITE, address, value, true, true);
   } else if (began(before, pins, Z80_IORQ | Z80_RD)) {
     uint32_t match = watch->match_count;
+    uint32_t slot = kept_at(watch, match);
     see(watch, monitor, tick, MCP_IN, address, value, true, true);
-    watch->port_read_held = watch->match_count > match && match < watch->room;
-    watch->port_read_match = match;
+    watch->port_read_held = watch->match_count > match && slot < watch->room;
+    watch->port_read_match = slot;
   } else if (began(before, pins, Z80_IORQ | Z80_WR)) {
     see(watch, monitor, tick, MCP_OUT, address, value, true, true);
   }

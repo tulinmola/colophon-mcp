@@ -18,7 +18,7 @@ use crate::emulator::{
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Kind, Match, Run, Spectrum,
+    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Match, Place, Run, Spectrum,
     SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
@@ -609,30 +609,35 @@ pub struct Shown {
 }
 
 // What a run watches for, and how many matches it gathers and places it
-// counts before it stops.
+// counts before it stops; where it gathers the last matches, how many of
+// them it keeps instead.
 pub struct Watching<'a> {
     pub conditions: &'a [Condition],
     pub most_gathered: u32,
+    pub gathers_last: bool,
     pub most_counted: u32,
+    pub counts_by_pc: bool,
 }
 
 // What a run saw, when it watched: every match, in the order it happened,
-// its tick counted from the machine's start, and every place counted, by kind
-// and then by address; and whether the processor halting for good stopped
-// it, which a run watched or not may.
+// or the last it gathered, its tick counted from the machine's start, and
+// every place counted, by kind and then by address or pc, with how many
+// times it matched; and whether the processor halting for good stopped it,
+// which a run watched or not may.
 pub struct Watched {
     pub matches: Vec<Match>,
-    pub counts: Vec<(Kind, u16, u32)>,
+    pub counts: Vec<(Place, u32)>,
     pub matched: bool,
     pub full: bool,
     pub returned: bool,
     pub halted: bool,
 }
 
-// Past the match that fills a gathering, a run sees out the instruction under
-// way, which makes four accesses at most (EX (SP),IX), then the response to
-// an interrupt taken at its end, four more (in mode 2), and the instruction it
-// stops before.
+// Past the match that fills a gathering or a count, a run sees out the
+// instruction under way, which makes four accesses at most (EX (SP),IX),
+// then the response to an interrupt taken at its end, four more (in mode 2),
+// and the instruction it stops before. The last nine matches therefore hold
+// every match of until, which stops the run at the first.
 const ROOM_PAST_FULL: u32 = 9;
 
 // A state named when it was asked for and dropped before the asking reached
@@ -755,7 +760,9 @@ impl Built {
         let nothing = Watching {
             conditions: &[],
             most_gathered: 0,
+            gathers_last: false,
             most_counted: 0,
+            counts_by_pc: false,
         };
         while typed.settled && typed.ticks < until {
             let (run, _) = self.watched(u32::MAX, until - typed.ticks, &nothing, None);
@@ -817,57 +824,103 @@ impl Built {
         let conditions = watching.conditions;
         // A gathering that may hold nothing fills at its first match.
         let room = watching.most_gathered.max(1).saturating_add(ROOM_PAST_FULL);
-        // SAFETY: bindgen renders a match as integers and bools, and all-zero
-        // bytes are a value of each.
+        // SAFETY: bindgen renders a match and a place as integers, bools and
+        // arrays of them, and all-zero bytes are a value of each.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
         let counting = conditions.iter().any(|condition| condition.list == COUNT);
-        let size = if counting {
-            KINDS.len() * COUNTS_PER_KIND
+        let (size, place_room) = if counting {
+            (
+                KINDS.len() * COUNTS_PER_KIND,
+                watching.most_counted.saturating_add(ROOM_PAST_FULL),
+            )
         } else {
-            0
+            (0, 0)
         };
         let mut counts = vec![0; size];
+        // SAFETY: as for a match.
+        let mut places = vec![unsafe { std::mem::zeroed::<Place>() }; place_room as usize];
         let mut watch = Watch::new(
             conditions,
             &mut matches,
             &mut counts,
+            &mut places,
             watching.most_gathered,
             watching.most_counted,
         );
+        if watching.gathers_last {
+            watch.gather_last();
+        }
+        if watching.counts_by_pc {
+            watch.count_by_pc();
+        }
         if let Some((pc, sp)) = returning {
             watch.returning_to(pc, sp);
         }
-        let watching = !conditions.is_empty() || returning.is_some();
+        let watching_anything = !conditions.is_empty() || returning.is_some();
         let run = match &mut self.hardware {
-            Hardware::Cpc(cpc) => cpc.run(frames, limit, watching.then_some(&mut watch)),
+            Hardware::Cpc(cpc) => cpc.run(frames, limit, watching_anything.then_some(&mut watch)),
             Hardware::Spectrum(spectrum) => {
-                spectrum.run(frames, limit, watching.then_some(&mut watch))
+                spectrum.run(frames, limit, watching_anything.then_some(&mut watch))
             }
         };
         let watch = *watch.seen();
-        assert!(
-            watch.match_count <= room,
-            "a run saw {} matches, past the {room} there was room for",
-            watch.match_count
-        );
-        matches.truncate(watch.match_count as usize);
+        if watching.gathers_last && watch.match_count > room {
+            matches.rotate_left((watch.match_count % room) as usize);
+        } else {
+            assert!(
+                watch.match_count <= room,
+                "a run saw {} matches, past the {room} there was room for",
+                watch.match_count
+            );
+            matches.truncate(watch.match_count as usize);
+        }
+        if watching.gathers_last {
+            // Of the matches kept, those gathered before the last
+            // most_gathered are dropped.
+            let gathered = matches.iter().filter(|seen| seen.gathers).count();
+            let mut surplus = gathered.saturating_sub(watching.most_gathered as usize);
+            matches.retain_mut(|seen| {
+                if seen.gathers && surplus > 0 {
+                    surplus -= 1;
+                    seen.gathers = false;
+                }
+                seen.stops || seen.gathers
+            });
+        }
         for seen in &mut matches {
             seen.tick += self.tick;
         }
-        self.tick += run.ticks;
-        let counts = counts
-            .chunks(COUNTS_PER_KIND)
-            .zip(KINDS)
-            .flat_map(|(counts, kind)| {
-                (0..=u16::MAX)
-                    .zip(counts)
-                    .filter(|(_, count)| **count > 0)
-                    .map(move |(address, count)| (kind, address, *count))
+        assert!(
+            watch.counted <= place_room,
+            "a run counted at {} places, past the {place_room} there was room for",
+            watch.counted
+        );
+        let place = |kept: &Place| {
+            let first = &kept.first;
+            let at = if watching.counts_by_pc {
+                first.pc
+            } else {
+                first.address
+            };
+            (first.kind, at)
+        };
+        places.truncate(watch.counted as usize);
+        places.sort_by_key(place);
+        let counted = places
+            .into_iter()
+            .map(|mut kept| {
+                let (kind, at) = place(&kept);
+                kept.first.tick += self.tick;
+                (
+                    kept,
+                    counts[kind as usize * COUNTS_PER_KIND + usize::from(at)],
+                )
             })
             .collect();
+        self.tick += run.ticks;
         let watched = Watched {
             matches,
-            counts,
+            counts: counted,
             matched: watch.matched,
             full: watch.full,
             returned: watch.returned,

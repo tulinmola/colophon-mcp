@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 use crate::fields::hexadecimal_number;
 use crate::keys::Key;
 use crate::machine::{
-    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, READ, Run, UNTIL, WRITE,
+    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, Place, READ, Run, UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, TAPES, Watched, Watching,
@@ -51,9 +51,9 @@ const MOST_BYTES: u16 = 4096;
 // A match takes some 80 characters, so these come to about as many as
 // MOST_BYTES does.
 const MOST_GATHERED: u32 = 128;
-// A place counted takes some 30 characters, so these come to about twice what
+// A place counted takes some 60 characters, so these come to about twice what
 // MOST_BYTES does.
-const MOST_COUNTED: u32 = 512;
+const MOST_COUNTED: u32 = 256;
 // Each is weighed against every access a run makes.
 const MOST_CONDITIONS: usize = 16;
 // An instruction listed takes some 50 characters, so these come to about half
@@ -453,11 +453,42 @@ fn watched_for(
     Ok(watched)
 }
 
-fn watching(conditions: &[Condition]) -> Watching<'_> {
+// gather_last and count_by say how gather and count keep what matches their
+// conditions, and mean nothing without them.
+fn kept_as_asked(
+    gather: Option<&Value>,
+    gather_last: Option<bool>,
+    count: Option<&Value>,
+    count_by: Option<CountBy>,
+) -> Result<(), String> {
+    if gather.is_none() && gather_last.is_some() {
+        return Err(
+            "gather_last says which matches of gather are kept, and gather is not given; give \
+             gather the conditions to gather, or leave gather_last out"
+                .to_owned(),
+        );
+    }
+    if count.is_none() && count_by.is_some() {
+        return Err(
+            "count_by says what count counts an access by, and count is not given; give count \
+             the conditions to count, or leave count_by out"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn watching(
+    conditions: &[Condition],
+    gather_last: Option<bool>,
+    count_by: Option<CountBy>,
+) -> Watching<'_> {
     Watching {
         conditions,
         most_gathered: MOST_GATHERED,
+        gathers_last: gather_last == Some(true),
         most_counted: MOST_COUNTED,
+        counts_by_pc: count_by == Some(CountBy::Pc),
     }
 }
 
@@ -649,18 +680,26 @@ struct RunRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the run goes, written as until's are. The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. At most 16.
+    /// Conditions whose matches are gathered as the run goes, written as until's are. The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
+    /// Whether gather keeps the last 128 matches rather than the first: true runs on past the 128th, and answers the 128 gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gather_last: Option<bool>,
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
+    /// What count counts an access by: "address", the byte's address or the port's, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_by: Option<CountBy>,
     /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are.
     #[schemars(schema_with = "keys_schema")]
     #[schemars(transform = absent_not_null)]
@@ -695,18 +734,26 @@ struct CallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. At most 16.
+    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 512th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. At most 16.
+    /// Whether gather keeps the last 128 matches rather than the first, as run's gather_last keeps them. false if not given, and refused without gather.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gather_last: Option<bool>,
+    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
+    /// What count counts an access by, as run's count_by says. "address" if not given, and refused without count.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count_by: Option<CountBy>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -717,6 +764,16 @@ struct TypeRequest {
     handle: String,
     /// What to type: "PRINT 2+2\n" on a CPC, "p2+2\n" on a Spectrum, whose ROM reads a letter typed where the cursor shows K as a keyword.
     text: String,
+}
+
+// What a count counts an access by.
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum CountBy {
+    /// The byte's address, or the port's.
+    Address,
+    /// Where the instruction that made the access begins.
+    Pc,
 }
 
 // A CPC's two drives, as AMSDOS names them.
@@ -1048,7 +1105,7 @@ enum Stopped {
     Unsettled,
     /// A condition of until matched.
     Matched,
-    /// The gathering came to 128 matches, or the count to 512 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end.
+    /// The gathering came to 128 matches, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills.
     Full,
     /// The processor halted on HALT with interrupts disabled, where it waits for good: IFF1 shuts out INT, and nothing on either machine raises the NMI that would wake it. A run from here runs as asked, halted throughout, unless set has written in an NMI; call wakes the processor for its routine alone, and set or state_restore takes it past the HALT.
     Halted,
@@ -1113,42 +1170,58 @@ impl Matched {
     }
 }
 
+// A place counted, told by its first match.
 #[derive(Serialize, JsonSchema)]
 struct Counted {
+    /// The machine's tick at the place's first match: as the instruction was about to begin, or once the tick that put the access on the bus had run.
+    tick: u64,
     /// Where instructions began, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     execute: Option<Hexadecimal>,
-    /// A byte the program read as data, by its address, in hexadecimal after &.
+    /// A byte the program read as data, by its address, in hexadecimal after &; counted by pc, the address of the place's first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     read: Option<Hexadecimal>,
-    /// A byte the processor wrote, by its address, in hexadecimal after &.
+    /// A byte the processor wrote, by its address, in hexadecimal after &; counted by pc, the address of the place's first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     write: Option<Hexadecimal>,
-    /// A port the processor read, by its address, in hexadecimal after &.
+    /// A port the processor read, by its address, in hexadecimal after &; counted by pc, the port of the place's first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     r#in: Option<Hexadecimal>,
-    /// A port the processor wrote, by its address, in hexadecimal after &.
+    /// A port the processor wrote, by its address, in hexadecimal after &; counted by pc, the port of the place's first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     out: Option<Hexadecimal>,
+    /// Where the instruction that made the place's first match begins, in hexadecimal after &, which counted by pc is the place itself; not given for instructions, whose address is their own, or when the response to an interrupt made the access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc: Option<Hexadecimal>,
+    /// The instruction's bytes as the processor first fetched them there, as pairs of hexadecimal digits: its opcodes and its operands, so that code overwritten since still says what ran; of an instruction longer than four bytes, as only a chain of prefixes makes one, its first four. Given for instructions alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    bytes: Option<String>,
     /// How many times it matched.
     count: u32,
 }
 
 impl Counted {
-    fn of(&(kind, address, count): &(Kind, u16, u32)) -> Counted {
-        let at = |listed| (kind == listed).then_some(Hexadecimal::address(address));
+    fn of((place, count): &(Place, u32)) -> Counted {
+        let first = &place.first;
+        let at = |kind| (first.kind == kind).then_some(Hexadecimal::address(first.address));
+        let access = first.kind != EXECUTE;
         Counted {
+            tick: first.tick,
             execute: at(EXECUTE),
             read: at(READ),
             write: at(WRITE),
             r#in: at(IN),
             out: at(OUT),
-            count,
+            pc: (access && !first.response).then_some(Hexadecimal::address(first.pc)),
+            bytes: (!access).then(|| digit_pairs(&place.bytes[..usize::from(place.length)])),
+            count: *count,
         }
     }
 }
@@ -1167,11 +1240,11 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     matched: Option<Vec<Matched>>,
-    /// What matched the conditions of gather, in the order it happened.
+    /// What matched the conditions of gather, in the order it happened: the first matches, or with gather_last the last 128.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched the conditions of count, and how many times: executes first, then reads, writes, port reads and port writes, each by address.
+    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads and port writes, each by address, or by pc.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
@@ -1618,7 +1691,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1633,11 +1706,18 @@ impl Server {
             request.gather.as_ref(),
             request.count.as_ref(),
         )?;
+        kept_as_asked(
+            request.gather.as_ref(),
+            request.gather_last,
+            request.count.as_ref(),
+            request.count_by,
+        )?;
         let keys = keys(machine, request.keys.as_ref())?;
         let mut arguments = journaled(&request);
         journal_conditions(&mut arguments, &conditions);
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
+        let (gather_last, count_by) = (request.gather_last, request.count_by);
         let ran = match (request.frames, request.ticks) {
             (Some(frames), None) => {
                 let frames = u32::try_from(frames)
@@ -1652,7 +1732,8 @@ impl Server {
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
                     let tick = built.tick();
-                    let (run, watched) = built.run(frames, limit, &watching(&conditions), &keys);
+                    let watching = watching(&conditions, gather_last, count_by);
+                    let (run, watched) = built.run(frames, limit, &watching, &keys);
                     built.record(tick, "run", arguments, None);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
@@ -1677,7 +1758,8 @@ impl Server {
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
                     let tick = built.tick();
-                    let (run, watched) = built.run(u32::MAX, ticks, &watching(&conditions), &keys);
+                    let watching = watching(&conditions, gather_last, count_by);
+                    let (run, watched) = built.run(u32::MAX, ticks, &watching, &keys);
                     built.record(tick, "run", arguments, None);
                     Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering, counting)
                 })
@@ -1721,8 +1803,15 @@ impl Server {
             request.gather.as_ref(),
             request.count.as_ref(),
         )?;
+        kept_as_asked(
+            request.gather.as_ref(),
+            request.gather_last,
+            request.count.as_ref(),
+            request.count_by,
+        )?;
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
+        let (gather_last, count_by) = (request.gather_last, request.count_by);
         let mut arguments = journaled(&request);
         arguments["address"] = json!(Hexadecimal::address(address));
         journal_conditions(&mut arguments, &conditions);
@@ -1731,8 +1820,8 @@ impl Server {
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
             let tick = built.tick();
-            let (run, watched) =
-                built.call(address, &values, frames, limit, &watching(&conditions))?;
+            let watching = watching(&conditions, gather_last, count_by);
+            let (run, watched) = built.call(address, &values, frames, limit, &watching)?;
             built.record(tick, "call", arguments, None);
             let stopped = if run.frames >= frames {
                 Stopped::Frames

@@ -91,23 +91,49 @@ typedef struct {
   bool gathers;
 } mcp_match_t;
 
+/* The bytes of the longest instruction but a chain of prefixes, such as
+   DD CB d op, or ED and an opcode with an address after it. */
+#define MCP_INSTRUCTION_BYTES 4
+
+/* A place counted, as its first match found it. */
+typedef struct {
+  mcp_match_t first;
+  /* An instruction's bytes, as the processor fetched them that first time:
+     its opcodes and its operands, the first MCP_INSTRUCTION_BYTES of one
+     longer, as only a chain of prefixes makes one. None for an access. */
+  uint8_t bytes[MCP_INSTRUCTION_BYTES];
+  uint8_t length;
+} mcp_place_t;
+
 /* What a run watches for and what it saw. The caller sets what comes before
  * match_count and zeroes the rest; the run keeps the rest. */
 typedef struct {
   const mcp_condition_t *conditions;
   uint32_t condition_count;
-  /* Where the matches are kept, in the order they happened. */
+  /* Where the matches are kept, in the order they happened: as many of the
+     first as there is room for, or, where gathers_last, the last, each at
+     its number among them modulo room, which is then at least 1. */
   mcp_match_t *matches;
   uint32_t room;
-  /* The run stops at the end of the instruction that gathers this many. */
+  bool gathers_last;
+  /* Unless gathers_last, the run stops at the end of the instruction that
+     gathers this many. */
   uint32_t most_gathered;
   /* Where the matches of the count list are counted, from zero:
-     MCP_COUNTS_PER_KIND counts to a kind, by address, for each of the
-     MCP_KINDS kinds in the order mcp_kind_t gives them; NULL if the list is
-     empty. */
+     MCP_COUNTS_PER_KIND counts to a kind, by address, or by pc where
+     counts_by_pc, for each of the MCP_KINDS kinds in the order mcp_kind_t
+     gives them; NULL if the list is empty. */
   uint32_t *counts;
+  /* Whether an access is counted by where the instruction that made it
+     begins, rather than by its address. The response to an interrupt is no
+     instruction, so its accesses are then not counted. */
+  bool counts_by_pc;
+  /* Where the places counted are kept, as many as there is room for, in the
+     order each was first matched. */
+  mcp_place_t *places;
+  uint32_t place_room;
   /* The run stops at the end of the instruction that counts at this many
-     places, a place being a kind and an address. */
+     places, a place being a kind and an address, or a pc. */
   uint32_t most_counted;
   /* A call stops the run once the processor stands at return_pc with its
      stack at return_sp, where the routine's own return leaves it. */
@@ -128,9 +154,18 @@ typedef struct {
   bool begun;
   bool responding;
   uint16_t pc;
-  /* A port read matched and kept, and still on the bus: which match it is. */
+  /* A port read matched and kept, and still on the bus: where it is kept. */
   bool port_read_held;
   uint32_t port_read_match;
+  /* The place the instruction under way first matched, whose bytes it is
+     fetching; NULL unless the instruction first matched its place. */
+  mcp_place_t *fetching;
+  /* Whether the instruction under way has fetched its first opcode, after
+     which one fetched with no prefix pending is an NMI's acknowledge. A run
+     that begins unsettled is taken to begin after one: runs end unsettled
+     only inside a chain of prefixes, and set writes an NMI's acknowledge in
+     as cpu.accepting 1. */
+  bool fetched;
 } mcp_watch_t;
 
 /* Run until the monitor has retraced this many times or the limit in ticks

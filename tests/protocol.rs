@@ -1029,6 +1029,8 @@ fn an_unknown_tool_is_a_protocol_error_and_unfit_arguments_a_tool_error() {
 // Programs the tests write, in the Z80's own bytes.
 const ADD_A_B: u8 = 0x80;
 const AND_N: u8 = 0xE6;
+const BIT_0_AT_HL: [u8; 2] = [0xCB, 0x46];
+const CALL: u8 = 0xCD;
 const CP_E: u8 = 0xBB;
 const DI: u8 = 0xF3;
 const EI: u8 = 0xFB;
@@ -1039,6 +1041,7 @@ const IN_A_C: [u8; 2] = [0xED, 0x78];
 const IN_A_N: u8 = 0xDB;
 const INC_A: u8 = 0x3C;
 const DEC_BC: u8 = 0x0B;
+const DEC_HL: u8 = 0x2B;
 const INC_BC: u8 = 0x03;
 const INC_HL: u8 = 0x23;
 const INC_AT_HL: u8 = 0x34;
@@ -1053,6 +1056,8 @@ const LD_A_FROM: u8 = 0x3A;
 const LD_AT_HL: u8 = 0x36;
 const LD_AT_HL_A: u8 = 0x77;
 const LD_BC: u8 = 0x01;
+const LD_BC_TO: [u8; 2] = [0xED, 0x43];
+const LD_B: u8 = 0x06;
 const LD_E: u8 = 0x1E;
 const LD_E_A: u8 = 0x5F;
 const LD_HL: u8 = 0x21;
@@ -2264,8 +2269,9 @@ fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
     assert!(session.handles().is_empty());
 }
 
-// What a run or a call answered it matched or gathered, each as its kind, its
-// address or port, its byte and where the instruction that made it begins.
+// What a run or a call answered it matched, gathered or counted, each as its
+// kind, its address or port, its byte and where the instruction that made it
+// begins.
 fn seen(list: &Value) -> Vec<(&'static str, u64, Option<u64>, Option<u64>)> {
     list.as_array()
         .expect("a list")
@@ -2499,8 +2505,12 @@ fn a_gathering_that_fills_stops_and_the_next_run_gathers_on() {
     let handle = session.open("cpc6128");
     let gathering = json!([{ "write": "&9000", "to": "&FFFF" }]);
     let mut next = 0x9000;
-    for _ in 0..3 {
-        let ran = session.run(&handle, json!({ "frames": 1, "gather": gathering }));
+    for last in [json!(null), json!(false), json!(null)] {
+        let mut arguments = json!({ "frames": 1, "gather": gathering });
+        if !last.is_null() {
+            arguments["gather_last"] = last;
+        }
+        let ran = session.run(&handle, arguments);
         assert_eq!(ran["stopped"], "full", "{ran}");
         let writes = seen(&ran["gathered"]);
         assert_eq!(writes.len(), 128, "{ran}");
@@ -2534,6 +2544,115 @@ fn a_gathering_fills_at_the_end_of_the_instruction_that_filled_it() {
     );
     assert_eq!(writes[127].3, writes[128].3, "{ran}");
     assert_eq!(ran["pc"], ampersand(8), "{ran}");
+}
+
+// The same program counted: LD (&8000),A writes the first place and each
+// PUSH two more, the high byte first (UM0080), from a stack at &9000, so
+// the 256th is the first byte of the 128th PUSH, &8F01, and its second,
+// &8F00, is counted with it.
+#[test]
+fn a_count_fills_at_the_end_of_the_instruction_that_filled_it() {
+    let program = [
+        DI, LD_SP, 0x00, 0x90, LD_TO_A, 0x00, 0x80, PUSH_HL, JR, 0xFD,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let counting = json!([{ "write": "&4000", "to": "&FFFF" }]);
+    let ran = session.run(&handle, json!({ "ticks": 10000, "count": counting }));
+    let mut counted = told(&ran["counted"]);
+    assert_eq!(
+        (&ran["stopped"], counted.len()),
+        (&json!("full"), 257),
+        "{ran}"
+    );
+    counted.sort_by_key(|told| told.tick);
+    let pushed: Vec<_> = counted[255..]
+        .iter()
+        .map(|told| (told.address, told.pc))
+        .collect();
+    assert_eq!(pushed, [(0x8F01, Some(7)), (0x8F00, Some(7))], "{ran}");
+    assert_eq!(ran["pc"], ampersand(8), "{ran}");
+}
+
+// Fewer matches than a gathering holds are the same list, gathered first or
+// last.
+#[test]
+fn a_gathering_of_the_last_that_never_fills_lists_every_match() {
+    let roms = Roms::programmed("cpc6128.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let gathering = json!([{ "write": "&9000", "to": "&FFFF" }]);
+    let mut gathered = |last: bool| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(
+            &handle,
+            json!({ "ticks": 1000, "gather": gathering, "gather_last": last }),
+        );
+        assert_eq!(ran["stopped"], "ticks", "{ran}");
+        ran["gathered"].clone()
+    };
+    let first = gathered(false);
+    let count = first.as_array().unwrap().len();
+    assert!((10..128).contains(&count), "{first}");
+    assert_eq!(gathered(true), first);
+}
+
+// A run gathering the last matches, stopped where the program's 256th pass
+// writes &90FF, lists the last 128 of what its twin gathers over the same
+// stretch in runs that fill and gather on, the last of them the write that
+// stopped it, made by LD (HL),A at &000C.
+#[test]
+fn gathering_the_last_is_the_tail_of_gathering_it_all() {
+    for (file, machine, port, port_address) in [
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            json!({ "out": "&7F00", "mask": "&C000" }),
+            0x7F00,
+        ),
+        (
+            "spectrum48.rom",
+            "spectrum48",
+            json!({ "out": "&FE", "mask": "&01" }),
+            0x00FE,
+        ),
+    ] {
+        let roms = Roms::programmed(file, &passing(port_address));
+        let mut session = Session::start(&roms);
+        let conditions = json!([
+            { "execute": 0, "to": "&3FFF" },
+            { "read": "&9000", "to": "&90FF" },
+            { "write": "&7F00", "to": "&90FF" },
+            port,
+        ]);
+        let until = json!([{ "write": "&90FF" }]);
+        let handle = session.open(machine);
+        let mut all = Vec::new();
+        let ended = loop {
+            let ran = session.run(
+                &handle,
+                json!({ "frames": 50, "until": until, "gather": conditions }),
+            );
+            all.extend(ran["gathered"].as_array().unwrap().iter().cloned());
+            if ran["stopped"] != "full" {
+                break ran;
+            }
+        };
+        let twin = session.open(machine);
+        let last = session.run(
+            &twin,
+            json!({ "frames": 50, "until": until, "gather": conditions, "gather_last": true }),
+        );
+        assert_eq!(
+            (&last["stopped"], &last["tick"], &last["matched"]),
+            (&json!("matched"), &ended["tick"], &ended["matched"]),
+            "{machine}: {last}"
+        );
+        assert!(all.len() > 1000, "{machine}: {} gathered", all.len());
+        assert_eq!(last["gathered"], json!(all[all.len() - 128..]), "{machine}");
+        let (kind, address, _, pc) = *seen(&last["gathered"]).last().unwrap();
+        assert_eq!((kind, address, pc), ("write", 0x90FF, Some(0x000C)));
+    }
 }
 
 // A CPC's Gate Array answers &7Fxx, A15 low and A14 high ("The Gate Array",
@@ -2591,15 +2710,19 @@ fn a_port_matches_on_the_bits_its_device_decodes() {
 // Interrupt mode 1 pushes the program counter and runs from &0038 (UM0080),
 // where the handler writes a byte with LD (HL),n, takes interrupts again and
 // returns.
-#[test]
-fn what_the_response_to_an_interrupt_writes_names_no_instruction() {
+fn answering_interrupts() -> Vec<u8> {
     let mut program = vec![
         LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, IM_1[0], IM_1[1], EI, HALT, JR,
     ];
     program.push(0xFD);
     program.resize(0x38, NOP);
     program.extend([LD_AT_HL, 0x55, EI, RET]);
-    let roms = Roms::programmed("spectrum48.rom", &program);
+    program
+}
+
+#[test]
+fn what_the_response_to_an_interrupt_writes_names_no_instruction() {
+    let roms = Roms::programmed("spectrum48.rom", &answering_interrupts());
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
     let gathering = json!([{ "write": "&7FFE", "to": "&7FFF" }, { "write": "&9000" }]);
@@ -2616,6 +2739,114 @@ fn what_the_response_to_an_interrupt_writes_names_no_instruction() {
             ],
             "{ran}"
         );
+    }
+}
+
+// The same program and its handler, counted by address and by pc on twins:
+// the two pushes of the response are counted by their addresses, and name no
+// instruction, and by pc they are not counted at all, since no instruction
+// made them; the handler's write is counted alike either way.
+#[test]
+fn a_count_by_pc_leaves_out_what_the_response_to_an_interrupt_writes() {
+    let roms = Roms::programmed("spectrum48.rom", &answering_interrupts());
+    let mut session = Session::start(&roms);
+    let mut counted = |count_by: &str| {
+        let handle = session.open("spectrum48");
+        let ran = session.run(
+            &handle,
+            json!({
+                "frames": 3,
+                "count": [{ "write": "&7FFE", "to": "&7FFF" }, { "write": "&9000" }],
+                "count_by": count_by,
+            }),
+        );
+        ran["counted"].clone()
+    };
+    let by_address = counted("address");
+    let by_pc = counted("pc");
+    let handled = &by_address[2];
+    assert_eq!(
+        seen(&by_address),
+        [
+            ("write", 0x7FFE, None, None),
+            ("write", 0x7FFF, None, None),
+            ("write", 0x9000, None, Some(0x0038)),
+        ],
+        "{by_address}"
+    );
+    assert!(handled["count"].as_u64().unwrap() >= 2, "{by_address}");
+    for pushed in [&by_address[0], &by_address[1]] {
+        assert_eq!(pushed["count"], handled["count"], "{by_address}");
+    }
+    assert_eq!(by_pc, json!([handled]));
+}
+
+// An NMI written in with set is taken at the end of the instruction under
+// way, whether INC A or HALT, and answered from &0066, where RETN returns
+// (UM0080, Nonmaskable Interrupt Response). When an NMI "is accepted, the
+// CPU ignores the next instruction that it fetches and instead performs a
+// restart at address 0066h" (UM0080, CPU Response), so that fetch is no
+// byte of the instruction before it, and the pushes are the response's:
+// they name no instruction, and a count by pc leaves them out. A run that
+// begins at the acknowledge, as set leaves the processor by writing
+// cpu.accepting 1, which the emulator's z80.c gives an NMI, is answered
+// alike.
+#[test]
+fn the_response_to_an_nmi_names_no_instruction_and_fetches_none() {
+    let program = [INC_A, LD_B, 0x55, JR, 0xFE, HALT];
+    let stack = json!([{ "write": "&7FFE", "to": "&7FFF" }]);
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &program);
+        roms.write_at(file, 0x66, &RETN);
+        let mut session = Session::start(&roms);
+        for (taken, value, instruction, bytes) in [
+            ("cpu.nmi_pending", json!(true), 0, "3C"),
+            ("cpu.nmi_pending", json!(true), 5, "76"),
+            ("cpu.accepting", json!(1), 0, "3C"),
+        ] {
+            let handle = session.open(machine);
+            session.set(
+                &handle,
+                json!({ "cpu.pc": instruction, "cpu.sp": "&8000", taken: value }),
+            );
+            let ran = session.run(
+                &handle,
+                json!({
+                    "ticks": 100,
+                    "count": [{ "execute": 0, "to": "&FFFF" }, { "write": "&7FFE", "to": "&7FFF" }],
+                    "count_by": "pc",
+                    "gather": stack,
+                }),
+            );
+            let pushed: Vec<_> = seen(&ran["gathered"])
+                .into_iter()
+                .map(|(kind, address, _, pc)| (kind, address, pc))
+                .collect();
+            assert_eq!(
+                pushed,
+                [("write", 0x7FFF, None), ("write", 0x7FFE, None)],
+                "{machine}: {ran}"
+            );
+            let counted = told(&ran["counted"]);
+            assert!(
+                counted.iter().all(|told| KINDS[told.kind] == "execute"),
+                "{machine}: {ran}"
+            );
+            let first = ran["counted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|counted| counted["execute"] == ampersand(instruction))
+                .expect("the instruction counted");
+            assert_eq!(first["bytes"], bytes, "{machine}: {ran}");
+            let handler = ran["counted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|counted| counted["execute"] == ampersand(0x66))
+                .expect("the handler counted");
+            assert_eq!(handler["bytes"], "ED45", "{machine}: {ran}");
+        }
     }
 }
 
@@ -2797,13 +3028,17 @@ fn a_called_routine_returns_with_its_registers_and_leaves_the_machine_where_it_w
 
 // A call counts what its routine does, ADD A,B and RET at &0100 and the two
 // bytes the RET reads, and not the instruction it returns to, which the
-// machine then stands before.
+// machine then stands before. Each place is told by its first match: RET
+// begins once ADD A,r has taken its 4 T-states (Z80 CPU User Manual,
+// UM0080), from a Spectrum's ROM, where nothing is contended, and each read
+// at the tick the call's gathering lists it at. Called again, counting by pc
+// and gathering the last, the two reads are one place, the RET's.
 #[test]
 fn a_call_counts_what_its_routine_does() {
     let roms = routine("spectrum48.rom", &COUNTING_FROM_9000);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
-    session.step(&handle, 3);
+    let start = session.step(&handle, 3)["tick"].as_u64().unwrap();
     let called = session.answer(
         "call",
         json!({
@@ -2811,17 +3046,43 @@ fn a_call_counts_what_its_routine_does() {
             "address": "&0100",
             "values": { "cpu.sp": 0x8000 },
             "count": [{ "execute": 0, "to": "&FFFF" }, { "read": "&7FFE", "to": "&7FFF" }],
+            "gather": [{ "read": "&7FFE", "to": "&7FFF" }],
         }),
     );
     assert_eq!(called["stopped"], "returned", "{called}");
+    let read = |index: usize| &called["gathered"][index]["tick"];
     assert_eq!(
         called["counted"],
         json!([
-            { "execute": "&0100", "count": 1 },
-            { "execute": "&0101", "count": 1 },
-            { "read": "&7FFE", "count": 1 },
-            { "read": "&7FFF", "count": 1 },
-        ])
+            { "tick": start, "execute": "&0100", "bytes": "80", "count": 1 },
+            { "tick": start + 4, "execute": "&0101", "bytes": "C9", "count": 1 },
+            { "tick": read(0), "read": "&7FFE", "pc": "&0101", "count": 1 },
+            { "tick": read(1), "read": "&7FFF", "pc": "&0101", "count": 1 },
+        ]),
+        "{called}"
+    );
+    let start = called["tick"].as_u64().unwrap();
+    let again = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&0100",
+            "values": { "cpu.sp": 0x8000 },
+            "count": [{ "execute": 0, "to": "&FFFF" }, { "read": "&7FFE", "to": "&7FFF" }],
+            "count_by": "pc",
+            "gather": [{ "read": "&7FFE", "to": "&7FFF" }],
+            "gather_last": true,
+        }),
+    );
+    assert_eq!(seen(&again["gathered"]).len(), 2, "{again}");
+    assert_eq!(
+        again["counted"],
+        json!([
+            { "tick": start, "execute": "&0100", "bytes": "80", "count": 1 },
+            { "tick": start + 4, "execute": "&0101", "bytes": "C9", "count": 1 },
+            { "tick": again["gathered"][0]["tick"], "read": "&7FFE", "pc": "&0101", "count": 2 },
+        ]),
+        "{again}"
     );
 }
 
@@ -3105,6 +3366,22 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             json!({ "handle": handle, "ticks": 10, "gather": many })
         ),
         "gather has 17 conditions, and takes at most 16"
+    );
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "ticks": 10, "gather_last": true })
+        ),
+        "gather_last says which matches of gather are kept, and gather is not given; give \
+         gather the conditions to gather, or leave gather_last out"
+    );
+    assert_eq!(
+        session.refusal(
+            "call",
+            json!({ "handle": handle, "address": 0, "count_by": "pc" })
+        ),
+        "count_by says what count counts an access by, and count is not given; give count the \
+         conditions to count, or leave count_by out"
     );
     assert_eq!(
         session.refusal(
@@ -3961,30 +4238,46 @@ fn disassemble_says_what_would_have_worked() {
 
 const KINDS: [&str; 5] = ["execute", "read", "write", "in", "out"];
 
-// What a run or a call counted, in the order it answered: each place as its
-// kind, by its place among KINDS, and its address or port, and how many
-// times it matched.
-fn places(list: &Value) -> Vec<((usize, u64), u64)> {
+// A match or a place as a run or a call answered it: its tick, its kind, by
+// its place among KINDS, its address or port, where the instruction that
+// made it begins, and how many times it matched, once for a match.
+#[derive(Clone, Copy, Debug)]
+struct Told {
+    tick: u64,
+    kind: usize,
+    address: u64,
+    pc: Option<u64>,
+    count: u64,
+}
+
+fn told(list: &Value) -> Vec<Told> {
     list.as_array()
         .expect("a list")
         .iter()
-        .map(|counted| {
+        .map(|told| {
             let kind = KINDS
                 .iter()
-                .position(|kind| counted.get(*kind).is_some())
+                .position(|kind| told.get(*kind).is_some())
                 .expect("a kind");
-            (
-                (kind, after_ampersand(&counted[KINDS[kind]], 4)),
-                counted["count"].as_u64().unwrap(),
-            )
+            Told {
+                tick: told["tick"].as_u64().unwrap(),
+                kind,
+                address: after_ampersand(&told[KINDS[kind]], 4),
+                pc: told.get("pc").map(|pc| after_ampersand(pc, 4)),
+                count: told.get("count").map_or(1, |count| count.as_u64().unwrap()),
+            }
         })
         .collect()
 }
 
-// A machine gathering over a stretch, and its twin counting over the same
-// ticks, run again wherever either fills, see the same matches: the
-// gathering, tallied by place, is the count. Each pass of the program walks
-// 256 bytes, so both fill on the way.
+// A machine gathering over a stretch, and its twins counting over the same
+// ticks by address and by pc, each run again wherever it fills, see the same
+// matches: the gathering, tallied by place, is the count, and each place a
+// run counts is told by the first match gathered there since that run
+// began. Each pass of the program walks 256 bytes, so the gathering and the
+// count by address fill on the way, and the count by pc, of a dozen
+// instructions, does not; interrupts are disabled, so every access is an
+// instruction's.
 #[test]
 fn counting_a_stretch_is_tallying_a_gathering_of_it() {
     for (file, machine, port, port_address) in [
@@ -4010,53 +4303,84 @@ fn counting_a_stretch_is_tallying_a_gathering_of_it() {
             port,
         ]);
         let stretch = 3 * SPECTRUM_FRAME_TICKS;
-        let mut over = |list: &str| {
+        // Each run's answer, after the tick the run began at.
+        let mut over = |list: &str, count_by: Option<&str>| {
             let handle = session.open(machine);
-            let (mut tick, mut runs) = (0, 0);
-            let mut tally: BTreeMap<(String, u64), u64> = BTreeMap::new();
+            let (mut tick, mut runs) = (0, Vec::new());
             while tick < stretch {
                 let mut arguments = json!({ "ticks": stretch - tick });
                 arguments[list] = conditions.clone();
+                if let Some(count_by) = count_by {
+                    arguments["count_by"] = json!(count_by);
+                }
                 let ran = session.run(&handle, arguments);
-                tick = ran["tick"].as_u64().unwrap();
-                runs += 1;
-                let seen: Vec<((String, u64), u64)> = if list == "gather" {
-                    seen(&ran["gathered"])
-                        .into_iter()
-                        .map(|(kind, address, _, _)| ((kind.to_owned(), address), 1))
-                        .collect()
+                let answered = if list == "gather" {
+                    told(&ran["gathered"])
                 } else {
-                    let counted = places(&ran["counted"]);
                     assert!(ran.get("gathered").is_none(), "{ran}");
-                    // Executes first, then reads, writes and ports, each
-                    // kind by address, and a full count holds 512 places
-                    // and the rest of the instruction that filled it.
-                    assert!(
-                        counted.windows(2).all(|pair| pair[0].0 < pair[1].0),
-                        "{ran}"
-                    );
+                    let counted = told(&ran["counted"]);
+                    // A full count holds 256 places and the rest of the
+                    // instruction that filled it.
                     if ran["stopped"] == "full" {
-                        assert!(counted.len() >= 512, "{ran}");
+                        assert!(counted.len() >= 256, "{ran}");
                     }
                     counted
-                        .into_iter()
-                        .map(|((kind, address), count)| ((KINDS[kind].to_owned(), address), count))
-                        .collect()
                 };
-                for (place, count) in seen {
-                    *tally.entry(place).or_insert(0) += count;
+                runs.push((tick, answered));
+                tick = ran["tick"].as_u64().unwrap();
+            }
+            (tick, runs)
+        };
+        let (gathered_to, gatherings) = over("gather", None);
+        let gathered: Vec<Told> = gatherings
+            .iter()
+            .flat_map(|(_, answered)| answered.iter().copied())
+            .collect();
+        for count_by in ["address", "pc"] {
+            let place = |told: &Told| {
+                let by_pc = count_by == "pc";
+                (told.kind, told.pc.filter(|_| by_pc).unwrap_or(told.address))
+            };
+            let (counted_to, countings) = over("count", Some(count_by));
+            assert_eq!(gathered_to, counted_to, "{machine}");
+            let mut tally: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+            for seen in &gathered {
+                *tally.entry(place(seen)).or_insert(0) += 1;
+            }
+            let mut counted: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+            for (began, answered) in &countings {
+                // Executes first, then reads, writes and ports, each kind by
+                // address or by pc.
+                assert!(
+                    answered
+                        .windows(2)
+                        .all(|pair| place(&pair[0]) < place(&pair[1])),
+                    "{machine} by {count_by}: {answered:?}"
+                );
+                let since = gathered.partition_point(|seen| seen.tick < *began);
+                for told in answered {
+                    *counted.entry(place(told)).or_insert(0) += told.count;
+                    let first = gathered[since..]
+                        .iter()
+                        .find(|seen| place(seen) == place(told))
+                        .expect("gathered");
+                    assert_eq!(
+                        (first.tick, first.address, first.pc),
+                        (told.tick, told.address, told.pc),
+                        "{machine} by {count_by}: {told:?}"
+                    );
                 }
             }
-            (tick, runs, tally)
-        };
-        let (gathered_to, gatherings, gathered) = over("gather");
-        let (counted_to, countings, counted) = over("count");
-        assert_eq!(gathered_to, counted_to, "{machine}");
-        assert_eq!(gathered, counted, "{machine}");
-        assert!(
-            gatherings > 10 && countings > 1,
-            "{machine}: {gatherings} gatherings, {countings} countings"
-        );
+            assert_eq!(tally, counted, "{machine} by {count_by}");
+            let fills = countings.len() > 10;
+            assert!(
+                gatherings.len() > 100 && (fills || countings.len() == 1),
+                "{machine} by {count_by}: {} gatherings, {} countings",
+                gatherings.len(),
+                countings.len()
+            );
+            assert_eq!(fills, count_by == "address", "{machine} by {count_by}");
+        }
     }
 }
 
@@ -4065,7 +4389,12 @@ fn counting_a_stretch_is_tallying_a_gathering_of_it() {
 // condition; the instruction a run stops before is not yet counted; and a JR
 // to itself, 12 T-states each time from the ROM, where nothing holds the
 // processor (UM0080), is counted 1000 times in 12000 ticks, and gathered and
-// counted alike where one run does both.
+// counted alike where one run does both. Each place is told by its first
+// match: DI takes 4 T-states, LD A,n 7 and OUT (n),A 11 (UM0080), and each
+// port written at the tick the run's gathering lists it at. The ULA delays a
+// write to an even port only while it draws the screen, from "cycle 14335"
+// after the interrupt (16K/48K reference), and the emulator stands a
+// Spectrum at its interrupt as it powers on, so nothing delays these.
 #[test]
 fn a_count_counts_each_place_by_its_whole_address_however_often() {
     let program = [
@@ -4080,29 +4409,30 @@ fn a_count_counts_each_place_by_its_whole_address_however_often() {
             "ticks": 1000,
             "until": [{ "execute": 9 }],
             "count": [{ "execute": 0, "to": 9 }, { "out": "&FE", "mask": "&01" }],
+            "gather": [{ "out": "&FE", "mask": "&01" }],
         }),
     );
     assert_eq!(ran["stopped"], "matched", "{ran}");
+    let out = |index: usize| &ran["gathered"][index]["tick"];
     assert_eq!(
         ran["counted"],
         json!([
-            { "execute": "&0000", "count": 1 },
-            { "execute": "&0001", "count": 1 },
-            { "execute": "&0003", "count": 1 },
-            { "execute": "&0005", "count": 1 },
-            { "execute": "&0007", "count": 1 },
-            { "out": "&05FE", "count": 1 },
-            { "out": "&06FE", "count": 1 },
-        ])
+            { "tick": 0, "execute": "&0000", "bytes": "F3", "count": 1 },
+            { "tick": 4, "execute": "&0001", "bytes": "3E05", "count": 1 },
+            { "tick": 11, "execute": "&0003", "bytes": "D3FE", "count": 1 },
+            { "tick": 22, "execute": "&0005", "bytes": "3E06", "count": 1 },
+            { "tick": 29, "execute": "&0007", "bytes": "D3FE", "count": 1 },
+            { "tick": out(0), "out": "&05FE", "pc": "&0003", "count": 1 },
+            { "tick": out(1), "out": "&06FE", "pc": "&0007", "count": 1 },
+        ]),
+        "{ran}"
     );
     let jump = json!([{ "execute": 9 }]);
+    let jumped = |count: u64, tick: &Value| json!([{ "tick": tick, "execute": "&0009", "bytes": "18FE", "count": count }]);
     let ran = session.run(&handle, json!({ "ticks": 12000, "count": jump }));
     assert_eq!(
         (&ran["ticks"], &ran["counted"]),
-        (
-            &json!(12000),
-            &json!([{ "execute": "&0009", "count": 1000 }])
-        ),
+        (&json!(12000), &jumped(1000, &json!(40))),
         "{ran}"
     );
     let ran = session.run(
@@ -4110,26 +4440,105 @@ fn a_count_counts_each_place_by_its_whole_address_however_often() {
         json!({ "ticks": 120, "count": jump, "gather": jump }),
     );
     assert_eq!(seen(&ran["gathered"]).len(), 10, "{ran}");
-    assert_eq!(ran["counted"], json!([{ "execute": "&0009", "count": 10 }]));
+    assert_eq!(ran["counted"], jumped(10, &json!(40 + 12000)));
+}
+
+// The program writes RET at &9001 and INC A at &9000 and calls them, then
+// writes INC B over INC A and calls them again. An instruction counted keeps
+// the bytes the processor fetched as it first began there, its opcodes and
+// its operands: an address after ED's opcode, and a displacement before a
+// DD CB instruction's own opcode, which follows it (UM0080); of a chain of
+// DD prefixes, one instruction, since "no interrupts are accepted during the
+// execution of these sequences" ("The Undocumented Z80 Documented", Sean
+// Young, 5.5), the first four bytes.
+#[test]
+fn an_instruction_counted_keeps_the_bytes_it_first_ran() {
+    let program = [
+        &[
+            DI, LD_SP, 0x00, 0x80, LD_HL, 0x01, 0x90, LD_AT_HL, RET, DEC_HL,
+        ][..],
+        &[
+            LD_AT_HL, INC_A, CALL, 0x00, 0x90, LD_AT_HL, 0x04, CALL, 0x00, 0x90,
+        ],
+        &LD_BC_TO,
+        &[0x02, 0x90],
+        &[
+            PREFIX_DD, PREFIX_DD, PREFIX_DD, PREFIX_DD, LD_HL, 0x34, 0x12,
+        ],
+        &[PREFIX_DD, BIT_0_AT_HL[0], 0x02, BIT_0_AT_HL[1], HALT],
+    ]
+    .concat();
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &program);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let ran = session.run(
+            &handle,
+            json!({ "ticks": 1000, "count": [{ "execute": 0, "to": "&FFFF" }] }),
+        );
+        assert_eq!(ran["stopped"], "halted", "{machine}: {ran}");
+        let counted: Vec<(u64, &str, u64)> = ran["counted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|counted| {
+                (
+                    after_ampersand(&counted["execute"], 4),
+                    counted["bytes"].as_str().unwrap(),
+                    counted["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (0x0000, "F3", 1),
+                (0x0001, "310080", 1),
+                (0x0004, "210190", 1),
+                (0x0007, "36C9", 1),
+                (0x0009, "2B", 1),
+                (0x000A, "363C", 1),
+                (0x000C, "CD0090", 1),
+                (0x000F, "3604", 1),
+                (0x0011, "CD0090", 1),
+                (0x0014, "ED430290", 1),
+                (0x0018, "DDDDDDDD", 1),
+                (0x001F, "DDCB0246", 1),
+                (0x0023, "76", 1),
+                (0x9000, "3C", 2),
+                (0x9001, "C9", 2),
+            ],
+            "{machine}: {ran}"
+        );
+        assert_eq!(session.peek(&handle, json!("&9000"), 1), "04");
+    }
 }
 
 // The stand-in firmware is zeros, NOPs from &0000 on, each beginning at an
-// address of its own; interrupts are disabled at power-on.
+// address of its own; interrupts are disabled at power-on. A NOP takes 4
+// T-states (UM0080), and nothing holds the processor in a Spectrum's ROM.
 #[test]
 fn a_count_that_fills_stops_and_the_next_run_counts_on() {
     let roms = Roms::all();
     let mut session = Session::start(&roms);
-    let handle = session.open("cpc464");
+    let handle = session.open("spectrum48");
     let counting = json!([{ "execute": 0, "to": "&3FFF" }]);
-    for first in [0, 512] {
-        let ran = session.run(&handle, json!({ "frames": 1, "count": counting }));
+    for first in [0, 256] {
+        let ran = session.run(&handle, json!({ "ticks": 2000, "count": counting }));
         assert_eq!(
             (&ran["stopped"], &ran["pc"]),
-            (&json!("full"), &ampersand(first + 512)),
+            (&json!("full"), &ampersand(first + 256)),
             "{ran}"
         );
-        let expected: Vec<Value> = (first..first + 512)
-            .map(|address| json!({ "execute": ampersand(address), "count": 1 }))
+        let expected: Vec<Value> = (first..first + 256)
+            .map(|address| {
+                json!({
+                    "tick": 4 * u64::from(address),
+                    "execute": ampersand(address),
+                    "bytes": "00",
+                    "count": 1,
+                })
+            })
             .collect();
         assert_eq!(ran["counted"], json!(expected));
     }
@@ -5144,6 +5553,9 @@ fn the_journal_made_again_makes_the_machine_again() {
                 "frames": 2,
                 "until": [{ "write": "&9100" }],
                 "gather": [{ "write": "&9000", "to": "&9010" }],
+                "gather_last": true,
+                "count": [{ "write": "&9000", "to": "&90FF" }],
+                "count_by": "pc",
             }),
         ),
     ] {
@@ -5271,7 +5683,9 @@ fn the_journal_writes_addresses_after_an_ampersand() {
         "ticks": 100,
         "until": [{ "execute": 4096, "to": "#1FFF" }],
         "gather": [{ "write": "$9000", "to": "&9000" }, { "out": 254, "mask": 1 }],
+        "gather_last": true,
         "count": [{ "in": "#FE", "mask": "0x1" }],
+        "count_by": "pc",
     });
     session.run(&handle, ran);
     session.answer(
@@ -5300,7 +5714,9 @@ fn the_journal_writes_addresses_after_an_ampersand() {
                 "ticks": 100,
                 "until": [{ "execute": "&1000", "to": "&1FFF" }],
                 "gather": [{ "write": "&9000" }, { "out": "&00FE", "mask": "&0001" }],
+                "gather_last": true,
                 "count": [{ "in": "&00FE", "mask": "&0001" }],
+                "count_by": "pc",
             }),
             json!({
                 "address": "&0100",
@@ -5724,7 +6140,13 @@ fn the_spectrums_frame_count_is_written_by_its_interrupt_handler() {
 // The frame's interrupt is answered at &0038 once a frame, and MASK-INT
 // writes FRAMES from &003E once each time; FRAMES is "incremented every 20
 // ms" (The Complete Spectrum ROM Disassembly, 0038). Counted over fifty
-// frames, both are fifty, and FRAMES is fifty on.
+// frames, both are fifty, and FRAMES is fifty on. Between the first of each,
+// PUSH AF, PUSH HL, LD HL,(nn) and INC HL take 11, 11, 16 and 6 T-states
+// (UM0080): fetched from the ROM, and reading FRAMES a few dozen T-states
+// after the interrupt, long before "cycle 14335", the first at which the ULA
+// delays the processor, since "when the border is being drawn ... no delays
+// occur" (comp.sys.sinclair FAQ, 16K/48K reference). The two instructions
+// counted are PUSH AF and LD (nn),HL.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn the_spectrums_interrupt_handler_is_counted_once_a_frame() {
@@ -5741,9 +6163,13 @@ fn the_spectrums_interrupt_handler_is_counted_once_a_frame() {
         &handle,
         json!({ "frames": 50, "count": [{ "execute": "&0038" }, { "execute": "&003E" }] }),
     );
+    let first = ran["counted"][0]["tick"].as_u64().unwrap();
     assert_eq!(
         ran["counted"],
-        json!([{ "execute": "&0038", "count": 50 }, { "execute": "&003E", "count": 50 }]),
+        json!([
+            { "tick": first, "execute": "&0038", "bytes": "F5", "count": 50 },
+            { "tick": first + 11 + 11 + 16 + 6, "execute": "&003E", "bytes": "22785C", "count": 50 },
+        ]),
         "{ran}"
     );
     assert_eq!(frames(&mut session), before.wrapping_add(50));
@@ -5844,6 +6270,91 @@ fn a_spectrum_rom_routine_called_returns_what_its_disassembly_says() {
         (&json!(0x40), &json!(0x01), &json!(5))
     );
     assert_eq!(cpu["sp"], before["sp"]);
+}
+
+// CL-LINE, at &0E44 in the 48K ROM, "will clear the bottom B lines of the
+// display", and CL-ALL calls it with B &18 to "'clear' the 24 lines of the
+// display" (The Complete Spectrum ROM Disassembly, as SkoolKit gives it,
+// https://skoolkid.github.io/rom/asm/0E44.html and
+// https://skoolkid.github.io/rom/asm/0DAF.html), the 6912 bytes the ULA
+// reads to display the screen (comp.sys.sinclair FAQ, 16K/48K reference,
+// https://worldofspectrum.org/faq/reference/48kreference.htm). For each of
+// the eight pixel lines and each of the three thirds, LD (HL),$00 at &0E59
+// clears "the first character", from &4000, where CL-ADDR at &0E9B puts the
+// top line, and LDIR at &0E5C "all the other characters", 255 more of the
+// 256 "for a 'third'", 6144 bytes; CL-ATTR at &0E88 finds the first
+// attribute at &5800 and thirty-two to a line, 768, and LD (HL),A at &0E80
+// sets the first and LDIR at &0E82 "all the attribute bytes" after it.
+// Counted by pc, the writes to the screen are those four instructions, each
+// first writing where the disassembly says. Each instruction counted keeps
+// the bytes the ROM holds there, BIT 0,(IY+$02) among them, its opcode after
+// its displacement, and the routine ends with POP BC, LD C,$21 and RET.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_count_by_pc_names_the_instructions_that_clear_the_spectrums_screen() {
+    let roms = firmware();
+    let rom = fs::read(roms.join("spectrum48.rom")).expect("the firmware");
+    let mut session = Session::reading(&roms);
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 150 }));
+    let routine = json!([{ "execute": "&0E44", "to": "&0E87" }]);
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&0E44",
+            "values": { "cpu.b": 24 },
+            "count": [{ "execute": "&0E44", "to": "&0E87" }, { "write": "&4000", "to": "&5AFF" }],
+            "count_by": "pc",
+            "gather": routine,
+            "gather_last": true,
+        }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    let counted = told(&called["counted"]);
+    let writes: Vec<(u64, Option<u64>, u64)> = counted
+        .iter()
+        .filter(|told| KINDS[told.kind] == "write")
+        .map(|told| (told.address, told.pc, told.count))
+        .collect();
+    assert_eq!(
+        writes,
+        [
+            (0x4000, Some(0x0E59), 24),
+            (0x4001, Some(0x0E5C), 6120),
+            (0x5800, Some(0x0E80), 1),
+            (0x5801, Some(0x0E82), 767),
+        ],
+        "{called}"
+    );
+    let instructions: BTreeMap<u64, &str> = called["counted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|counted| {
+            let address = after_ampersand(counted.get("execute")?, 4);
+            Some((address, counted["bytes"].as_str().unwrap()))
+        })
+        .collect();
+    for (&address, &bytes) in &instructions {
+        let start = usize::try_from(address).unwrap();
+        let held = &rom[start..start + bytes.len() / 2];
+        assert_eq!(bytes_of(bytes), held, "&{address:04X}");
+    }
+    for (address, bytes) in [
+        (0x0E44, "C5"),
+        (0x0E45, "CD9B0E"),
+        (0x0E59, "3600"),
+        (0x0E5C, "EDB0"),
+        (0x0E74, "3A8D5C"),
+        (0x0E77, "FDCB0246"),
+    ] {
+        assert_eq!(instructions.get(&address), Some(&bytes), "&{address:04X}");
+    }
+    let gathered = seen(&called["gathered"]);
+    assert_eq!(gathered.len(), 128, "{called}");
+    let ending: Vec<u64> = gathered[125..].iter().map(|seen| seen.1).collect();
+    assert_eq!(ending, [0x0E84, 0x0E85, 0x0E87], "{called}");
 }
 
 // The emulator's command line boots a machine for as many of its frames, its

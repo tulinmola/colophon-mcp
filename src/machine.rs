@@ -29,7 +29,7 @@ pub use crate::emulator::{
     mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_READ as READ,
     mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT,
     mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
-    mcp_run_t as Run,
+    mcp_place_t as Place, mcp_run_t as Run,
 };
 
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
@@ -47,13 +47,20 @@ const _: () = {
     }
 };
 
-// A watch holds the conditions, the room for matches and the counts it is
-// given as pointers, so it borrows them for as long as it lives, and the
-// bridge never reaches past any of them.
+// A watch holds the conditions, the room for matches, the counts and the
+// room for places it is given as pointers, so it borrows them for as long as
+// it lives, and the bridge never reaches past any of them.
 pub struct Watch<'a> {
     watch: mcp_watch_t,
-    _borrowed: PhantomData<(&'a [Condition], &'a mut [Match], &'a mut [u32])>,
+    _borrowed: PhantomData<Borrowed<'a>>,
 }
+
+type Borrowed<'a> = (
+    &'a [Condition],
+    &'a mut [Match],
+    &'a mut [u32],
+    &'a mut [Place],
+);
 
 impl<'a> Watch<'a> {
     // The counts are laid out as mcp_watch_t says and all zero where a
@@ -62,6 +69,7 @@ impl<'a> Watch<'a> {
         conditions: &'a [Condition],
         matches: &'a mut [Match],
         counts: &'a mut [u32],
+        places: &'a mut [Place],
         most_gathered: u32,
         most_counted: u32,
     ) -> Watch<'a> {
@@ -88,11 +96,25 @@ impl<'a> Watch<'a> {
         if counting {
             watch.counts = counts.as_mut_ptr();
         }
+        watch.places = places.as_mut_ptr();
+        watch.place_room = u32::try_from(places.len()).expect("room for every place");
         watch.most_counted = most_counted;
         Watch {
             watch,
             _borrowed: PhantomData,
         }
+    }
+
+    // The matches kept are the last there is room for, and the gathering
+    // never fills.
+    pub fn gather_last(&mut self) {
+        assert!(self.watch.room > 0, "room for the last match at least");
+        self.watch.gathers_last = true;
+    }
+
+    // An access is counted by where the instruction that made it begins.
+    pub fn count_by_pc(&mut self) {
+        self.watch.counts_by_pc = true;
     }
 
     // The run stops once the processor stands at pc with its stack at sp.
@@ -1151,7 +1173,7 @@ mod tests {
         for watched in [false, true] {
             // SAFETY: all-zero bytes are a value of every field of a match.
             let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 16];
-            let mut watch = Watch::new(&elsewhere, &mut matches, &mut [], 1, 0);
+            let mut watch = Watch::new(&elsewhere, &mut matches, &mut [], &mut [], 1, 0);
             let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[DI, NOP, HALT], NOP));
             let run = spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, watched.then_some(&mut watch));
             assert_eq!((run.ticks, run.frames, run.settled), (12, 0, true));
@@ -1225,7 +1247,7 @@ mod tests {
             });
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 400_000];
-        let mut watch = Watch::new(&gathering, &mut matches, &mut [], u32::MAX, 0);
+        let mut watch = Watch::new(&gathering, &mut matches, &mut [], &mut [], u32::MAX, 0);
         cpc.run(60, 120 * CPC_STANDARD_FRAME_TICKS, Some(&mut watch));
         let count = watch.seen().match_count as usize;
         assert!(count < matches.len(), "{count} matches");
@@ -1265,7 +1287,7 @@ mod tests {
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 100_000];
         let mut finding = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
-        let mut watch = Watch::new(&writes, &mut matches, &mut [], u32::MAX, 0);
+        let mut watch = Watch::new(&writes, &mut matches, &mut [], &mut [], u32::MAX, 0);
         finding.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
         let count = watch.seen().match_count as usize;
         let followed = matches[..count]
@@ -1274,12 +1296,40 @@ mod tests {
             .expect("an interrupt's push");
         assert!(followed > 0 && matches[followed + 1].response);
         let mut filling = Spectrum::new(forty_eight_k(), rom(&program, LD_AT_HL_A));
-        let mut watch = Watch::new(&writes, &mut matches, &mut [], followed as u32, 0);
+        let mut watch = Watch::new(&writes, &mut matches, &mut [], &mut [], followed as u32, 0);
         let run = filling.run(2, 4 * SPECTRUM_FRAME_TICKS, Some(&mut watch));
         let seen = *watch.seen();
         assert!(seen.full && run.settled);
         assert_eq!(seen.match_count as usize, followed + 2);
         assert_eq!(filling.machine().cpu.pc, 0x0038);
+    }
+
+    // A chain of DD prefixes is one instruction, since "no interrupts are
+    // accepted during the execution of these sequences" ("The Undocumented Z80
+    // Documented", Sean Young, 5.5), and a place keeps the first four bytes of
+    // it; a fifth would be written past them, where `make test-sanitized`
+    // sees it.
+    #[test]
+    fn a_place_keeps_the_first_four_bytes_of_a_chain_of_prefixes() {
+        let program = [PREFIX_DD; 5]
+            .into_iter()
+            .chain([LD_HL, 0x34, 0x12, DI, HALT])
+            .collect::<Vec<_>>();
+        let mut spectrum = Spectrum::new(forty_eight_k(), rom(&program, HALT));
+        let everywhere = [Condition {
+            kind: EXECUTE,
+            first: 0,
+            last: 0xFFFF,
+            mask: 0,
+            list: COUNT,
+        }];
+        let mut counts = vec![0; KINDS.len() * COUNTS_PER_KIND];
+        // SAFETY: all-zero bytes are a value of every field of a place.
+        let mut places = vec![unsafe { std::mem::zeroed::<Place>() }; 3];
+        let mut watch = Watch::new(&everywhere, &mut [], &mut counts, &mut places, 0, u32::MAX);
+        spectrum.run(1, SPECTRUM_FRAME_TICKS, Some(&mut watch));
+        assert_eq!(watch.seen().counted, 3);
+        assert_eq!((places[0].length, places[0].bytes), (4, [PREFIX_DD; 4]));
     }
 
     // Every value set could write, swept across machines kept busy with every
@@ -1634,11 +1684,13 @@ mod tests {
     }
 
     // Runs with a watch on every instruction, every access and every port,
-    // gathering without end into room for a few and counting each, and
-    // answers whether the run saw more than there was room for, which are
-    // counted and never kept.
+    // gathering without end into room for a few and counting each, at room
+    // for a few places, and answers whether the run saw more than there was
+    // room for: matches past it are counted and never kept, or kept round
+    // and round where the last are gathered, and places past it counted and
+    // never kept. Every other run gathers the last and counts by pc.
     // The room is on the heap, where AddressSanitizer sees past its end.
-    fn watching_everything(run: impl FnOnce(Option<&mut Watch>) -> Run) -> bool {
+    fn watching_everything(last: bool, run: impl FnOnce(Option<&mut Watch>) -> Run) -> bool {
         let conditions: Vec<Condition> = [GATHER, COUNT]
             .into_iter()
             .flat_map(|list| {
@@ -1654,16 +1706,30 @@ mod tests {
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
         let mut counts = vec![0; KINDS.len() * COUNTS_PER_KIND];
-        let mut watch = Watch::new(&conditions, &mut matches, &mut counts, u32::MAX, u32::MAX);
+        // SAFETY: all-zero bytes are a value of every field of a place.
+        let mut places = vec![unsafe { std::mem::zeroed::<Place>() }; 4];
+        let mut watch = Watch::new(
+            &conditions,
+            &mut matches,
+            &mut counts,
+            &mut places,
+            u32::MAX,
+            u32::MAX,
+        );
+        if last {
+            watch.gather_last();
+            watch.count_by_pc();
+        }
         run(Some(&mut watch));
-        watch.seen().match_count > watch.seen().room
+        let seen = watch.seen();
+        seen.match_count > seen.room && seen.counted > seen.place_room
     }
 
     fn sweep_cpc(cpc: &mut Cpc, contexts: &[(&str, &[(&str, Value)])]) -> (usize, usize) {
         // SAFETY: as in sweep.
         let standing = unsafe { std::ptr::read(cpc.machine()) };
         let trials = trials(&standing.encode(), contexts);
-        let mut overflowed = 0;
+        let (mut watched, mut overflowed) = (0, 0);
         let (ran, checked_out) = sweep(&standing, &trials, |written| {
             // SAFETY: as in sweep; restored into the machine it was taken from.
             *cpc.machine_mut() = unsafe { std::ptr::read(&standing) };
@@ -1673,7 +1739,10 @@ mod tests {
             }
             *cpc.machine_mut() = written;
             cpc.remap();
-            if watching_everything(|watch| cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 2, watch)) {
+            watched += 1;
+            if watching_everything(watched % 2 == 0, |watch| {
+                cpc.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 2, watch)
+            }) {
                 overflowed += 1;
             }
             true
@@ -1736,7 +1805,7 @@ mod tests {
             // SAFETY: as in sweep.
             let standing = unsafe { std::ptr::read(spectrum.machine()) };
             let trials = trials(&standing.encode(), &[("", &[])]);
-            let mut overflowed = 0;
+            let (mut watched, mut overflowed) = (0, 0);
             let (ran, checked_out) = sweep(&standing, &trials, |written| {
                 // SAFETY: as for a CPC.
                 *spectrum.machine_mut() = unsafe { std::ptr::read(&standing) };
@@ -1746,7 +1815,8 @@ mod tests {
                 }
                 *spectrum.machine_mut() = written;
                 spectrum.seek();
-                if watching_everything(|watch| {
+                watched += 1;
+                if watching_everything(watched % 2 == 0, |watch| {
                     spectrum.run(u32::MAX, SPECTRUM_FRAME_TICKS / 2, watch)
                 }) {
                     overflowed += 1;
@@ -1942,7 +2012,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a count of zero for every kind and every address")]
     fn a_watch_that_counts_refuses_to_go_without_its_counts() {
-        Watch::new(&counting_everything(), &mut [], &mut [], 1, 1);
+        Watch::new(&counting_everything(), &mut [], &mut [], &mut [], 1, 1);
     }
 
     #[test]
@@ -1950,7 +2020,7 @@ mod tests {
     fn a_watch_that_counts_refuses_counts_already_begun() {
         let mut counts = vec![0; KINDS.len() * COUNTS_PER_KIND];
         counts[0x38] = 1;
-        Watch::new(&counting_everything(), &mut [], &mut counts, 1, 1);
+        Watch::new(&counting_everything(), &mut [], &mut counts, &mut [], 1, 1);
     }
 
     #[test]
