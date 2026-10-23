@@ -7,6 +7,20 @@
 #include "mcp.h"
 #include "watch.h"
 
+/* Whether the tick wrote one of the PSG's registers. The core runs the chip on
+   every access to the PPI, which the board decodes from A11 low, and port C's
+   top two bits are the chip's BDIR and BC1: each access that leaves them
+   giving it WRITE writes port A's byte to the selected register
+   (colophon-emulator's cpc.c, io_write, io_read and run_psg, at 679ba55). A
+   read held by WAIT writes it again on every tick it is held, the same byte
+   to the same register, and is seen once, as it begins. */
+static bool psg_written(const cpc_t *cpc, uint64_t before, uint64_t pins) {
+  bool accessed = mcp_request_began(before, pins, Z80_IORQ | Z80_WR) ||
+                  mcp_request_began(before, pins, Z80_IORQ | Z80_RD);
+  return accessed && (z80_address(pins) & 0x0800) == 0 &&
+         ppi_output_of(&cpc->ppi, PPI_PORT_C) >> 6 == PSG_WRITE;
+}
+
 /* Ticks the machine, unless the watch stops it first. */
 static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
   if (watch != NULL && mcp_watch_before(watch, &cpc->cpu, z80_instruction_complete(&cpc->cpu),
@@ -22,6 +36,10 @@ static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
   }
   if (watch != NULL) {
     mcp_watch_after(watch, &cpc->cpu, &cpc->monitor, before, pins, run->ticks);
+    if (psg_written(cpc, before, pins)) {
+      mcp_watch_psg(watch, &cpc->monitor, run->ticks, cpc->psg.selected,
+                    ppi_output_of(&cpc->ppi, PPI_PORT_A));
+    }
   }
   return true;
 }

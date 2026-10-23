@@ -26,15 +26,15 @@ use crate::emulator::{
 
 pub use crate::emulator::{
     mcp_condition_t as Condition, mcp_kind_t as Kind, mcp_kind_t_MCP_EXECUTE as EXECUTE,
-    mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_READ as READ,
-    mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT,
-    mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
-    mcp_place_t as Place, mcp_run_t as Run,
+    mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_PSG as PSG,
+    mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List,
+    mcp_list_t_MCP_COUNT as COUNT, mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL,
+    mcp_match_t as Match, mcp_place_t as Place, mcp_run_t as Run,
 };
 
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
 // are laid out.
-pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT];
+pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT, PSG];
 
 pub const COUNTS_PER_KIND: usize = MCP_COUNTS_PER_KIND as usize;
 

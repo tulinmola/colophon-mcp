@@ -41,11 +41,13 @@ typedef enum {
   MCP_IN,
   /* The processor writing such a port. */
   MCP_OUT,
+  /* One of a CPC's PSG registers written, by its number. */
+  MCP_PSG,
 } mcp_kind_t;
 
-/* How many kinds mcp_kind_t gives, and how many places each can name: an
-   address or a port, sixteen bits of either. */
-#define MCP_KINDS 5
+/* How many kinds mcp_kind_t gives, and how many places each can name at
+   most: an address or a port, sixteen bits of either. */
+#define MCP_KINDS 6
 #define MCP_COUNTS_PER_KIND 0x10000
 
 /* The list a condition is given in, which says what its matches do. */
@@ -60,9 +62,9 @@ typedef enum {
 
 typedef struct {
   mcp_kind_t kind;
-  /* The first address of the range, or the port. */
+  /* The first address or register of the range, or the port. */
   uint16_t first;
-  /* The last address of the range. */
+  /* The last address or register of the range. */
   uint16_t last;
   /* The bits of a port's address that its device decodes. */
   uint16_t mask;
@@ -74,10 +76,10 @@ typedef struct {
      that put an access on the bus has run. */
   uint64_t tick;
   mcp_kind_t kind;
-  /* The address, or the port. */
+  /* The address, the port, or the register. */
   uint16_t address;
-  /* The byte read or written, a port's as the processor took it; 0 for an
-     instruction. */
+  /* The byte read or written, a port's as the processor took it and a
+     register's as port A gave it; 0 for an instruction. */
   uint8_t value;
   /* Where the instruction that made an access begins, unless the response to
      an interrupt made it. */

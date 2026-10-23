@@ -20,7 +20,8 @@ use tokio::sync::oneshot;
 use crate::fields::hexadecimal_number;
 use crate::keys::Key;
 use crate::machine::{
-    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, Place, READ, Run, UNTIL, WRITE,
+    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, PSG, Place, READ, Run, UNTIL,
+    WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, TAPES, Watched, Watching,
@@ -310,9 +311,23 @@ fn ram_address(value: &Value) -> Result<u32, String> {
 
 const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
                                {\"write\": address}, each with \"to\" and the last address if it \
-                               is a range, or {\"in\": port, \"mask\": bits} or {\"out\": port, \
+                               is a range, {\"in\": port, \"mask\": bits} or {\"out\": port, \
                                \"mask\": bits}, the mask being the bits of the port's address that \
-                               its device decodes";
+                               its device decodes, or on a CPC {\"psg\": register}, with \"to\" and \
+                               the last register if it is a range";
+
+const REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
+
+// "The PSG has 16 internal registers" ("AY-3-8912 PSG", Kevin Thacker's
+// cpctech,
+// https://web.archive.org/web/20220626135348/https://cpctech.cpcwiki.de/docs/psg.html).
+fn register(value: &Value) -> Result<u16, String> {
+    value
+        .as_u64()
+        .filter(|number| *number <= 15)
+        .and_then(|number| u16::try_from(number).ok())
+        .ok_or_else(|| format!("{value} is no register; {REGISTER_FORMS}"))
+}
 
 // A condition, kept once in a tool's $defs, as until, gather and count all
 // take lists of them.
@@ -325,20 +340,22 @@ impl JsonSchema for ConditionForms {
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let address = generator.subschema_for::<AddressForms>().to_value();
-        let condition = |kind: &str, other: &str, required: &[&str]| {
+        let register = json!({ "type": "integer", "minimum": 0, "maximum": 15 });
+        let condition = |kind: &str, other: &str, schema: &Value, required: &[&str]| {
             json!({
                 "type": "object",
-                "properties": { kind: address, other: address },
+                "properties": { kind: schema, other: schema },
                 "required": required,
                 "additionalProperties": false,
             })
         };
         let branches = [
-            condition("execute", "to", &["execute"]),
-            condition("read", "to", &["read"]),
-            condition("write", "to", &["write"]),
-            condition("in", "mask", &["in", "mask"]),
-            condition("out", "mask", &["out", "mask"]),
+            condition("execute", "to", &address, &["execute"]),
+            condition("read", "to", &address, &["read"]),
+            condition("write", "to", &address, &["write"]),
+            condition("in", "mask", &address, &["in", "mask"]),
+            condition("out", "mask", &address, &["out", "mask"]),
+            condition("psg", "to", &register, &["psg"]),
         ];
         Schema::try_from(json!({ "oneOf": branches })).expect("an object is a schema")
     }
@@ -352,12 +369,13 @@ fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
     })
 }
 
-const KIND_NAMES: [(&str, Kind); 5] = [
+const KIND_NAMES: [(&str, Kind); 6] = [
     ("execute", EXECUTE),
     ("read", READ),
     ("write", WRITE),
     ("in", IN),
     ("out", OUT),
+    ("psg", PSG),
 ];
 
 fn condition(value: &Value, list: List) -> Result<Condition, String> {
@@ -378,7 +396,8 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
             ),
         });
     };
-    let first = address(&fields[name]).map_err(|problem| format!("{name} {problem}"))?;
+    let parse: fn(&Value) -> Result<u16, String> = if kind == PSG { register } else { address };
+    let first = parse(&fields[name]).map_err(|problem| format!("{name} {problem}"))?;
     let port = kind == IN || kind == OUT;
     let other = if port { "mask" } else { "to" };
     if let Some(unknown) = fields.keys().find(|key| *key != name && *key != other) {
@@ -393,12 +412,21 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
     } else {
         let last = fields
             .get("to")
-            .map(|to| address(to).map_err(|problem| format!("to {problem}")))
+            .map(|to| parse(to).map_err(|problem| format!("to {problem}")))
             .transpose()?
             .unwrap_or(first);
         if last < first {
+            let shown = |at: u16| {
+                if kind == PSG {
+                    at.to_string()
+                } else {
+                    Hexadecimal::address(at).to_string()
+                }
+            };
             return Err(format!(
-                "{value} runs back from &{first:04X} to &{last:04X}, and a range runs upward"
+                "{value} runs back from {} to {}, and a range runs upward",
+                shown(first),
+                shown(last)
             ));
         }
         (last, 0)
@@ -520,26 +548,27 @@ fn journaled<T: Serialize>(request: &T) -> Value {
 }
 
 // Each list of conditions a request gave, as the journal keeps it, whatever
-// form it was given in: its addresses after &, and a range of one address as
-// that address.
+// form it was given in: its addresses after &, its registers by their
+// numbers, and a range of one address or register as that one.
 fn journal_conditions(arguments: &mut Value, conditions: &[Condition]) {
     let written = |condition: &Condition| {
         let (name, _) = KIND_NAMES
             .iter()
             .find(|(_, kind)| *kind == condition.kind)
             .expect("every kind is named");
+        let written_as = |number: u16| {
+            if condition.kind == PSG {
+                json!(number)
+            } else {
+                json!(Hexadecimal::address(number))
+            }
+        };
         let mut fields = Map::new();
-        fields.insert(
-            (*name).to_owned(),
-            json!(Hexadecimal::address(condition.first)),
-        );
+        fields.insert((*name).to_owned(), written_as(condition.first));
         if condition.kind == IN || condition.kind == OUT {
-            fields.insert(
-                "mask".to_owned(),
-                json!(Hexadecimal::address(condition.mask)),
-            );
+            fields.insert("mask".to_owned(), written_as(condition.mask));
         } else if condition.last != condition.first {
-            fields.insert("to".to_owned(), json!(Hexadecimal::address(condition.last)));
+            fields.insert("to".to_owned(), written_as(condition.last));
         }
         Value::Object(fields)
     };
@@ -674,7 +703,7 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
-    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
+    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -690,13 +719,13 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
-    /// What count counts an access by: "address", the byte's address or the port's, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
+    /// What count counts an access by: "address", the byte's address, the port's or the PSG register's number, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
@@ -770,7 +799,7 @@ struct TypeRequest {
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum CountBy {
-    /// The byte's address, or the port's.
+    /// The byte's address, the port's, or the PSG register's number.
     Address,
     /// Where the instruction that made the access begins.
     Pc,
@@ -1137,7 +1166,11 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     out: Option<Hexadecimal>,
-    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took.
+    /// One of a CPC's PSG registers written, by its number, from 0 to 15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    psg: Option<u16>,
+    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took; for a register of the PSG, the byte the PPI's port A gave it, of which a register narrower than eight bits keeps only its low bits, as psg.registers then reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     value: Option<Hexadecimal>,
@@ -1162,6 +1195,7 @@ impl Matched {
             write: at(WRITE),
             r#in: at(IN),
             out: at(OUT),
+            psg: (seen.kind == PSG).then_some(seen.address),
             value: access.then_some(Hexadecimal::byte(seen.value)),
             pc: (access && !seen.response).then_some(Hexadecimal::address(seen.pc)),
             beam_x: seen.beam_x,
@@ -1195,6 +1229,10 @@ struct Counted {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     out: Option<Hexadecimal>,
+    /// One of a CPC's PSG registers written, by its number, from 0 to 15; counted by pc, the register of the place's first match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    psg: Option<u16>,
     /// Where the instruction that made the place's first match begins, in hexadecimal after &, which counted by pc is the place itself; not given for instructions, whose address is their own, or when the response to an interrupt made the access.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
@@ -1219,6 +1257,7 @@ impl Counted {
             write: at(WRITE),
             r#in: at(IN),
             out: at(OUT),
+            psg: (first.kind == PSG).then_some(first.address),
             pc: (access && !first.response).then_some(Hexadecimal::address(first.pc)),
             bytes: (!access).then(|| digit_pairs(&place.bytes[..usize::from(place.length)])),
             count: *count,
@@ -1244,7 +1283,7 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads and port writes, each by address, or by pc.
+    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes and the PSG's registers written, each by address or register, or by pc.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
@@ -1706,6 +1745,7 @@ impl Server {
             request.gather.as_ref(),
             request.count.as_ref(),
         )?;
+        machine.watchable(&conditions)?;
         kept_as_asked(
             request.gather.as_ref(),
             request.gather_last,
@@ -1817,6 +1857,7 @@ impl Server {
         journal_conditions(&mut arguments, &conditions);
         let values = request.values.unwrap_or_default();
         let (machine, orders) = self.thread(&request.handle)?;
+        machine.watchable(&conditions)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
             let tick = built.tick();
@@ -2136,7 +2177,7 @@ impl Server {
         }))
     }
 
-    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a range of one address as that address, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a register of the PSG as a number, a range of one address or register as that one, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn journal(
         &self,

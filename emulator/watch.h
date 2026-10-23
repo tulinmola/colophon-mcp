@@ -14,9 +14,17 @@
 bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const monitor_t *monitor,
                       uint64_t tick);
 
+/* Whether a request first reaches the bus on this tick. */
+bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request);
+
 /* After a tick, given the bus before it and after it. */
 void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor,
                      uint64_t before, uint64_t pins, uint64_t tick);
+
+/* After a tick that wrote one of the PSG's registers: its number, and the
+ * byte it was given. */
+void mcp_watch_psg(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, uint8_t selected,
+                   uint8_t value);
 
 /* At the instruction a run ends before. */
 void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor, uint64_t tick);

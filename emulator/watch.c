@@ -134,7 +134,7 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
   return false;
 }
 
-static bool began(uint64_t before, uint64_t pins, uint64_t request) {
+bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request) {
   return (pins & request) == request && (before & request) != request;
 }
 
@@ -154,7 +154,7 @@ void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *moni
     watch->matches[watch->port_read_match].value = value;
   }
   bool opcode = (pins & Z80_M1) != 0;
-  if (began(before, pins, Z80_MREQ | Z80_RD)) {
+  if (mcp_request_began(before, pins, Z80_MREQ | Z80_RD)) {
     if (opcode && watch->fetched && cpu->prefix == 0) {
       /* An instruction's opcodes after its first are fetched with a prefix
          pending, since a prefix has not finished until the instruction it
@@ -168,17 +168,22 @@ void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *moni
     } else {
       see(watch, monitor, tick, MCP_READ, address, value, true, true);
     }
-  } else if (began(before, pins, Z80_MREQ | Z80_WR)) {
+  } else if (mcp_request_began(before, pins, Z80_MREQ | Z80_WR)) {
     see(watch, monitor, tick, MCP_WRITE, address, value, true, true);
-  } else if (began(before, pins, Z80_IORQ | Z80_RD)) {
+  } else if (mcp_request_began(before, pins, Z80_IORQ | Z80_RD)) {
     uint32_t match = watch->match_count;
     uint32_t slot = kept_at(watch, match);
     see(watch, monitor, tick, MCP_IN, address, value, true, true);
     watch->port_read_held = watch->match_count > match && slot < watch->room;
     watch->port_read_match = slot;
-  } else if (began(before, pins, Z80_IORQ | Z80_WR)) {
+  } else if (mcp_request_began(before, pins, Z80_IORQ | Z80_WR)) {
     see(watch, monitor, tick, MCP_OUT, address, value, true, true);
   }
+}
+
+void mcp_watch_psg(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, uint8_t selected,
+                   uint8_t value) {
+  see(watch, monitor, tick, MCP_PSG, selected, value, true, true);
 }
 
 void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor, uint64_t tick) {

@@ -1058,6 +1058,7 @@ const LD_AT_HL_A: u8 = 0x77;
 const LD_BC: u8 = 0x01;
 const LD_BC_TO: [u8; 2] = [0xED, 0x43];
 const LD_B: u8 = 0x06;
+const LD_C: u8 = 0x0E;
 const LD_E: u8 = 0x1E;
 const LD_E_A: u8 = 0x5F;
 const LD_HL: u8 = 0x21;
@@ -2707,6 +2708,151 @@ fn a_port_matches_on_the_bits_its_device_decodes() {
     );
 }
 
+// While bits 7 and 6 of the PPI's port C are 1 and 0, "the PSG will take the
+// data at PPI Port A and write it into the selected PSG register" ("AY-3-8912
+// PSG", Kevin Thacker's cpctech,
+// https://web.archive.org/web/20220626135348/https://cpctech.cpcwiki.de/docs/psg.html).
+// The routine at &0100 is that page's .write_to_psg, the register in C and
+// the byte in A, and the program first writes the page's %10000010, "Port A
+// output, Port B input, Port C output". The emulator runs the PSG at each
+// access to the PPI, by port C as the access leaves it (its cpc.c, run_psg),
+// so an OUT to port C, an IN from port B and the control word &0F write
+// again: D7 0 makes it "the control word for bit set/reset", D3 to D1 name
+// PC7, and D0 is "1 = Set". The mode word %10010010 makes port A an input,
+// after which "the internal latch is cleared in All Ports" (OKI's MSM82C55A-2
+// datasheet,
+// https://web.archive.org/web/20240918052821/https://cpctech.cpcwiki.de/docs/datasheet/msm82c55a.pdf),
+// so PC7 set once more gives the PSG an input's &FF (the emulator's ppi.h).
+// The Gate Array, &7Fxx, has A11 high, and the PPI answers A11 low.
+const WRITING_THROUGH_THE_PPI: [u8; 58] = [
+    DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_C, 1, LD_A, 0xFF, CALL,
+    0x00, 0x01, LD_C, 7, LD_A, 0x3E, CALL, 0x00, 0x01, LD_BC, 0x80, 0xF6, OUT_C_C[0], OUT_C_C[1],
+    LD_BC, 0x10, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_B, 0xF5, IN_A_C[0], IN_A_C[1], LD_BC, 0x00, 0xF6,
+    OUT_C_C[0], OUT_C_C[1], LD_BC, 0x0F, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x92, 0xF7,
+    OUT_C_C[0], OUT_C_C[1], LD_BC, 0x0F, 0xF7, OUT_C_C[0], OUT_C_C[1], HALT,
+];
+const WRITE_TO_PSG: [u8; 29] = [
+    LD_B, 0xF4, OUT_C_C[0], OUT_C_C[1], LD_BC, 0xC0, 0xF6, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x00,
+    0xF6, OUT_C_C[0], OUT_C_C[1], LD_B, 0xF4, OUT_C_A[0], OUT_C_A[1], LD_BC, 0x80, 0xF6,
+    OUT_C_C[0], OUT_C_C[1], LD_BC, 0x00, 0xF6, OUT_C_C[0], OUT_C_C[1], RET,
+];
+
+// Each match as its register, its byte and where the instruction that made it
+// begins.
+fn psg_writes(list: &Value) -> Vec<(u64, u64, u64)> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|seen| {
+            (
+                seen["psg"].as_u64().expect("a register"),
+                after_ampersand(&seen["value"], 2),
+                after_ampersand(&seen["pc"], 4),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_psg_write_is_matched_at_each_access_to_the_ppi_that_leaves_it_writing() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_THROUGH_THE_PPI);
+    roms.write_at("cpc6128.rom", 0x100, &WRITE_TO_PSG);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let registers = json!([{ "psg": 0, "to": 15 }]);
+    let ran = session.run(&handle, json!({ "frames": 1, "gather": registers }));
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        psg_writes(&ran["gathered"]),
+        [
+            (1, 0xFF, 0x0115),
+            (7, 0x3E, 0x0115),
+            (7, 0x3E, 0x001A),
+            (7, 0x3E, 0x0023),
+            (7, 0x3E, 0x002D),
+            (7, 0xFF, 0x0037),
+        ],
+        "{ran}"
+    );
+    // R1 "stores the most significant 4 bits of the period" (SOFT 968,
+    // Appendix IX), so it keeps &0F of &FF.
+    assert_eq!(session.inspect(&handle, "psg.registers[1]"), 0x0F);
+    assert_eq!(session.inspect(&handle, "psg.registers[7]"), 0xFF);
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        journal["entries"][1]["arguments"]["gather"],
+        json!([{ "psg": 0, "to": 15 }])
+    );
+
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 1, "until": [{ "psg": 7, "to": 7 }] }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &json!("&0117"))
+    );
+    assert_eq!(psg_writes(&ran["matched"]), [(7, 0x3E, 0x0115)]);
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        journal["entries"][1]["arguments"]["until"],
+        json!([{ "psg": 7 }])
+    );
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 1, "until": [{ "psg": 1 }, { "out": "&F680", "mask": "&FFFF" }] }),
+    );
+    let kinds: Vec<_> = ran["matched"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|seen| {
+            if seen.get("out").is_some() {
+                "out"
+            } else {
+                "psg"
+            }
+        })
+        .collect();
+    assert_eq!(kinds, ["out", "psg"], "{ran}");
+
+    let counted = |session: &mut Session, count_by: &str| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(
+            &handle,
+            json!({ "frames": 1, "count": registers, "count_by": count_by }),
+        );
+        ran["counted"]
+            .as_array()
+            .expect("a count")
+            .iter()
+            .map(|place| {
+                (
+                    place["psg"].as_u64().expect("a register"),
+                    after_ampersand(&place["pc"], 4),
+                    place["count"].as_u64().expect("a count"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        counted(&mut session, "address"),
+        [(1, 0x0115, 1), (7, 0x0115, 5)]
+    );
+    assert_eq!(
+        counted(&mut session, "pc"),
+        [
+            (7, 0x001A, 1),
+            (7, 0x0023, 1),
+            (7, 0x002D, 1),
+            (7, 0x0037, 1),
+            (1, 0x0115, 2),
+        ]
+    );
+}
+
 // Interrupt mode 1 pushes the program counter and runs from &0038 (UM0080),
 // where the handler writes a byte with LD (HL),n, takes interrupts again and
 // returns.
@@ -3302,6 +3448,42 @@ fn run_and_call_ask_for_nothing_they_can_go_without() {
     }
 }
 
+// Clients SHOULD follow $ref resolution "when validating tool inputs and
+// outputs against `inputSchema` and `outputSchema`" (2026-07-28, tools), so
+// the schema admits what the server takes; being the tool's reference, it
+// refuses what the server refuses.
+#[test]
+fn the_schema_of_a_condition_admits_what_the_server_takes() {
+    let roms = Roms::all();
+    let tools = tools(&mut Session::start(&roms));
+    let schema = input_schema(&tools, "run");
+    let fitting = |condition: &Value| {
+        let arguments = json!({ "handle": "cpc6128-1", "frames": 1, "until": [condition] });
+        fits(&arguments, &schema, &schema, "run")
+    };
+    for condition in [
+        json!({ "execute": "&0038" }),
+        json!({ "read": 1, "to": 2 }),
+        json!({ "write": "&C000", "to": "&FFFF" }),
+        json!({ "in": "&F500", "mask": "&0B00" }),
+        json!({ "out": "&7F00", "mask": "&C000" }),
+        json!({ "psg": 7 }),
+        json!({ "psg": 0, "to": 15 }),
+    ] {
+        if let Err(problem) = fitting(&condition) {
+            panic!("{condition}: {problem}");
+        }
+    }
+    for condition in [
+        json!({ "psg": 16 }),
+        json!({ "psg": "&07" }),
+        json!({ "psg": 1, "mask": 2 }),
+        json!({ "in": "&F500" }),
+    ] {
+        assert!(fitting(&condition).is_err(), "{condition}");
+    }
+}
+
 #[test]
 fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
     let roms = Roms::all();
@@ -3314,9 +3496,10 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         )
     };
     let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
-                 address}, each with \"to\" and the last address if it is a range, or {\"in\": \
-                 port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, the mask being the bits \
-                 of the port's address that its device decodes";
+                 address}, each with \"to\" and the last address if it is a range, {\"in\": port, \
+                 \"mask\": bits} or {\"out\": port, \"mask\": bits}, the mask being the bits of \
+                 the port's address that its device decodes, or on a CPC {\"psg\": register}, \
+                 with \"to\" and the last register if it is a range";
     assert_eq!(
         refused(&mut session, json!({ "read": 5, "out": 6 })),
         format!(
@@ -3358,6 +3541,33 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             "until[1]: {{\"execute\":1,\"mask\":2}} has mask, which execute does not take; \
              {forms}"
         )
+    );
+    let registers = "a register of the PSG is a number from 0 to 15";
+    assert_eq!(
+        refused(&mut session, json!({ "psg": 16 })),
+        format!("until[1]: psg 16 is no register; {registers}; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "psg": "&07" })),
+        format!("until[1]: psg \"&07\" is no register; {registers}; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "psg": 13, "to": 0 })),
+        format!(
+            "until[1]: {{\"psg\":13,\"to\":0}} runs back from 13 to 0, and a range runs upward; \
+             {forms}"
+        )
+    );
+    let no_psg = "a spectrum48 has no PSG, whose registers psg watches: its speaker is bit 4 of \
+                  its ULA's port, which {\"out\": \"&FE\", \"mask\": \"&01\"} watches, and a \
+                  cpc464, a cpc664 or a cpc6128 has a PSG";
+    assert_eq!(refused(&mut session, json!({ "psg": 0, "to": 13 })), no_psg);
+    assert_eq!(
+        session.refusal(
+            "call",
+            json!({ "handle": handle, "address": 0, "gather": [{ "psg": 7 }] })
+        ),
+        no_psg
     );
     let many = vec![json!({ "execute": 1 }); 17];
     assert_eq!(
@@ -6355,6 +6565,105 @@ fn a_count_by_pc_names_the_instructions_that_clear_the_spectrums_screen() {
     assert_eq!(gathered.len(), 128, "{called}");
     let ending: Vec<u64> = gathered[125..].iter().map(|seen| seen.1).collect();
     assert_eq!(ending, [0x0E84, 0x0E85, 0x0E87], "{called}");
+}
+
+// MC SOUND REGISTER, at &BD34, takes "the sound chip register number" in A
+// and "the data to send" in C (SOFT 968, The Amstrad 6128 Firmware Manual,
+// https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual, entry
+// 188), and writes it with an OUT (C),A after OR &80, at &087D in the 6128's
+// firmware: "PSG will write the data at PPI port A into the currently
+// selected register" (Bread80's unassembly of it, Machine.asm,
+// https://github.com/Bread80/CPC6128-Firmware-Source). R1, the coarse tune,
+// "stores the most significant 4 bits of the period" (SOFT 968, Appendix
+// IX).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_writes_its_psg_where_its_firmware_writes() {
+    let mut session = Session::reading(&firmware());
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        let called = session.answer(
+            "call",
+            json!({
+                "handle": handle,
+                "address": "&BD34",
+                "values": { "cpu.a": 1, "cpu.c": 255 },
+                "gather": [{ "psg": 0, "to": 15 }],
+            }),
+        );
+        assert_eq!(called["stopped"], "returned", "{machine}: {called}");
+        let written = psg_writes(&called["gathered"]);
+        let [(1, 0xFF, pc)] = written[..] else {
+            panic!("{machine}: {called}");
+        };
+        if machine == "cpc6128" {
+            assert_eq!(pc, 0x087D);
+        }
+        assert_eq!(
+            session.peek(&handle, json!(pc - 2), 4),
+            "F680ED79",
+            "{machine}"
+        );
+        assert_eq!(
+            session.inspect(&handle, "psg.registers[1]"),
+            0x0F,
+            "{machine}"
+        );
+    }
+}
+
+// SOUND QUEUE, at &BCAA, takes in HL "a sound program", whose bytes are the
+// channels, bit 0 for channel A, the amplitude envelope, the tone envelope,
+// the tone period, the noise period, the initial amplitude and the duration
+// in hundredths of a second; envelope 0 means "simply hold the initial
+// amplitude", and the program "must lie in the central 32K of RAM" (SOFT
+// 968, entry 142). The chip takes the period's low eight bits in R0 and its
+// top four in R1; R7's bits 0 to 5 run from "Channel A tone disable" to
+// "Channel C noise disable", and bit 6, for the keyboard, "is always set to
+// zero"; R8 holds channel A's amplitude in bits 0 to 3 (Appendix IX). The
+// sound manager writes the tone, then silences the channel before it writes
+// the mixer, then sets the volume: set_tone_and_get_tone_envelope,
+// update_mixer_for_channel and write_volume_ in Bread80's Sound.asm. Where an
+// envelope's step is 0, the 664's and the 6128's add the amplitude to it, and
+// the 464's V1.0 firmware ORs the amplitude in and then adds it as well, its
+// OR (IX+&0F) and JP P running on into ADD A,(IX+&0F) (&21CF to &21D5 of its
+// ROM). The amplitude is kept with bit 7 set, &8C for 12 (set_initial_values),
+// so the 464 writes the low four bits of &8C + &8C, R8 &08, which SOFT 968
+// does not mention.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_sound_queued_writes_the_psg_as_the_sound_manager_does() {
+    let mut session = Session::reading(&firmware());
+    for (machine, amplitude) in [("cpc464", 0x08), ("cpc664", 0x0C), ("cpc6128", 0x0C)] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        session.poke(&handle, json!("&8000"), "010000DE01000C6400");
+        let called = session.answer(
+            "call",
+            json!({
+                "handle": handle,
+                "address": "&BCAA",
+                "values": { "cpu.h": "&80", "cpu.l": 0 },
+                "gather": [{ "psg": 0, "to": 15 }],
+            }),
+        );
+        assert_eq!(called["stopped"], "returned", "{machine}: {called}");
+        assert_eq!(
+            session.inspect(&handle, "cpu.f").as_u64().unwrap() & 1,
+            1,
+            "{machine}: queued"
+        );
+        let written: Vec<(u64, u64)> = psg_writes(&called["gathered"])
+            .into_iter()
+            .map(|(register, value, _)| (register, value))
+            .collect();
+        assert_eq!(
+            written,
+            [(0, 0xDE), (1, 0x01), (8, 0x00), (7, 0x3E), (8, amplitude)],
+            "{machine}: {called}"
+        );
+    }
 }
 
 // The emulator's command line boots a machine for as many of its frames, its

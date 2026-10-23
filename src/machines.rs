@@ -18,7 +18,7 @@ use crate::emulator::{
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Match, Place, Run, Spectrum,
+    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, Spectrum,
     SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
@@ -529,6 +529,24 @@ impl Machine {
         }
     }
 
+    // Whether the machine has what the conditions watch, and what does if it
+    // has not. On a Spectrum's ULA port, "a one in bit 4 activates the EAR
+    // output and the internal speaker" ("16K/48K reference",
+    // https://worldofspectrum.org/faq/reference/48kreference.htm).
+    pub fn watchable(&self, conditions: &[Condition]) -> Result<(), String> {
+        match self.board {
+            Board::Spectrum { .. } if conditions.iter().any(|condition| condition.kind == PSG) => {
+                Err(format!(
+                    "a {} has no PSG, whose registers psg watches: its speaker is bit 4 of its \
+                     ULA's port, which {{\"out\": \"&FE\", \"mask\": \"&01\"}} watches, and a \
+                     cpc464, a cpc664 or a cpc6128 has a PSG",
+                    self.name
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     // How long a frame of this machine is when nothing has reprogrammed it.
     pub fn standard_frame(&self) -> u64 {
         match self.board {
@@ -634,10 +652,12 @@ pub struct Watched {
 }
 
 // Past the match that fills a gathering or a count, a run sees out the
-// instruction under way, which makes four accesses at most (EX (SP),IX),
-// then the response to an interrupt taken at its end, four more (in mode 2),
-// and the instruction it stops before. The last nine matches therefore hold
-// every match of until, which stops the run at the first.
+// instruction under way, which makes four matches at most (EX (SP),IX's
+// accesses; OUTI makes three, a read, a port written and a PSG register
+// written through it), then the response to an interrupt taken at its end,
+// four more (in mode 2), and the instruction it stops before. The last nine
+// matches therefore hold every match of until, which stops the run at the
+// first.
 const ROOM_PAST_FULL: u32 = 9;
 
 // A state named when it was asked for and dropped before the asking reached
