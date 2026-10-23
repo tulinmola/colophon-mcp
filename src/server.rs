@@ -1,18 +1,23 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 
+use rmcp::handler::server::common::FromContextPart;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext, schema_for_output};
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, MetaObject, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use schemars::transform::{RecursiveTransform, Transform};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
@@ -24,7 +29,7 @@ use crate::machine::{
     WRITE,
 };
 use crate::machines::{
-    self, Built, DISCS, Entry, FileRead, MACHINES, Machine, TAPES, Watched, Watching,
+    self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
 };
 use crate::picture;
 use crate::screen::{Asked, MOST_HEIGHT, MOST_RASTERS, MOST_WIDTH, Reading};
@@ -52,6 +57,9 @@ const MOST_BYTES: u16 = 4096;
 // A match takes some 80 characters, so these come to about as many as
 // MOST_BYTES does.
 const MOST_GATHERED: u32 = 128;
+// A match written to a file takes a line of some 100 characters, so these
+// come to some 100MB, and the room a run keeps for them to 32MB.
+const MOST_GATHERED_TO_A_FILE: u32 = 1 << 20;
 // A place counted takes some 60 characters, so these come to about twice what
 // MOST_BYTES does.
 const MOST_COUNTED: u32 = 256;
@@ -192,6 +200,73 @@ fn identified() -> MetaObject {
     MetaObject(meta)
 }
 
+// A tool's arguments, taken as rmcp's own Parameters takes them, save that
+// one of the wrong kind is named by its path, which serde leaves out of
+// "invalid type: sequence, expected a boolean". rmcp's tool macro takes a
+// tool's schema from the argument whose type has this name, and its router
+// answers an invalid_params error beginning "failed to deserialize
+// parameters:" as the tool's refusal.
+struct Parameters<T>(T);
+
+impl<T: JsonSchema> JsonSchema for Parameters<T> {
+    fn schema_name() -> Cow<'static, str> {
+        T::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        T::json_schema(generator)
+    }
+}
+
+impl<S, T: DeserializeOwned> FromContextPart<ToolCallContext<'_, S>> for Parameters<T> {
+    fn from_context_part(context: &mut ToolCallContext<S>) -> Result<Parameters<T>, ErrorData> {
+        let arguments = Value::Object(context.arguments.take().unwrap_or_default());
+        serde_path_to_error::deserialize(arguments)
+            .map(Parameters)
+            .map_err(|error| {
+                let path = error.path().to_string();
+                let problem = error.into_inner();
+                let named = if path == "." {
+                    problem.to_string()
+                } else {
+                    format!("{path}: {problem}")
+                };
+                ErrorData::invalid_params(
+                    format!("failed to deserialize parameters: {named}"),
+                    None,
+                )
+            })
+    }
+}
+
+// The tools, their schemas without the formats schemars gives each integer
+// by its Rust type, uint64, int64 and the rest. Every format JSON Schema
+// defines is of strings, so these are custom formats, and "Save for
+// agreement between parties, schema authors SHALL NOT expect a peer
+// implementation to support such custom format attributes" (JSON Schema
+// Validation 2020-12, 7.1 and 7.2.3,
+// https://json-schema.org/draft/2020-12/json-schema-validation).
+fn router_without_formats() -> ToolRouter<Server> {
+    let formatless = |schema: &JsonObject| {
+        let mut schema = Schema::from(schema.clone());
+        RecursiveTransform(|schema: &mut Schema| {
+            schema.remove("format");
+        })
+        .transform(&mut schema);
+        match Value::from(schema) {
+            Value::Object(object) => Arc::new(object),
+            _ => unreachable!("an object's schema stays an object"),
+        }
+    };
+    let mut router = Server::tool_router();
+    for route in router.map.values_mut() {
+        let tool = &mut route.attr;
+        tool.input_schema = formatless(&tool.input_schema);
+        tool.output_schema = tool.output_schema.as_deref().map(formatless);
+    }
+    router
+}
+
 fn machine_names(_: &mut SchemaGenerator) -> Schema {
     let names: Vec<&str> = MACHINES.iter().map(|machine| machine.name).collect();
     json_schema!({ "type": "string", "enum": names })
@@ -242,6 +317,21 @@ pub(crate) fn absent_not_null(schema: &mut Schema) {
         if let [only] = types.as_slice() {
             let only = only.clone();
             schema.insert("type".to_owned(), only);
+        }
+    }
+    // schemars makes an optional structure or enum, which it names in its
+    // $defs, one of it or null.
+    let null = json!({ "type": "null" });
+    if let Some(Value::Array(branches)) = schema.get_mut("anyOf") {
+        branches.retain(|branch| *branch != null);
+        if let [Value::Object(only)] = branches.as_slice() {
+            let only = only.clone();
+            schema.remove("anyOf");
+            for (keyword, value) in only {
+                if schema.get(&keyword).is_none() {
+                    schema.insert(keyword, value);
+                }
+            }
         }
     }
 }
@@ -481,14 +571,22 @@ fn watched_for(
     Ok(watched)
 }
 
-// gather_last and count_by say how gather and count keep what matches their
-// conditions, and mean nothing without them.
+// gather_last, count_by and path say how gather and count keep what matches
+// their conditions, and mean nothing without them.
 fn kept_as_asked(
     gather: Option<&Value>,
     gather_last: Option<bool>,
     count: Option<&Value>,
     count_by: Option<CountBy>,
+    path: Option<&PathBuf>,
 ) -> Result<(), String> {
+    if gather.is_none() && count.is_none() && path.is_some() {
+        return Err(
+            "path names the file gather and count write what they find to, and neither is \
+             given; give gather or count the conditions to watch, or leave path out"
+                .to_owned(),
+        );
+    }
     if gather.is_none() && gather_last.is_some() {
         return Err(
             "gather_last says which matches of gather are kept, and gather is not given; give \
@@ -510,12 +608,18 @@ fn watching(
     conditions: &[Condition],
     gather_last: Option<bool>,
     count_by: Option<CountBy>,
+    filing: bool,
 ) -> Watching<'_> {
+    let gathering = conditions.iter().any(|condition| condition.list == GATHER);
     Watching {
         conditions,
-        most_gathered: MOST_GATHERED,
+        most_gathered: if filing && gathering {
+            MOST_GATHERED_TO_A_FILE
+        } else {
+            MOST_GATHERED
+        },
         gathers_last: gather_last == Some(true),
-        most_counted: MOST_COUNTED,
+        most_counted: (!filing).then_some(MOST_COUNTED),
         counts_by_pc: count_by == Some(CountBy::Pc),
     }
 }
@@ -709,17 +813,17 @@ struct RunRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the run goes, written as until's are. The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
+    /// Conditions whose matches are gathered as the run goes, written as until's are, the instruction the run begins on among them, which until never stops before. The run stops at the end of the instruction that makes the 128th match, or with path the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last 128 matches rather than the first: true runs on past the 128th, and answers the 128 gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
+    /// Whether gather keeps the last 128 matches rather than the first, or with path the last 1048576: true runs on past the 128th, or the 1048576th, and lists those gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. At most 16.
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -729,12 +833,16 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
-    /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are.
+    /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are. A program that reads its keyboard only now and then can miss a key held for less than the time between its readings.
     #[schemars(schema_with = "keys_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<Value>>,
+    /// A file to write what gather and count find to, in place of the answer's gathered and counted, for a client to read with tools of its own: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory, which the answer and the journal name absolute. A path that names a file already, or a directory that is not there, is refused before the run begins. Each line of the file is a JSON object and ends in a newline: first each match gathered, in the order it happened, then each place counted, in counted's order, each as the answer would list it, after "list": "gather" or "count", the list it belongs to. The file stands at its path from before the run, empty, and holds what it is to hold once the answer names it by its SHA-256, so a client reads it after the answer. One that cannot be written whole after the run is taken away again, and the run, which is not taken back, is refused with where the machine stands, and journaled without the file. Refused without gather or count.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -763,17 +871,17 @@ struct CallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
+    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, or with path the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last 128 matches rather than the first, as run's gather_last keeps them. false if not given, and refused without gather.
+    /// Whether gather keeps the last 128 matches rather than the first, or with path the last 1048576, as run's gather_last keeps them. false if not given, and refused without gather.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. At most 16.
+    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. With path, a count never fills. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -783,6 +891,10 @@ struct CallRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
+    /// A file to write what gather and count find to, in place of the answer's gathered and counted, as run's path takes it. A path that names a file already, or a directory that is not there, is refused before the call begins, and a call refused takes the file made for it away again.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -1134,7 +1246,7 @@ enum Stopped {
     Unsettled,
     /// A condition of until matched.
     Matched,
-    /// The gathering came to 128 matches, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills.
+    /// The gathering came to 128 matches, or to 1048576 written to a file, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills, nor does a count written to a file.
     Full,
     /// The processor halted on HALT with interrupts disabled, where it waits for good: IFF1 shuts out INT, and nothing on either machine raises the NMI that would wake it. A run from here runs as asked, halted throughout, unless set has written in an NMI; call wakes the processor for its routine alone, and set or state_restore takes it past the HALT.
     Halted,
@@ -1287,6 +1399,62 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
+    /// The file written at path, which holds what gathered and counted would have listed, in their place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    written: Option<Filed>,
+}
+
+// The file a run wrote its lists to.
+#[derive(Serialize, JsonSchema)]
+struct Filed {
+    #[serde(flatten)]
+    file: FileRead,
+    /// How many of its lines are matches of gather, which come first; given with gather.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    gathered: Option<usize>,
+    /// How many of its lines are places of count, which follow; given with count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    counted: Option<usize>,
+}
+
+// The lists a run was asked for, and the file that takes them in place of
+// the answer, if one was given.
+struct Lists {
+    gathering: bool,
+    counting: bool,
+    file: Option<NewFile>,
+}
+
+// A line of a run's file: what the answer would list, after the list.
+#[derive(Serialize)]
+struct Line<T> {
+    list: &'static str,
+    #[serde(flatten)]
+    entry: T,
+}
+
+fn line<T: Serialize>(file: &mut NewFile, list: &'static str, entry: T) -> io::Result<()> {
+    serde_json::to_writer(&mut *file, &Line { list, entry })?;
+    file.write_all(b"\n")
+}
+
+fn write_lists(file: &mut NewFile, watched: &Watched) -> io::Result<()> {
+    for seen in watched.matches.iter().filter(|seen| seen.gathers) {
+        line(file, "gather", Matched::of(seen))?;
+    }
+    for place in &watched.counts {
+        line(file, "count", Counted::of(place))?;
+    }
+    Ok(())
+}
+
+// The file a run's answer names, for its journal.
+fn wrote(ran: &Result<Ran, String>) -> Option<FileRead> {
+    let filed = ran.as_ref().ok()?.written.as_ref()?;
+    Some(filed.file.clone())
 }
 
 impl Ran {
@@ -1303,12 +1471,15 @@ impl Ran {
             matched: None,
             gathered: None,
             counted: None,
+            written: None,
         }
     }
 
     // What the run's watch saw, and why the run stopped if the watch or a
-    // halt for good stopped it.
-    fn watched(mut self, watched: &Watched, gathering: bool, counting: bool) -> Ran {
+    // halt for good stopped it. The lists go to the file, if one was given,
+    // and a file that cannot be written takes nothing back: the machine
+    // stands where the run left it.
+    fn watched(mut self, watched: &Watched, lists: Lists) -> Result<Ran, String> {
         if self.run.settled {
             if watched.returned {
                 self.stopped = Stopped::Returned;
@@ -1329,9 +1500,30 @@ impl Ran {
                 .collect()
         };
         self.matched = watched.matched.then(|| listed(|seen| seen.stops));
-        self.gathered = gathering.then(|| listed(|seen| seen.gathers));
-        self.counted = counting.then(|| watched.counts.iter().map(Counted::of).collect());
-        self
+        let Some(mut file) = lists.file else {
+            self.gathered = lists.gathering.then(|| listed(|seen| seen.gathers));
+            self.counted = lists
+                .counting
+                .then(|| watched.counts.iter().map(Counted::of).collect());
+            return Ok(self);
+        };
+        let written = write_lists(&mut file, watched);
+        let file = file.finish(written).map_err(|problem| {
+            format!(
+                "{problem}. The request is not taken back: it ran {} ticks, and the machine stands \
+                 where it ended, at tick {} with its program counter at {}, and its journal holds \
+                 the request; make it again, from a state kept before it or from the journal's \
+                 requests before it, to write the file, at a path the file system can take it at",
+                self.run.ticks, self.tick, self.pc
+            )
+        })?;
+        let gathered = watched.matches.iter().filter(|seen| seen.gathers).count();
+        self.written = Some(Filed {
+            file,
+            gathered: lists.gathering.then_some(gathered),
+            counted: lists.counting.then_some(watched.counts.len()),
+        });
+        Ok(self)
     }
 }
 
@@ -1585,7 +1777,7 @@ impl Server {
         }
     }
 
-    /// Build a machine, powered on and standing before its first instruction, or standing where a snapshot was taken, and give it a handle. It stands until machine_close puts it away or the server stops, and this server never gives its handle to another machine. The answer names every file the machine was built from by its SHA-256. A snapshot is loaded as the emulator's command line loads one, into the machine named, after its firmware is fitted. A CPC's is an SNA of version 1, 2 or 3, of which only the fields of version 1 are read: none keeps the disc controller, so the machine must not have been taken inside a disc access, and the 6845's counters a version 3 carries are not read, so the machine starts its frame from the top, with the 6845's counters, the Gate Array's interrupt counter and the monitor's beam all at 0. Its first run by frames therefore ends early, at the retrace the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen; until then monitor.beam_y runs up to three lines past the 6845's line, and from then on, on the firmware's screen, 70 or 71 past it, the border above the picture. A Spectrum's is the 48K .sna, which keeps no beam position either. The machine's tick starts at 0 from either.
+    /// Build a machine, powered on and standing before its first instruction, or standing where a snapshot was taken, and give it a handle. It stands until machine_close puts it away or the server stops, and this server never gives its handle to another machine. The answer names every file the machine was built from by its SHA-256. A snapshot is loaded as the emulator's command line loads one, into the machine named, after its firmware is fitted. A CPC's is an SNA of version 1, 2 or 3, of which only the fields of version 1 are read: none keeps the disc controller, which the machine finds as at power-on, so one taken inside a disc access does not go on with it, and AMSDOS, which sets the controller up with SPECIFY as the machine starts, reads no disc from there, until set writes fdc.non_dma back as SPECIFY left it; and the 6845's counters a version 3 carries are not read, so the machine starts its frame from the top, with the 6845's counters, the Gate Array's interrupt counter and the monitor's beam all at 0. Its first run by frames therefore ends early, at the retrace the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen; until then monitor.beam_y runs up to three lines past the 6845's line, and from then on, on the firmware's screen, 70 or 71 past it, the border above the picture. A Spectrum's is the 48K .sna, which keeps no beam position either. The machine's tick starts at 0 from either.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -1730,14 +1922,17 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = false,
         open_world_hint = false
     ))]
-    async fn run(&self, Parameters(request): Parameters<RunRequest>) -> Result<Json<Ran>, String> {
+    async fn run(
+        &self,
+        Parameters(mut request): Parameters<RunRequest>,
+    ) -> Result<Json<Ran>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
         let most_ticks = u64::from(MOST_FRAMES) * machine.standard_frame();
         let conditions = watched_for(
@@ -1751,13 +1946,20 @@ impl Server {
             request.gather_last,
             request.count.as_ref(),
             request.count_by,
+            request.path.as_ref(),
         )?;
         let keys = keys(machine, request.keys.as_ref())?;
+        request.path = request
+            .path
+            .as_deref()
+            .map(machines::absolute)
+            .transpose()?;
         let mut arguments = journaled(&request);
         journal_conditions(&mut arguments, &conditions);
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let (gather_last, count_by) = (request.gather_last, request.count_by);
+        let path = request.path;
         let ran = match (request.frames, request.ticks) {
             (Some(frames), None) => {
                 let frames = u32::try_from(frames)
@@ -1771,18 +1973,25 @@ impl Server {
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
                 Server::ask(&request.handle, orders, move |built| {
+                    let file = path.as_deref().map(NewFile::create).transpose()?;
                     let tick = built.tick();
-                    let watching = watching(&conditions, gather_last, count_by);
+                    let watching = watching(&conditions, gather_last, count_by, file.is_some());
                     let (run, watched) = built.run(frames, limit, &watching, &keys);
-                    built.record(tick, "run", arguments, None);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
                     } else {
                         Stopped::Limit
                     };
-                    Ran::of(run, built, stopped).watched(&watched, gathering, counting)
+                    let lists = Lists {
+                        gathering,
+                        counting,
+                        file,
+                    };
+                    let ran = Ran::of(run, built, stopped).watched(&watched, lists);
+                    built.record(tick, "run", arguments, None, wrote(&ran));
+                    ran
                 })
-                .await?
+                .await??
             }
             (None, Some(ticks)) => {
                 let ticks = u64::try_from(ticks)
@@ -1797,13 +2006,20 @@ impl Server {
                         )
                     })?;
                 Server::ask(&request.handle, orders, move |built| {
+                    let file = path.as_deref().map(NewFile::create).transpose()?;
                     let tick = built.tick();
-                    let watching = watching(&conditions, gather_last, count_by);
+                    let watching = watching(&conditions, gather_last, count_by, file.is_some());
                     let (run, watched) = built.run(u32::MAX, ticks, &watching, &keys);
-                    built.record(tick, "run", arguments, None);
-                    Ran::of(run, built, Stopped::Ticks).watched(&watched, gathering, counting)
+                    let lists = Lists {
+                        gathering,
+                        counting,
+                        file,
+                    };
+                    let ran = Ran::of(run, built, Stopped::Ticks).watched(&watched, lists);
+                    built.record(tick, "run", arguments, None, wrote(&ran));
+                    ran
                 })
-                .await?
+                .await??
             }
             _ => {
                 return Err(
@@ -1816,7 +2032,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, and their handlers run within the call. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. A routine that halts on HALT with interrupts disabled stops the call there, halted, as it stops a run: one that waits on HALT for the next frame, called with IFF1 clear, as inside an interrupt's handler or after DI, waits for good. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
+    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, so their handlers run within the call only if IFF1 is set: a run by frames leaves either machine's firmware inside the handler of the frame's interrupt, with IFF1 clear, and a routine called there runs with no interrupt at all, unless it enables them itself. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. A routine that halts on HALT with interrupts disabled stops the call there, halted, as it stops a run: one that waits on HALT for the next frame, called with IFF1 clear, as inside an interrupt's handler or after DI, waits for good. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -1825,7 +2041,7 @@ impl Server {
     ))]
     async fn call(
         &self,
-        Parameters(request): Parameters<CallRequest>,
+        Parameters(mut request): Parameters<CallRequest>,
     ) -> Result<Json<Ran>, String> {
         let address = address(&request.address)?;
         let frames = request.frames.unwrap_or(i64::from(MOST_FRAMES));
@@ -1848,7 +2064,13 @@ impl Server {
             request.gather_last,
             request.count.as_ref(),
             request.count_by,
+            request.path.as_ref(),
         )?;
+        request.path = request
+            .path
+            .as_deref()
+            .map(machines::absolute)
+            .transpose()?;
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let (gather_last, count_by) = (request.gather_last, request.count_by);
@@ -1856,20 +2078,36 @@ impl Server {
         arguments["address"] = json!(Hexadecimal::address(address));
         journal_conditions(&mut arguments, &conditions);
         let values = request.values.unwrap_or_default();
+        let path = request.path;
         let (machine, orders) = self.thread(&request.handle)?;
         machine.watchable(&conditions)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
+            let file = path.as_deref().map(NewFile::create).transpose()?;
             let tick = built.tick();
-            let watching = watching(&conditions, gather_last, count_by);
-            let (run, watched) = built.call(address, &values, frames, limit, &watching)?;
-            built.record(tick, "call", arguments, None);
+            let watching = watching(&conditions, gather_last, count_by, file.is_some());
+            let (run, watched) = match built.call(address, &values, frames, limit, &watching) {
+                Ok(called) => called,
+                Err(problem) => {
+                    if let Some(file) = file {
+                        file.discard();
+                    }
+                    return Err(problem);
+                }
+            };
             let stopped = if run.frames >= frames {
                 Stopped::Frames
             } else {
                 Stopped::Limit
             };
-            Ok::<_, String>(Ran::of(run, built, stopped).watched(&watched, gathering, counting))
+            let lists = Lists {
+                gathering,
+                counting,
+                file,
+            };
+            let ran = Ran::of(run, built, stopped).watched(&watched, lists);
+            built.record(tick, "call", arguments, None, wrote(&ran));
+            ran
         })
         .await??;
         Ok(Json(ran))
@@ -1901,7 +2139,7 @@ impl Server {
         let ran = Server::ask(&request.handle, orders, move |built| {
             let tick = built.tick();
             let run = built.step(instructions);
-            built.record(tick, "step", arguments, None);
+            built.record(tick, "step", arguments, None, None);
             Ran::of(run, built, Stopped::Instructions)
         })
         .await?;
@@ -1943,7 +2181,7 @@ impl Server {
         let ran = Server::ask(&request.handle, orders, move |built| {
             let tick = built.tick();
             let run = built.r#type(&keystrokes, held, released);
-            built.record(tick, "type", arguments, None);
+            built.record(tick, "type", arguments, None, None);
             Ran::of(run, built, Stopped::Typed)
         })
         .await?;
@@ -1980,7 +2218,7 @@ impl Server {
         let given = file.clone();
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_disc(number, &contents)?;
-            built.record(built.tick(), "disc_insert", arguments, Some(given));
+            built.record(built.tick(), "disc_insert", arguments, Some(given), None);
             Ok::<_, String>(built.tick())
         })
         .await?
@@ -2018,7 +2256,7 @@ impl Server {
         let given = file.clone();
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_tape(&contents)?;
-            built.record(built.tick(), "tape_insert", arguments, Some(given));
+            built.record(built.tick(), "tape_insert", arguments, Some(given), None);
             Ok::<_, String>(built.tick())
         })
         .await?
@@ -2031,7 +2269,7 @@ impl Server {
         }))
     }
 
-    /// Write a machine to a new file as a snapshot, in the format the emulator's command line writes with --save and machine_open reads: an SNA of version 1 for a CPC, the 48K .sna for a Spectrum. The file is written only where none is, at its path on the file system the server runs on, from the server's working directory if relative, so that nothing is ever written over: a path that names a file already is refused. A snapshot keeps less than the machine. Neither keeps whether the processor is halted, so a machine saved on HALT, waiting for an interrupt, runs on past the HALT as soon as it is read. A CPC's keeps no counters of the 6845's, so the machine read from it starts its frame from the top, and neither the disc controller nor the discs, so one saved inside a disc access does not go on with it. A Spectrum's keeps no beam position and no tape, and keeps the program counter in the two bytes below the stack pointer, in the file and not in the machine, so a machine read from it has lost what those two bytes held; a Spectrum whose stack pointer is below &4002, 0 among them, is refused. Refused inside an instruction, as a run or a step ending in a chain of prefixes leaves the machine. The machine is left as it stands. The answer names the file by its SHA-256, with the machine's tick.
+    /// Write a machine to a new file as a snapshot, in the format the emulator's command line writes with --save and machine_open reads: an SNA of version 1 for a CPC, the 48K .sna for a Spectrum. The file is written only where none is, at its path on the file system the server runs on, from the server's working directory if relative, so that nothing is ever written over: a path that names a file already is refused. A snapshot keeps less than the machine. Neither keeps whether the processor is halted, so a machine saved on HALT, waiting for an interrupt, runs on past the HALT as soon as it is read. A CPC's keeps no counters of the 6845's, so the machine read from it starts its frame from the top, and neither the discs nor the disc controller, which the machine read from it finds as at power-on, so one saved inside a disc access does not go on with it, and AMSDOS, which sets the controller up with SPECIFY as the machine starts, reads no disc from there until set writes fdc.non_dma back as SPECIFY left it. A Spectrum's keeps no beam position and no tape, and keeps the program counter in the two bytes below the stack pointer, in the file and not in the machine, so a machine read from it has lost what those two bytes held; a Spectrum whose stack pointer is below &4002, 0 among them, is refused. Refused inside an instruction, as a run or a step ending in a chain of prefixes leaves the machine. The machine is left as it stands. The file holds the machine's RAM whole, to be read as an image of it: a CPC's after its header of 256 bytes, all 64K or 128K of it by the RAM's own addresses, as peek's ram counts them, and a Spectrum's after its header of 27, &4000 to &FFFF, save the two bytes below the stack pointer, which hold the program counter. The answer names the file by its SHA-256, with the machine's tick.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -2177,7 +2415,7 @@ impl Server {
         }))
     }
 
-    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a register of the PSG as a number, a range of one address or register as that one, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a register of the PSG as a number, a range of one address or register as that one, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well, and a file a run or a call wrote named by what it holds. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, and write files that hold what these hold, each at a path that names nothing yet, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn journal(
         &self,
@@ -2255,7 +2493,7 @@ impl Server {
         let values = request.values;
         let written = Server::ask(&request.handle, orders, move |built| {
             let written = built.set(&values)?;
-            built.record(built.tick(), "set", arguments, None);
+            built.record(built.tick(), "set", arguments, None, None);
             Ok::<_, String>(written)
         })
         .await??;
@@ -2425,7 +2663,7 @@ impl Server {
         arguments["address"] = json!(Hexadecimal::address(address));
         Server::ask(&request.handle, orders, move |built| {
             built.poke(address, &bytes);
-            built.record(built.tick(), "poke", arguments, None);
+            built.record(built.tick(), "poke", arguments, None, None);
         })
         .await?;
         Ok(Json(Poked {
@@ -2435,7 +2673,7 @@ impl Server {
     }
 }
 
-#[tool_handler(meta = identified())]
+#[tool_handler(router = router_without_formats(), meta = identified())]
 impl ServerHandler for Server {
     async fn call_tool(
         &self,
@@ -2475,5 +2713,96 @@ impl ServerHandler for Server {
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(&REVISIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const DI: u8 = 0xF3;
+    const JR: u8 = 0x18;
+    const LD_SP: u8 = 0x31;
+    const LD_A_TO: u8 = 0x32;
+    const PUSH_HL: u8 = 0xE5;
+
+    // DI, LD SP,&9000, then PUSH HL round a JR, every write matching a range
+    // of the whole of memory; LD (&8000),A writes once first, so the
+    // 1048576th match is the first of a PUSH's two writes, the high byte
+    // first (Z80 CPU User Manual, Zilog UM0080,
+    // https://www.zilog.com/docs/z80/um0080.pdf), whose second is kept with
+    // it.
+    const PUSHING: [u8; 10] = [
+        DI, LD_SP, 0x00, 0x90, LD_A_TO, 0x00, 0x80, PUSH_HL, JR, 0xFD,
+    ];
+
+    // A Spectrum whose ROM is PUSHING, gathering every write to a file for
+    // 240 frames' ticks, in which it makes more writes than a gathering of
+    // the first fills with, and fewer than twice as many.
+    const TICKS: u64 = 240 * 69888;
+
+    fn gathering_writes(gather_last: Option<bool>) -> (Run, Vec<Match>) {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "colophon-mcp-server-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("a scratch directory");
+        let mut rom = vec![0x76; 0x4000];
+        rom[..PUSHING.len()].copy_from_slice(&PUSHING);
+        fs::write(directory.join("spectrum48.rom"), rom).expect("a stand-in is written");
+        let machine = machines::named("spectrum48").expect("the 48");
+        let parts = machine.parts(&directory, None);
+        let _ = fs::remove_dir_all(&directory);
+        let mut built = parts
+            .expect("its stand-in is read")
+            .build(machine)
+            .expect("a machine without a snapshot is always built");
+        let gathering = json!([{ "write": 0, "to": "&FFFF" }]);
+        let conditions = watched_for(None, Some(&gathering), None).expect("a gathering");
+        let watching = watching(&conditions, gather_last, None, true);
+        let (run, watched) = built.run(u32::MAX, TICKS, &watching, &[]);
+        assert_eq!(watched.full, gather_last.is_none(), "{run:?}");
+        let gathered = watched.matches.into_iter().filter(|seen| seen.gathers);
+        (run, gathered.collect())
+    }
+
+    #[test]
+    fn a_gathering_written_to_a_file_fills_at_its_1048576th_match() {
+        let (run, gathered) = gathering_writes(None);
+        assert!(run.ticks < TICKS, "{run:?}");
+        assert_eq!(gathered.len(), 1_048_577);
+        let [first, second] = &gathered[gathered.len() - 2..] else {
+            unreachable!("two matches at least");
+        };
+        assert_eq!((first.pc, second.pc), (7, 7));
+        assert_eq!(first.address, second.address.wrapping_add(1));
+    }
+
+    // Kept last, the gathering runs its ticks and keeps 1048576 matches,
+    // which take up where a gathering of the first, filled, has them.
+    #[test]
+    fn a_gathering_of_the_last_written_to_a_file_keeps_the_last_1048576() {
+        let (_, first) = gathering_writes(None);
+        let (run, last) = gathering_writes(Some(true));
+        assert!(run.ticks >= TICKS, "{run:?}");
+        assert_eq!(last.len(), 1_048_576);
+        let told = |seen: &Match| (seen.tick, seen.address, seen.value, seen.pc);
+        let from = first
+            .iter()
+            .position(|seen| told(seen) == told(&last[0]))
+            .expect("the two gatherings overlap");
+        assert!(from > 0);
+        assert!(
+            first[from..]
+                .iter()
+                .zip(&last)
+                .all(|(one, other)| told(one) == told(other))
+        );
+        assert!(last.last().unwrap().tick <= run.ticks);
     }
 }

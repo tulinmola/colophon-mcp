@@ -125,7 +125,7 @@ pub fn named(name: &str) -> Option<&'static Machine> {
 // A file read for a machine or written from one, named by what it holds.
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct FileRead {
-    /// Where the file was read, an absolute path.
+    /// The file's path, absolute.
     pub path: PathBuf,
     /// The SHA-256 of what it held, in hexadecimal.
     pub sha256: String,
@@ -133,7 +133,10 @@ pub struct FileRead {
 
 impl FileRead {
     pub fn of(path: &Path, contents: &[u8]) -> FileRead {
-        let digest = Sha256::digest(contents);
+        FileRead::digested(path, &Sha256::digest(contents))
+    }
+
+    fn digested(path: &Path, digest: &[u8]) -> FileRead {
         FileRead {
             path: path.to_owned(),
             sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
@@ -204,42 +207,113 @@ fn read_whole(path: &Path, largest: u64, what: &str, takes: &str) -> Result<Vec<
     Ok(contents)
 }
 
-// Writes a file only where none is, so that none is ever written over, and
-// takes away what it began if it cannot finish.
-pub fn write_new(path: &Path, contents: &[u8]) -> Result<FileRead, String> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                format!(
-                    "{} is taken, and a file is written only where none is: give a path that \
-                     names nothing yet",
-                    path.display()
-                )
-            } else {
-                format!(
-                    "cannot write {}: {error}; a file is written at a path on the file system \
-                     the server runs on, in a directory that is there, and {}",
-                    path.display(),
-                    working_directory_clause()
-                )
-            }
-        })?;
-    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
-        drop(file);
-        let begun = match fs::remove_file(path) {
-            Ok(()) => "what was begun there is taken away again",
-            Err(_) => "what was begun there is left, unfinished, and holds that path",
-        };
-        return Err(format!(
-            "cannot write {}: {error}; {begun}, and the file is written again when asked, at a \
-             path the file system can take it at",
-            path.display()
-        ));
+// A file written only where none is, so that none is ever written over, and
+// named by what it holds once it is written; what was begun there is taken
+// away again if it cannot be finished. What is hashed is what the file
+// took, write by write, so that the hash is of what it holds.
+pub struct NewFile {
+    path: PathBuf,
+    file: io::BufWriter<Hashing>,
+}
+
+struct Hashing {
+    file: fs::File,
+    sha256: Sha256,
+}
+
+impl Write for Hashing {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.sha256.update(&bytes[..written]);
+        Ok(written)
     }
-    Ok(FileRead::of(path, contents))
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl NewFile {
+    pub fn create(path: &Path) -> Result<NewFile, String> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    format!(
+                        "{} is taken, and a file is written only where none is: give a path \
+                         that names nothing yet",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "cannot write {}: {error}; a file is written at a path on the file \
+                         system the server runs on, in a directory that is there, and {}",
+                        path.display(),
+                        working_directory_clause()
+                    )
+                }
+            })?;
+        Ok(NewFile {
+            path: path.to_owned(),
+            file: io::BufWriter::new(Hashing {
+                file,
+                sha256: Sha256::new(),
+            }),
+        })
+    }
+
+    // The file, once what was written to it is on the file system, or what
+    // stopped the writing.
+    pub fn finish(mut self, written: io::Result<()>) -> Result<FileRead, String> {
+        let finished = written
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.get_ref().file.sync_all());
+        if let Err(error) = finished {
+            // Dropped whole, the buffer would try again to write what it holds.
+            let (hashing, _) = self.file.into_parts();
+            drop(hashing);
+            let begun = match fs::remove_file(&self.path) {
+                Ok(()) => "what was begun there is taken away again",
+                Err(_) => "what was begun there is left, unfinished, and holds that path",
+            };
+            return Err(format!(
+                "cannot write {}: {error}; {begun}",
+                self.path.display()
+            ));
+        }
+        let digest = std::mem::take(&mut self.file.get_mut().sha256).finalize();
+        Ok(FileRead::digested(&self.path, &digest))
+    }
+
+    // Takes away a file made for a request refused before anything was
+    // written to it.
+    pub fn discard(self) {
+        drop(self.file);
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Write for NewFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+pub fn write_new(path: &Path, contents: &[u8]) -> Result<FileRead, String> {
+    let mut file = NewFile::create(path)?;
+    let written = file.write_all(contents);
+    file.finish(written).map_err(|problem| {
+        format!(
+            "{problem}, and the file is written again when asked, at a path the file system can \
+             take it at"
+        )
+    })
 }
 
 // What a machine is built from, read and checked, so that building it
@@ -287,6 +361,10 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = crate::server::absent_not_null)]
     pub file: Option<FileRead>,
+    /// The file a run or a call wrote what it gathered or counted to, named by what it holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::server::absent_not_null)]
+    pub written: Option<FileRead>,
 }
 
 // What has been done to a machine, in the order it was done: the stretches
@@ -592,6 +670,7 @@ impl Parts {
             tool: "machine_open",
             arguments: json!({ "machine": machine.name }),
             file: None,
+            written: None,
         };
         if let Some((path, bytes)) = self.snapshot {
             let loaded = match &mut hardware {
@@ -628,12 +707,13 @@ pub struct Shown {
 
 // What a run watches for, and how many matches it gathers and places it
 // counts before it stops; where it gathers the last matches, how many of
-// them it keeps instead.
+// them it keeps instead. A count with no most_counted never fills, and
+// keeps every place.
 pub struct Watching<'a> {
     pub conditions: &'a [Condition],
     pub most_gathered: u32,
     pub gathers_last: bool,
-    pub most_counted: u32,
+    pub most_counted: Option<u32>,
     pub counts_by_pc: bool,
 }
 
@@ -781,7 +861,7 @@ impl Built {
             conditions: &[],
             most_gathered: 0,
             gathers_last: false,
-            most_counted: 0,
+            most_counted: Some(0),
             counts_by_pc: false,
         };
         while typed.settled && typed.ticks < until {
@@ -848,13 +928,11 @@ impl Built {
         // arrays of them, and all-zero bytes are a value of each.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
         let counting = conditions.iter().any(|condition| condition.list == COUNT);
-        let (size, place_room) = if counting {
-            (
-                KINDS.len() * COUNTS_PER_KIND,
-                watching.most_counted.saturating_add(ROOM_PAST_FULL),
-            )
-        } else {
-            (0, 0)
+        let every_place = KINDS.len() * COUNTS_PER_KIND;
+        let (size, place_room, most_counted) = match (counting, watching.most_counted) {
+            (false, _) => (0, 0, 0),
+            (true, Some(most)) => (every_place, most.saturating_add(ROOM_PAST_FULL), most),
+            (true, None) => (every_place, every_place as u32, u32::MAX),
         };
         let mut counts = vec![0; size];
         // SAFETY: as for a match.
@@ -865,7 +943,7 @@ impl Built {
             &mut counts,
             &mut places,
             watching.most_gathered,
-            watching.most_counted,
+            most_counted,
         );
         if watching.gathers_last {
             watch.gather_last();
@@ -1017,12 +1095,14 @@ impl Built {
         tool: &'static str,
         arguments: Value,
         file: Option<FileRead>,
+        written: Option<FileRead>,
     ) {
         self.journal.since.push(Entry {
             tick,
             tool,
             arguments,
             file,
+            written,
         });
     }
 

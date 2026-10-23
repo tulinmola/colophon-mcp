@@ -91,7 +91,7 @@ impl<'a> Watch<'a> {
         watch.conditions = conditions.as_ptr();
         watch.condition_count = u32::try_from(conditions.len()).expect("a few conditions");
         watch.matches = matches.as_mut_ptr();
-        watch.room = u32::try_from(matches.len()).expect("room for a few thousand matches");
+        watch.room = u32::try_from(matches.len()).expect("room for a million matches or so");
         watch.most_gathered = most_gathered;
         if counting {
             watch.counts = counts.as_mut_ptr();

@@ -361,7 +361,6 @@ const KEYWORDS: &[&str] = &[
     "$schema",
     "title",
     "description",
-    "format",
 ];
 
 // Whether a schema uses only the keywords in KEYWORDS, in every part of it.
@@ -1041,7 +1040,9 @@ const IN_A_C: [u8; 2] = [0xED, 0x78];
 const IN_A_N: u8 = 0xDB;
 const INC_A: u8 = 0x3C;
 const DEC_BC: u8 = 0x0B;
+const DEC_C: u8 = 0x0D;
 const DEC_HL: u8 = 0x2B;
+const DJNZ: u8 = 0x10;
 const INC_BC: u8 = 0x03;
 const INC_HL: u8 = 0x23;
 const INC_AT_HL: u8 = 0x34;
@@ -3438,14 +3439,92 @@ fn run_and_call_ask_for_nothing_they_can_go_without() {
     );
     // An argument left out has no value at all, not a null one.
     for tool in TOOLS {
-        let properties = input_schema(&tools, tool)["properties"].clone();
-        for (name, property) in properties.as_object().into_iter().flatten() {
+        let schema = input_schema(&tools, tool);
+        for (name, property) in schema["properties"].as_object().into_iter().flatten() {
             assert!(
                 property.get("default").is_none(),
                 "{tool}.{name}: {property}"
             );
+            assert!(
+                fits(&Value::Null, property, &schema, name).is_err(),
+                "{tool}.{name}: {property}"
+            );
         }
     }
+}
+
+// Where each keyword in a schema stands, past the names of properties and
+// definitions, which are no keywords.
+fn keyword_paths(schema: &Value, at: &str, into: &mut Vec<String>) {
+    match schema {
+        Value::Object(fields) => {
+            for (keyword, value) in fields {
+                let at = format!("{at}/{keyword}");
+                into.push(at.clone());
+                if matches!(keyword.as_str(), "properties" | "$defs") {
+                    for (name, part) in value.as_object().into_iter().flatten() {
+                        keyword_paths(part, &format!("{at}/{name}"), into);
+                    }
+                } else {
+                    keyword_paths(value, &at, into);
+                }
+            }
+        }
+        Value::Array(parts) => {
+            for (index, part) in parts.iter().enumerate() {
+                keyword_paths(part, &format!("{at}[{index}]"), into);
+            }
+        }
+        _ => {}
+    }
+}
+
+// Every format JSON Schema defines is of strings, so any other is a custom
+// format, and "Save for agreement between parties, schema authors SHALL NOT
+// expect a peer implementation to support such custom format attributes"
+// (JSON Schema Validation 2020-12, 7.1 and 7.2.3,
+// https://json-schema.org/draft/2020-12/json-schema-validation). No schema
+// here names a format.
+#[test]
+fn no_schema_names_a_format() {
+    let roms = Roms::all();
+    let tools = tools(&mut Session::start(&roms));
+    for tool in tools.as_array().unwrap() {
+        let mut found = Vec::new();
+        keyword_paths(&tool["inputSchema"], "inputSchema", &mut found);
+        keyword_paths(&tool["outputSchema"], "outputSchema", &mut found);
+        let formats: Vec<&String> = found.iter().filter(|at| at.ends_with("/format")).collect();
+        assert!(formats.is_empty(), "{}: {formats:?}", tool["name"]);
+    }
+}
+
+// An argument of the wrong kind is named, with the kind serde takes for it,
+// and one missing is named as serde names it, with no path before it.
+#[test]
+fn an_argument_of_the_wrong_kind_is_named() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    assert_eq!(
+        session.refusal("run", json!({ "frames": 1 })),
+        "failed to deserialize parameters: missing field `handle`"
+    );
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({
+                "handle": handle,
+                "frames": 1,
+                "gather": [{ "execute": 0 }],
+                "gather_last": [{ "execute": 0 }],
+            })
+        ),
+        "failed to deserialize parameters: gather_last: invalid type: sequence, expected a boolean"
+    );
+    assert_eq!(
+        session.refusal("screen", json!({ "handle": handle, "palette": [0, "&1A"] })),
+        "failed to deserialize parameters: palette[1]: invalid type: string \"&1A\", expected i64"
+    );
 }
 
 // Clients SHOULD follow $ref resolution "when validating tool inputs and
@@ -4756,6 +4835,365 @@ fn a_count_that_fills_stops_and_the_next_run_counts_on() {
     assert!(ran.get("counted").is_none(), "{ran}");
 }
 
+// The lines of a file a run wrote, each a JSON object ending in a newline,
+// split into the list it names first and the rest.
+fn lines_of(path: &Path) -> Vec<(String, Value)> {
+    let text = fs::read_to_string(path).expect("the file");
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    text.lines()
+        .map(|line| {
+            let Value::Object(mut fields) = serde_json::from_str(line).expect("a JSON line") else {
+                panic!("{line} is no object");
+            };
+            assert_eq!(fields.keys().next().map(String::as_str), Some("list"));
+            let list = fields.shift_remove("list").unwrap();
+            (
+                list.as_str().expect("a list's name").to_owned(),
+                Value::Object(fields),
+            )
+        })
+        .collect()
+}
+
+// A gathering written to a file holds what a gathering carried through runs
+// that fill lists over the same stretch, a match to a line, and the run
+// writing it does not fill.
+#[test]
+fn a_gathering_written_to_a_file_is_the_stretch_gathered_through_runs_that_fill() {
+    for (file, machine, port, port_address) in [
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            json!({ "out": "&7F00", "mask": "&C000" }),
+            0x7F00,
+        ),
+        (
+            "spectrum48.rom",
+            "spectrum48",
+            json!({ "out": "&FE", "mask": "&01" }),
+            0x00FE,
+        ),
+    ] {
+        let roms = Roms::programmed(file, &passing(port_address));
+        let mut session = Session::start(&roms);
+        let conditions = json!([
+            { "execute": 0, "to": "&3FFF" },
+            { "read": "&9000", "to": "&90FF" },
+            { "write": "&7F00", "to": "&90FF" },
+            port,
+        ]);
+        let stretch = 3 * SPECTRUM_FRAME_TICKS;
+        let carried = session.open(machine);
+        let (mut tick, mut gathered) = (0, Vec::new());
+        while tick < stretch {
+            let ran = session.run(
+                &carried,
+                json!({ "ticks": stretch - tick, "gather": conditions }),
+            );
+            gathered.extend(ran["gathered"].as_array().unwrap().iter().cloned());
+            tick = ran["tick"].as_u64().unwrap();
+        }
+        let filed = session.open(machine);
+        let path = roms.0.join("gathered.jsonl");
+        let ran = session.run(
+            &filed,
+            json!({ "ticks": stretch, "gather": conditions, "path": path }),
+        );
+        assert_eq!(
+            (&ran["stopped"], &ran["tick"], ran.get("gathered")),
+            (&json!("ticks"), &json!(tick), None),
+            "{machine}: {ran}"
+        );
+        let lines = lines_of(&path);
+        assert!(lines.iter().all(|(list, _)| list == "gather"), "{machine}");
+        let entries: Vec<Value> = lines.into_iter().map(|(_, entry)| entry).collect();
+        assert!(gathered.len() > 1000, "{machine}: {}", gathered.len());
+        assert!(entries == gathered, "{machine}");
+        assert_eq!(
+            ran["written"],
+            json!({
+                "path": path,
+                "sha256": sha256(&fs::read(&path).unwrap()),
+                "gathered": gathered.len(),
+            }),
+            "{machine}"
+        );
+    }
+}
+
+// The stand-in firmware is NOPs, as for a count that fills, each at an
+// address of its own, so a count written to a file holds a place for each
+// of the thousand begun in 4000 ticks, far past the 256 at which an answer's
+// fills, and the run runs the ticks it was asked.
+#[test]
+fn a_count_written_to_a_file_never_fills() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let path = roms.0.join("counted.jsonl");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 4000, "count": [{ "execute": 0, "to": "&3FFF" }], "path": path }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["ticks"], ran.get("counted")),
+        (&json!("ticks"), &json!(4000), None),
+        "{ran}"
+    );
+    let expected: Vec<(String, Value)> = (0..1000)
+        .map(|address| {
+            let told = json!({
+                "tick": 4 * u64::from(address),
+                "execute": ampersand(address),
+                "bytes": "00",
+                "count": 1,
+            });
+            ("count".to_owned(), told)
+        })
+        .collect();
+    assert!(lines_of(&path) == expected);
+    assert_eq!(ran["written"]["counted"], 1000, "{ran}");
+}
+
+// A run that gathers and counts writes both lists to its one file, the
+// matches gathered first and the places counted after, each as the answer of
+// a twin given no path lists them, and what until matched, the read of the
+// 17th pass, stays in the answer; a gathering of the last matches that
+// never comes to its most writes the same file.
+#[test]
+fn a_file_holds_what_gather_and_count_would_have_listed() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let asked = json!({
+        "ticks": 1000,
+        "until": [{ "read": "&9010" }],
+        "gather": [{ "write": "&9000", "to": "&FFFF" }],
+        "count": [{ "execute": 0, "to": "&3FFF" }],
+    });
+    let twin = session.open("spectrum48");
+    let listed = session.run(&twin, asked.clone());
+    let mut written = Vec::new();
+    for (last, file) in [(false, "first.jsonl"), (true, "last.jsonl")] {
+        let handle = session.open("spectrum48");
+        let path = roms.0.join(file);
+        let mut arguments = asked.clone();
+        arguments["path"] = json!(path);
+        arguments["gather_last"] = json!(last);
+        let ran = session.run(&handle, arguments);
+        assert_eq!(
+            (&ran["stopped"], &ran["matched"]),
+            (&json!("matched"), &listed["matched"]),
+            "{ran}"
+        );
+        let gathered = listed["gathered"].as_array().unwrap();
+        let counted = listed["counted"].as_array().unwrap();
+        assert_eq!(
+            (&ran["written"]["gathered"], &ran["written"]["counted"]),
+            (&json!(gathered.len()), &json!(counted.len())),
+            "{ran}"
+        );
+        let lists: Vec<(String, Value)> = gathered
+            .iter()
+            .map(|entry| ("gather".to_owned(), entry.clone()))
+            .chain(
+                counted
+                    .iter()
+                    .map(|entry| ("count".to_owned(), entry.clone())),
+            )
+            .collect();
+        assert_eq!(lines_of(&path), lists);
+        written.push(fs::read(&path).unwrap());
+    }
+    assert!(written[0] == written[1]);
+}
+
+// A file is made only where none is, and a request whose file cannot be made
+// is refused before the machine moves, its journal as it was; a call refused
+// takes the file made for it away again. A relative path is taken from the
+// server's working directory, and the answer and the journal name the file
+// by its absolute path and its hash.
+#[test]
+fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
+    let roms = Roms::all();
+    roms.write_at("spectrum48.rom", 0x3000, &[INC_A, RET]);
+    let taken = roms.write("taken.jsonl", b"kept");
+    let directory = fs::canonicalize(&roms.0).unwrap();
+    let mut session = Session::beside(&roms);
+    let handle = session.open("spectrum48");
+    let counting = json!([{ "execute": 0, "to": "&3FFF" }]);
+    let run =
+        |path: &str| json!({ "handle": handle, "ticks": 400, "count": counting, "path": path });
+    assert_eq!(
+        session.refusal("run", run("taken.jsonl")),
+        format!(
+            "{} is taken, and a file is written only where none is: give a path that names \
+             nothing yet",
+            directory.join("taken.jsonl").display()
+        )
+    );
+    assert_eq!(fs::read(&taken).unwrap(), b"kept");
+    let refused = session.refusal("run", run("nowhere/counted.jsonl"));
+    assert!(
+        refused.starts_with(&format!(
+            "cannot write {}: ",
+            directory.join("nowhere/counted.jsonl").display()
+        )),
+        "{refused}"
+    );
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "ticks": 400, "path": "counted.jsonl" })
+        ),
+        "path names the file gather and count write what they find to, and neither is given; \
+         give gather or count the conditions to watch, or leave path out"
+    );
+    session.refusal(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&3000",
+            "values": { "cpu.sp": 2 },
+            "count": counting,
+            "path": "called.jsonl",
+        }),
+    );
+    assert!(!directory.join("called.jsonl").exists());
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(journal["count"], 1, "{journal}");
+    let ran = session.answer("run", run("counted.jsonl"));
+    let counted = directory.join("counted.jsonl");
+    let file = json!({ "path": counted, "sha256": sha256(&fs::read(&counted).unwrap()) });
+    assert_eq!(
+        ran["written"],
+        json!({ "path": counted, "sha256": file["sha256"], "counted": 100 }),
+        "{ran}"
+    );
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&3000",
+            "values": { "cpu.sp": "&9000" },
+            "count": counting,
+            "path": "called.jsonl",
+        }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    let call_file = directory.join("called.jsonl");
+    assert_eq!(
+        lines_of(&call_file)
+            .iter()
+            .map(|(list, told)| (list.as_str(), told["execute"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [("count", "&3000"), ("count", "&3001")]
+    );
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        journal["entries"][1],
+        json!({
+            "tick": 0,
+            "tool": "run",
+            "arguments": {
+                "ticks": 400,
+                "count": [{ "execute": "&0000", "to": "&3FFF" }],
+                "path": counted,
+            },
+            "written": file,
+        })
+    );
+    assert_eq!(
+        journal["entries"][2]["written"],
+        json!({ "path": call_file, "sha256": sha256(&fs::read(&call_file).unwrap()) })
+    );
+}
+
+// A server whose files can hold no more than four blocks, as a full disc
+// would stop them. ulimit's -f sets "the file size limit(s) in units of 512
+// bytes. [RLIMIT_FSIZE]"; a trap whose action is "" has the shell "ignore
+// each specified condition"; "signals set to be ignored (SIG_IGN) by the
+// calling process image shall be set to be ignored by the new process image"
+// of exec; and past RLIMIT_FSIZE, "if the thread is blocking, or the process
+// is catching or ignoring SIGXFSZ, the operation shall fail with an [EFBIG]
+// error" (POSIX.1-2024: ulimit, trap in the Shell Command Language, exec,
+// getrlimit; https://pubs.opengroup.org/onlinepubs/9799919799/).
+fn held_to_four_blocks(roms: &Roms) -> Session {
+    Session::spawned(
+        Command::new("sh")
+            .arg("-c")
+            .arg("trap '' XFSZ; ulimit -f 4; exec \"$0\" --roms \"$1\"")
+            .arg(env!("CARGO_BIN_EXE_colophon-mcp"))
+            .arg(&roms.0),
+    )
+}
+
+// A file that cannot be written whole is taken away, and the request,
+// which cannot be taken back, is journaled without it, and the refusal says
+// how far it ran and where the machine stands: after the thousand NOPs of
+// 4000 ticks, and after a call of a thousand more and a RET, 10 T-states
+// (UM0080), which returns there.
+#[test]
+fn a_request_whose_file_cannot_be_written_stands_and_says_where() {
+    let roms = Roms::all();
+    roms.write_at("spectrum48.rom", 0x23E8, &[RET]);
+    let mut session = held_to_four_blocks(&roms);
+    let handle = session.open("spectrum48");
+    let refused = |session: &mut Session, tool: &str, arguments: Value| {
+        let path = roms.0.join(format!("{tool}.jsonl"));
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        arguments["count"] = json!([{ "execute": 0, "to": "&FFFF" }]);
+        arguments["path"] = json!(path);
+        let refused = session.refusal(tool, arguments);
+        assert!(!path.exists());
+        let begun = format!("cannot write {}: ", path.display());
+        assert!(refused.starts_with(&begun), "{refused}");
+        refused
+    };
+    let ran = refused(&mut session, "run", json!({ "ticks": 4000 }));
+    assert!(
+        ran.ends_with(
+            "; what was begun there is taken away again. The request is not taken back: it ran \
+             4000 ticks, and the machine stands where it ended, at tick 4000 with its program \
+             counter at &03E8, and its journal holds the request; make it again, from a state kept \
+             before it or from the journal's requests before it, to write the file, at a path the file \
+             system can take it at"
+        ),
+        "{ran}"
+    );
+    let called = refused(
+        &mut session,
+        "call",
+        json!({ "address": "&2000", "values": { "cpu.sp": "&9000" } }),
+    );
+    assert!(
+        called.contains(
+            "The request is not taken back: it ran 4010 ticks, and the machine stands where it \
+             ended, at tick 8010 with its program counter at &03E8"
+        ),
+        "{called}"
+    );
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    let entries: Vec<(&Value, &Value, Option<&Value>)> = journal["entries"].as_array().unwrap()
+        [1..]
+        .iter()
+        .map(|entry| {
+            (
+                &entry["tool"],
+                &entry["arguments"]["path"],
+                entry.get("written"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (&json!("run"), &json!(roms.0.join("run.jsonl")), None),
+            (&json!("call"), &json!(roms.0.join("call.jsonl")), None),
+        ]
+    );
+}
+
 fn sha256(bytes: &[u8]) -> String {
     sha2::Sha256::digest(bytes)
         .iter()
@@ -5319,6 +5757,59 @@ fn a_snapshot_saved_is_what_a_machine_read_from_it_saves_again() {
     }
 }
 
+// A snapshot holds the machine's RAM whole: a CPC's "memory dump" from
+// &100, after its header ("Snapshot (.SNA) file format", Kevin Thacker's
+// cpctech, https://cpctech.cpcwiki.de/docs/snapshot.html), 64K or 128K by
+// peek's RAM addresses, and a Spectrum's 48K after its 27 bytes ("Emulator
+// file formats", World of Spectrum FAQ,
+// https://worldofspectrum.org/faq/reference/formats.htm), the RAM from
+// &4000, save the two bytes below the stack pointer, where the format keeps
+// the program counter.
+#[test]
+fn a_snapshot_holds_the_machines_ram_as_a_memory_image() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    for (machine, kilobytes) in [("cpc6128", 128), ("cpc464", 64)] {
+        let cpc = session.open(machine);
+        let image = varied(0x10000);
+        session.fill(&cpc, 0x0000, &image[..0x8000]);
+        session.fill(&cpc, 0x8000, &image[0x8000..]);
+        if kilobytes == 128 {
+            session.set(&cpc, json!({ "mmr": "&C4" }));
+            session.fill(&cpc, 0x4000, &varied(0x4000)[0x100..]);
+        }
+        let path = roms.0.join(format!("{machine}.sna"));
+        session.answer("snapshot_save", json!({ "handle": cpc, "path": path }));
+        let saved = fs::read(&path).unwrap();
+        let ram: Vec<u8> = (0..kilobytes * 1024)
+            .step_by(4096)
+            .flat_map(|ram| {
+                let peeked = session.answer(
+                    "peek",
+                    json!({ "handle": cpc, "ram": format!("&{ram:05X}"), "length": 4096 }),
+                );
+                bytes_of(peeked["bytes"].as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(saved.len(), 0x100 + kilobytes * 1024, "{machine}");
+        assert!(saved[0x100..] == ram[..], "{machine}");
+    }
+    let spectrum = session.open("spectrum48");
+    session.fill(&spectrum, 0x4000, &varied(0xC000));
+    session.set(&spectrum, json!({ "cpu.sp": "&8000", "cpu.pc": "&1234" }));
+    let path = roms.0.join("spectrum.sna");
+    session.answer("snapshot_save", json!({ "handle": spectrum, "path": path }));
+    let saved = fs::read(&path).unwrap();
+    let mut ram = bytes_of(&session.peek(&spectrum, json!("&4000"), 4096));
+    for address in (0x5000..0x10000).step_by(4096) {
+        ram.extend(bytes_of(&session.peek(&spectrum, json!(address), 4096)));
+    }
+    assert_eq!(saved.len(), 27 + 0xC000);
+    assert_eq!(saved[27 + 0x3FFE..27 + 0x4000], [0x34, 0x12]);
+    ram[0x3FFE..0x4000].copy_from_slice(&[0x34, 0x12]);
+    assert!(saved[27..] == ram[..]);
+}
+
 #[test]
 fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
     let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x4000]);
@@ -5768,6 +6259,15 @@ fn the_journal_made_again_makes_the_machine_again() {
                 "count_by": "pc",
             }),
         ),
+        (
+            "run",
+            json!({
+                "ticks": 20000,
+                "gather": [{ "write": "&9000", "to": "&9FFF" }],
+                "count": [{ "execute": "&0000", "to": "&3FFF" }],
+                "path": roms.0.join("written.jsonl"),
+            }),
+        ),
     ] {
         asked.push((json!(tool), arguments.clone(), now.clone()));
         let answer = ask(&mut session, &handle, tool, &arguments);
@@ -5827,14 +6327,24 @@ fn the_journal_made_again_makes_the_machine_again() {
         .as_str()
         .unwrap()
         .to_owned();
+    // A file is written only where none is, so the request that wrote one
+    // is made again at a path of its own, and writes what the first held.
     for entry in &entries[1..] {
-        ask(
+        let mut arguments = entry["arguments"].clone();
+        if !entry["written"].is_null() {
+            arguments["path"] = json!(roms.0.join("written again.jsonl"));
+        }
+        let answer = ask(
             &mut session,
             &again,
             entry["tool"].as_str().unwrap(),
-            &entry["arguments"],
+            &arguments,
         );
+        if !entry["written"].is_null() {
+            assert_eq!(answer["written"]["sha256"], entry["written"]["sha256"]);
+        }
     }
+    assert!(entries.iter().any(|entry| !entry["written"].is_null()));
     assert_eq!(
         session.run(&again, json!({ "ticks": 1 }))["tick"],
         session.run(&handle, json!({ "ticks": 1 }))["tick"]
@@ -7098,6 +7608,92 @@ fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
             "{machine}"
         );
         assert_eq!(fs::read(&path).unwrap(), blank);
+    }
+}
+
+// As it starts, AMSDOS calls its "BIOS: SETUP DISC" with its "default BIOS:
+// SETUP DISC parameters", which sends the "specify command", the last of
+// whose bytes is &03, its "head load delay and dma flag" (Kevin Thacker's
+// "Disassembly of AMSDOS ROM", https://cpctech.cpcwiki.de/docs/amsdos.asm,
+// at &C5EF, &C60D and &C5D4), the flag the emulator's specify() keeps as
+// fdc.non_dma. A snapshot keeps no controller, so a machine read from one
+// finds it as at power-on and catalogues no disc there, where the machine it
+// was saved from catalogues the same disc as blank, as the test above reads
+// it, and so does one read from it with fdc.non_dma written back.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_read_from_its_snapshot_finds_its_disc_controller_as_at_power_on() {
+    let scratch = Roms::new(&[]);
+    let disc = scratch.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::reading(&firmware());
+    let live = session.open("cpc6128");
+    session.run(&live, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    assert_eq!(session.inspect(&live, "fdc.non_dma"), true);
+    let snapshot = scratch.0.join("started.sna");
+    session.answer("snapshot_save", json!({ "handle": live, "path": snapshot }));
+    let read = session.open_from("cpc6128", &snapshot);
+    assert_eq!(session.inspect(&read, "fdc.non_dma"), false);
+    let mended = session.open_from("cpc6128", &snapshot);
+    session.set(&mended, json!({ "fdc.non_dma": true }));
+    let font = cpc_font(&mut session, &live, "cpc6128");
+    let mut catalogues = Vec::new();
+    for handle in [&live, &read, &mended] {
+        session.answer("disc_insert", json!({ "handle": handle, "path": disc }));
+        session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
+        session.run(handle, json!({ "frames": 250 }));
+        let text = cpc_text(&mut session, handle, &scratch, &font);
+        catalogues.push(text.iter().any(|line| line.replace(' ', "") == "178Kfree"));
+    }
+    assert_eq!(catalogues, [true, false, true]);
+}
+
+// A run by frames ends just past the retrace, which comes inside the handler
+// of the frame's interrupt on either machine's firmware, IFF1 clear, and a
+// routine called there runs with no interrupt, where one called with IFF1
+// and IFF2 set has its handler, at &0038 (UM0080) in the interrupt mode 1
+// both firmwares use, run within the call. The routine waits on DJNZ,
+// sixty passes of 256 rounds of it, longer than a frame on either machine.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_run_by_frames_leaves_either_firmware_inside_its_interrupts_handler() {
+    let waiting = [LD_C, 60, LD_B, 0, DJNZ, 0xFE, DEC_C, JR_NZ, 0xF9, RET];
+    let waiting: String = waiting.iter().map(|byte| format!("{byte:02X}")).collect();
+    let mut session = Session::reading(&firmware());
+    for (machine, started) in [
+        ("cpc6128", 78 * CPC_FRAME_TICKS),
+        ("spectrum48", 128 * SPECTRUM_FRAME_TICKS),
+    ] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": started }));
+        let ran = session.run(
+            &handle,
+            json!({ "frames": 1, "gather": [{ "execute": "&0038" }], "gather_last": true }),
+        );
+        let handled = ran["gathered"].as_array().unwrap().last().unwrap()["tick"].clone();
+        assert!(
+            ran["tick"].as_u64().unwrap() - handled.as_u64().unwrap() < 1000,
+            "{machine}: {ran}"
+        );
+        assert_eq!(session.inspect(&handle, "cpu.iff1"), false, "{machine}");
+        session.poke(&handle, json!("&9000"), &waiting);
+        let state = keep(&mut session, &handle);
+        let handled = |session: &mut Session, values: Value| {
+            let called = session.answer(
+                "call",
+                json!({
+                    "handle": handle,
+                    "address": "&9000",
+                    "values": values,
+                    "count": [{ "execute": "&0038" }],
+                }),
+            );
+            assert_eq!(called["stopped"], "returned", "{machine}: {called}");
+            called["counted"].as_array().unwrap().len()
+        };
+        assert_eq!(handled(&mut session, json!({})), 0, "{machine}");
+        restore(&mut session, &handle, &state);
+        let enabled = json!({ "cpu.iff1": true, "cpu.iff2": true });
+        assert_eq!(handled(&mut session, enabled), 1, "{machine}");
     }
 }
 
