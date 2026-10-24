@@ -5,14 +5,19 @@
 
 #include <stddef.h>
 
-static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t address) {
+static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t address,
+                   uint32_t location) {
   if (condition->kind != kind) {
     return false;
   }
   if (kind == MCP_IN || kind == MCP_OUT) {
     return ((address ^ condition->first) & condition->mask) == 0;
   }
-  return address >= condition->first && address <= condition->last;
+  if (address < condition->first || address > condition->last) {
+    return false;
+  }
+  return condition->memory == MCP_ANY_MEMORY ||
+         (condition->memory == MCP_ROM) == (location >= MCP_FIRST_ROM_LOCATION);
 }
 
 /* Where the match counted as this one is kept, if below room. */
@@ -24,8 +29,8 @@ static uint32_t kept_at(const mcp_watch_t *watch, uint32_t match) {
    count at its last new place. An instruction is counted only as it begins,
    where the pc is its own address. */
 static void count(mcp_watch_t *watch, const mcp_match_t *match) {
-  uint16_t place = watch->counts_by_pc ? match->pc : match->address;
-  uint32_t *counted = &watch->counts[(uint32_t)match->kind * MCP_COUNTS_PER_KIND + place];
+  uint32_t place = watch->counts_by_pc ? match->pc_location : match->location;
+  uint32_t *counted = &watch->counts[(uint32_t)match->kind * watch->counts_per_kind + place];
   if (*counted == 0) {
     if (watch->counted < watch->place_room) {
       mcp_place_t *kept = &watch->places[watch->counted];
@@ -45,12 +50,14 @@ static void count(mcp_watch_t *watch, const mcp_match_t *match) {
    match is counted where it may be gathered. */
 static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp_kind_t kind,
                 uint16_t address, uint8_t value, bool may_stop, bool may_gather) {
+  bool memory = kind == MCP_EXECUTE || kind == MCP_READ || kind == MCP_WRITE;
+  uint32_t location = memory ? watch->locate(watch->machine, address, kind == MCP_WRITE) : address;
   bool stops = false;
   bool gathers = false;
   bool counts = false;
   for (uint32_t index = 0; index < watch->condition_count; index++) {
     const mcp_condition_t *condition = &watch->conditions[index];
-    if (agrees(condition, kind, address)) {
+    if (agrees(condition, kind, address, location)) {
       stops |= condition->list == MCP_UNTIL && may_stop;
       gathers |= condition->list == MCP_GATHER && may_gather;
       counts |= condition->list == MCP_COUNT && may_gather;
@@ -60,8 +67,10 @@ static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp
       .tick = tick,
       .kind = kind,
       .address = address,
+      .location = location,
       .value = value,
       .pc = watch->pc,
+      .pc_location = watch->pc_location,
       .response = kind != MCP_EXECUTE && watch->responding,
       .beam_x = monitor->beam_x,
       .beam_y = monitor->beam_y,
@@ -104,13 +113,20 @@ static bool arrived(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monit
   return watch->matched || watch->returned;
 }
 
+/* At the instruction under way: where it begins, and in which memory, before
+   it can page another in. */
+static void began(mcp_watch_t *watch, const z80_t *cpu) {
+  watch->pc = cpu->pc;
+  watch->pc_location = watch->locate(watch->machine, cpu->pc, false);
+}
+
 bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const monitor_t *monitor,
                       uint64_t tick) {
   bool first = !watch->begun;
   watch->begun = true;
   if (!settled) {
     if (first) {
-      watch->pc = cpu->pc;
+      began(watch, cpu);
       watch->fetched = true;
     }
     /* The response to INT begins with its acknowledge; the response to an
@@ -121,7 +137,7 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
     }
     return false;
   }
-  watch->pc = cpu->pc;
+  began(watch, cpu);
   watch->responding = false;
   watch->fetching = NULL;
   watch->fetched = false;

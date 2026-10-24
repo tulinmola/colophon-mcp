@@ -18,7 +18,7 @@ use crate::emulator::{
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, COUNTS_PER_KIND, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, Spectrum,
+    COUNT, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, SPECTRUM_LOCATIONS, Spectrum,
     SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
@@ -719,12 +719,14 @@ pub struct Watching<'a> {
 
 // What a run saw, when it watched: every match, in the order it happened,
 // or the last it gathered, its tick counted from the machine's start, and
-// every place counted, by kind and then by address or pc, with how many
-// times it matched; and whether the processor halting for good stopped it,
-// which a run watched or not may.
+// every place counted, by kind, then by address or pc, then by location,
+// with how many times it matched; whether the machine pages ROMs and RAM, so
+// that an address does not say which holds a byte; and whether the processor
+// halting for good stopped it, which a run watched or not may.
 pub struct Watched {
     pub matches: Vec<Match>,
     pub counts: Vec<(Place, u32)>,
+    pub paged: bool,
     pub matched: bool,
     pub full: bool,
     pub returned: bool,
@@ -776,6 +778,13 @@ impl Built {
         match &self.hardware {
             Hardware::Cpc(cpc) => cpc.machine().cpu.pc,
             Hardware::Spectrum(spectrum) => spectrum.machine().cpu.pc,
+        }
+    }
+
+    fn locations(&self) -> u32 {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.locations(),
+            Hardware::Spectrum(_) => SPECTRUM_LOCATIONS,
         }
     }
 
@@ -928,15 +937,21 @@ impl Built {
         // arrays of them, and all-zero bytes are a value of each.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
         let counting = conditions.iter().any(|condition| condition.list == COUNT);
-        let every_place = KINDS.len() * COUNTS_PER_KIND;
+        let locations = self.locations() as usize;
+        let every_place = KINDS.len() * locations;
         let (size, place_room, most_counted) = match (counting, watching.most_counted) {
             (false, _) => (0, 0, 0),
             (true, Some(most)) => (every_place, most.saturating_add(ROOM_PAST_FULL), most),
             (true, None) => (every_place, every_place as u32, u32::MAX),
         };
         let mut counts = vec![0; size];
+        // Room for every place a count to a file can reach, 1671168 on a 6128,
+        // is asked for zeroed rather than filled, so that room no place is
+        // kept in is never written.
         // SAFETY: as for a match.
-        let mut places = vec![unsafe { std::mem::zeroed::<Place>() }; place_room as usize];
+        let mut places =
+            unsafe { Box::<[Place]>::new_zeroed_slice(place_room as usize).assume_init() }
+                .into_vec();
         let mut watch = Watch::new(
             conditions,
             &mut matches,
@@ -995,30 +1010,32 @@ impl Built {
         );
         let place = |kept: &Place| {
             let first = &kept.first;
-            let at = if watching.counts_by_pc {
-                first.pc
+            if watching.counts_by_pc {
+                (first.kind, first.pc, first.pc_location)
             } else {
-                first.address
-            };
-            (first.kind, at)
+                (first.kind, first.address, first.location)
+            }
         };
         places.truncate(watch.counted as usize);
         places.sort_by_key(place);
         let counted = places
             .into_iter()
             .map(|mut kept| {
-                let (kind, at) = place(&kept);
+                let (kind, _, location) = place(&kept);
+                assert!(
+                    (location as usize) < locations,
+                    "a place counted at location {location:#X}, past the {locations:#X} the \
+                     machine has"
+                );
                 kept.first.tick += self.tick;
-                (
-                    kept,
-                    counts[kind as usize * COUNTS_PER_KIND + usize::from(at)],
-                )
+                (kept, counts[kind as usize * locations + location as usize])
             })
             .collect();
         self.tick += run.ticks;
         let watched = Watched {
             matches,
             counts: counted,
+            paged: matches!(self.hardware, Hardware::Cpc(_)),
             matched: watch.matched,
             full: watch.full,
             returned: watch.returned,

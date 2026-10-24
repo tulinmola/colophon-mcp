@@ -1047,6 +1047,7 @@ const INC_BC: u8 = 0x03;
 const INC_HL: u8 = 0x23;
 const INC_AT_HL: u8 = 0x34;
 const INC_L: u8 = 0x2C;
+const JP: u8 = 0xC3;
 const JR: u8 = 0x18;
 const JR_NZ: u8 = 0x20;
 const JR_Z: u8 = 0x28;
@@ -2269,6 +2270,21 @@ fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
         "{refusal}"
     );
     assert!(session.handles().is_empty());
+}
+
+// Each match or place listed, without the tick it came at or the beam.
+fn timeless(list: &Value) -> Vec<Value> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|seen| {
+            let mut seen = seen.clone();
+            for key in ["tick", "beam_x", "beam_y"] {
+                seen.as_object_mut().expect("an object").remove(key);
+            }
+            seen
+        })
+        .collect()
 }
 
 // What a run or a call answered it matched, gathered or counted, each as its
@@ -3548,6 +3564,8 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "out": "&7F00", "mask": "&C000" }),
         json!({ "psg": 7 }),
         json!({ "psg": 0, "to": 15 }),
+        json!({ "execute": "&0038", "memory": "ram" }),
+        json!({ "read": 1, "to": 2, "memory": "rom" }),
     ] {
         if let Err(problem) = fitting(&condition) {
             panic!("{condition}: {problem}");
@@ -3558,6 +3576,8 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "psg": "&07" }),
         json!({ "psg": 1, "mask": 2 }),
         json!({ "in": "&F500" }),
+        json!({ "write": 1, "memory": "ram" }),
+        json!({ "execute": 1, "memory": "flash" }),
     ] {
         assert!(fitting(&condition).is_err(), "{condition}");
     }
@@ -3575,10 +3595,12 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         )
     };
     let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
-                 address}, each with \"to\" and the last address if it is a range, {\"in\": port, \
-                 \"mask\": bits} or {\"out\": port, \"mask\": bits}, the mask being the bits of \
-                 the port's address that its device decodes, or on a CPC {\"psg\": register}, \
-                 with \"to\" and the last register if it is a range";
+                 address}, each with \"to\" and the last address if it is a range, and an execute \
+                 or a read with \"memory\": \"ram\" or \"rom\" if only the RAM's bytes or only a \
+                 ROM's are to match; {\"in\": port, \"mask\": bits} or {\"out\": port, \
+                 \"mask\": bits}, the mask being the bits of the port's address that its device \
+                 decodes; or on a CPC {\"psg\": register}, with \"to\" and the last register if \
+                 it is a range";
     assert_eq!(
         refused(&mut session, json!({ "read": 5, "out": 6 })),
         format!(
@@ -3588,6 +3610,17 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
     assert_eq!(
         refused(&mut session, json!({ "to": 5 })),
         format!("until[1]: {{\"to\":5}} names no kind; {forms}")
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "write": 5, "memory": "ram" })),
+        format!(
+            "until[1]: {{\"write\":5,\"memory\":\"ram\"}} has memory, which write does not \
+             take; {forms}"
+        )
+    );
+    assert_eq!(
+        refused(&mut session, json!({ "execute": 5, "memory": "flash" })),
+        format!("until[1]: memory \"flash\" is neither \"ram\" nor \"rom\"; {forms}")
     );
     assert_eq!(
         refused(&mut session, json!({ "out": "&FE", "mask": 70000 })),
@@ -4529,13 +4562,16 @@ const KINDS: [&str; 5] = ["execute", "read", "write", "in", "out"];
 
 // A match or a place as a run or a call answered it: its tick, its kind, by
 // its place among KINDS, its address or port, where the instruction that
-// made it begins, and how many times it matched, once for a match.
-#[derive(Clone, Copy, Debug)]
+// made it begins, the ROM or the RAM a CPC names as holding either, and how
+// many times it matched, once for a match.
+#[derive(Clone, Debug)]
 struct Told {
     tick: u64,
     kind: usize,
     address: u64,
     pc: Option<u64>,
+    memory: Option<String>,
+    pc_memory: Option<String>,
     count: u64,
 }
 
@@ -4553,6 +4589,14 @@ fn told(list: &Value) -> Vec<Told> {
                 kind,
                 address: after_ampersand(&told[KINDS[kind]], 4),
                 pc: told.get("pc").map(|pc| after_ampersand(pc, 4)),
+                memory: ["rom", "ram"]
+                    .iter()
+                    .find_map(|tag| told.get(*tag))
+                    .map(Value::to_string),
+                pc_memory: ["pc_rom", "pc_ram"]
+                    .iter()
+                    .find_map(|tag| told.get(*tag))
+                    .map(Value::to_string),
                 count: told.get("count").map_or(1, |count| count.as_u64().unwrap()),
             }
         })
@@ -4623,20 +4667,20 @@ fn counting_a_stretch_is_tallying_a_gathering_of_it() {
         let (gathered_to, gatherings) = over("gather", None);
         let gathered: Vec<Told> = gatherings
             .iter()
-            .flat_map(|(_, answered)| answered.iter().copied())
+            .flat_map(|(_, answered)| answered.iter().cloned())
             .collect();
         for count_by in ["address", "pc"] {
-            let place = |told: &Told| {
-                let by_pc = count_by == "pc";
-                (told.kind, told.pc.filter(|_| by_pc).unwrap_or(told.address))
+            let place = |told: &Told| match told.pc.filter(|_| count_by == "pc") {
+                Some(pc) => (told.kind, pc, told.pc_memory.clone()),
+                None => (told.kind, told.address, told.memory.clone()),
             };
             let (counted_to, countings) = over("count", Some(count_by));
             assert_eq!(gathered_to, counted_to, "{machine}");
-            let mut tally: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+            let mut tally: BTreeMap<(usize, u64, Option<String>), u64> = BTreeMap::new();
             for seen in &gathered {
                 *tally.entry(place(seen)).or_insert(0) += 1;
             }
-            let mut counted: BTreeMap<(usize, u64), u64> = BTreeMap::new();
+            let mut counted: BTreeMap<(usize, u64, Option<String>), u64> = BTreeMap::new();
             for (began, answered) in &countings {
                 // Executes first, then reads, writes and ports, each kind by
                 // address or by pc.
@@ -4656,6 +4700,11 @@ fn counting_a_stretch_is_tallying_a_gathering_of_it() {
                     assert_eq!(
                         (first.tick, first.address, first.pc),
                         (told.tick, told.address, told.pc),
+                        "{machine} by {count_by}: {told:?}"
+                    );
+                    assert_eq!(
+                        (&first.memory, &first.pc_memory),
+                        (&told.memory, &told.pc_memory),
                         "{machine} by {count_by}: {told:?}"
                     );
                 }
@@ -4801,6 +4850,240 @@ fn an_instruction_counted_keeps_the_bytes_it_first_ran() {
         );
         assert_eq!(session.peek(&handle, json!("&9000"), 1), "04");
     }
+}
+
+// A 464's lower ROM and the RAM beneath it each hold code from &0000 on
+// that turns the lower ROM off, or on, through the Gate Array's RMR, whose
+// LR bit enables (0) or disables (1) it; while it is enabled, "all CPU read
+// operations where the ROM is paged will, fortunatly, read the ROM", and
+// writes "affect the “underlying” RAM" ("The Gate Array", Grim,
+// https://web.archive.org/web/20260710174425/https://www.grimware.org/doku.php/documentations/devices/gatearray),
+// as a poke's do. So the processor runs &0000 and &0003 from the ROM, &0005,
+// &0000 and &0003 from the RAM, and &0005 from the ROM again, round and
+// round.
+const LOWER_ROM_TURNING_ITSELF_OFF: [u8; 7] = [LD_BC, 0x84, 0x7F, OUT_C_C[0], OUT_C_C[1], JR, 0xF9];
+const RAM_TURNING_THE_LOWER_ROM_ON: [u8; 8] =
+    [LD_BC, 0x80, 0x7F, OUT_C_C[0], OUT_C_C[1], JP, 0x00, 0x00];
+
+#[test]
+fn a_cpcs_match_says_which_memory_held_its_byte() {
+    let roms = Roms::programmed("cpc464.rom", &LOWER_ROM_TURNING_ITSELF_OFF);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(
+        &handle,
+        json!(0),
+        &digit_pairs(&RAM_TURNING_THE_LOWER_ROM_ON),
+    );
+    let until = |memory: &str| json!([{ "execute": 0, "memory": memory }]);
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 1000,
+            "until": until("rom"),
+            "gather": [{ "execute": 0, "to": 7 }, { "out": "&7F00", "mask": "&C000" }],
+        }),
+    );
+    assert_eq!(
+        timeless(&ran["gathered"]),
+        [
+            json!({ "execute": "&0000", "rom": "lower" }),
+            json!({ "execute": "&0003", "rom": "lower" }),
+            json!({ "out": "&7F84", "value": "&84", "pc": "&0003", "pc_rom": "lower" }),
+            json!({ "execute": "&0005" }),
+            json!({ "execute": "&0000" }),
+            json!({ "execute": "&0003" }),
+            json!({ "out": "&7F80", "value": "&80", "pc": "&0003" }),
+            json!({ "execute": "&0005", "rom": "lower" }),
+        ],
+        "{ran}"
+    );
+    assert_eq!(
+        timeless(&ran["matched"]),
+        [json!({ "execute": "&0000", "rom": "lower" })]
+    );
+    let ran = session.run(&handle, json!({ "ticks": 1000, "until": until("ram") }));
+    assert_eq!(timeless(&ran["matched"]), [json!({ "execute": "&0000" })]);
+    assert_eq!(
+        session.inspect(&handle, "gate_array.lower_rom_enabled"),
+        false
+    );
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 1000, "until": until("ram"), "count": [{ "execute": 0, "to": 7 }] }),
+    );
+    assert_eq!(
+        timeless(&ran["counted"]),
+        [
+            json!({ "execute": "&0000", "bytes": "01807F", "count": 1 }),
+            json!({ "execute": "&0000", "rom": "lower", "bytes": "01847F", "count": 1 }),
+            json!({ "execute": "&0003", "bytes": "ED49", "count": 1 }),
+            json!({ "execute": "&0003", "rom": "lower", "bytes": "ED49", "count": 1 }),
+            json!({ "execute": "&0005", "bytes": "C30000", "count": 1 }),
+            json!({ "execute": "&0005", "rom": "lower", "bytes": "18F9", "count": 1 }),
+        ],
+        "{ran}"
+    );
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 1000,
+            "until": until("ram"),
+            "count": [{ "out": "&7F00", "mask": "&C000" }],
+            "count_by": "pc",
+        }),
+    );
+    assert_eq!(
+        timeless(&ran["counted"]),
+        [
+            json!({ "out": "&7F80", "pc": "&0003", "count": 1 }),
+            json!({ "out": "&7F84", "pc": "&0003", "pc_rom": "lower", "count": 1 }),
+        ],
+        "{ran}"
+    );
+}
+
+// A step ends inside a chain of 200 DD prefixes in a 464's lower ROM, longer
+// than the core waits for an instruction's end, and a run begun there still
+// says the ROM held the instruction that reads at the chain's end.
+#[test]
+fn a_run_begun_inside_a_chain_of_prefixes_names_its_memory() {
+    let program = [&[PREFIX_DD; 200][..], &[LD_A_FROM, 0x00, 0x90, JR, 0xFE]].concat();
+    let roms = Roms::programmed("cpc464.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    let step = session.step(&handle, 1);
+    assert_eq!(step["stopped"], "unsettled", "{step}");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 2000, "gather": [{ "read": "&9000" }] }),
+    );
+    let read = &ran["gathered"][0];
+    assert_eq!(
+        (&read["pc_rom"], read.get("pc_ram")),
+        (&json!("lower"), None),
+        "{ran}"
+    );
+}
+
+// A routine in a 6128's RAM at &8000 pages RAM configurations 4, 3 and 1 in
+// by the PAL's MMR, and the ROMs by the Gate Array's RMR and the ROM number
+// latch at &DFxx, and writes or reads under each, first calling a routine of
+// the second 64K at &4000. Configuration 4 puts the second 64K's first block
+// at &4000, 3 the base 64K's last, and 1 the second 64K's last at &C000
+// ("Ram management", Kevin Thacker's cpctech,
+// https://cpctech.cpcwiki.de/docs/rampage.html): &10000, &C000 and &1C000 by
+// the RAM's own addresses. The upper ROM the latch selects answers a read at
+// &C000: AMSDOS at 7, and at 5, where nothing is fitted, BASIC, ROM 0: "BASIC
+// will be selected if an attempt is made to select a rom which is not
+// connected" (cpctech's "Expansion ROM Selection",
+// https://web.archive.org/web/20190604090025/http://cpctech.cpc-live.com/docs/exprom.html).
+// Last it writes &C000 under configuration 0, the byte configuration 3 put at
+// &4000, which a count then holds as one place with the write that went
+// there first, beside the second 64K's byte at &4000.
+#[test]
+fn a_6128s_match_says_where_its_ram_and_its_roms_answer() {
+    let roms = Roms::programmed("cpc6128.rom", &[0x11]);
+    roms.write_at("cpc6128.rom", 0x4000, &[0xF0]);
+    roms.write_at("amsdos.rom", 0, &[0x07]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(
+        &handle,
+        json!("&4000"),
+        &digit_pairs(&[LD_TO_A, 0x00, 0x90, RET]),
+    );
+    session.set(&handle, json!({ "mmr": 0xC1 }));
+    session.poke(&handle, json!("&C000"), "3C");
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    let routine = [
+        &[LD_BC, 0xC4, 0x7F, OUT_C_C[0], OUT_C_C[1], CALL, 0x00, 0x40][..],
+        &[LD_A, 0xAB, LD_TO_A, 0x00, 0x40],
+        &[LD_C, 0xC3, OUT_C_C[0], OUT_C_C[1], LD_TO_A, 0x00, 0x40],
+        &[
+            LD_C, 0xC1, OUT_C_C[0], OUT_C_C[1], LD_C, 0x8C, OUT_C_C[0], OUT_C_C[1],
+        ],
+        &[LD_A_FROM, 0x00, 0xC0],
+        &[
+            LD_C, 0x84, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x07, 0xDF, OUT_C_C[0], OUT_C_C[1],
+        ],
+        &[
+            LD_A_FROM, 0x00, 0xC0, LD_C, 0x05, OUT_C_C[0], OUT_C_C[1], LD_A_FROM, 0x00, 0xC0,
+        ],
+        &[
+            LD_BC, 0x80, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_A_FROM, 0x00, 0x00,
+        ],
+        &[LD_C, 0xC0, OUT_C_C[0], OUT_C_C[1], LD_TO_A, 0x00, 0xC0, RET],
+    ]
+    .concat();
+    session.poke(&handle, json!("&8000"), &digit_pairs(&routine));
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&8000",
+            "values": { "cpu.sp": "&A000", "cpu.a": "&5A" },
+            "gather": [
+                { "execute": "&4000" },
+                { "write": "&4000" },
+                { "write": "&9000" },
+                { "read": "&C000" },
+                { "read": 0 },
+            ],
+            "count": [{ "write": "&4000" }, { "write": "&C000" }],
+        }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    assert_eq!(
+        timeless(&called["gathered"]),
+        [
+            json!({ "execute": "&4000", "ram": "&10000" }),
+            json!({ "write": "&9000", "value": "&5A", "pc": "&4000", "pc_ram": "&10000" }),
+            json!({ "write": "&4000", "ram": "&10000", "value": "&AB", "pc": "&800A" }),
+            json!({ "write": "&4000", "ram": "&C000", "value": "&AB", "pc": "&8011" }),
+            json!({ "read": "&C000", "ram": "&1C000", "value": "&3C", "pc": "&801C" }),
+            json!({ "read": "&C000", "rom": "upper 7", "value": "&07", "pc": "&8028" }),
+            json!({ "read": "&C000", "rom": "upper 0", "value": "&F0", "pc": "&802F" }),
+            json!({ "read": "&0000", "rom": "lower", "value": "&11", "pc": "&8037" }),
+        ],
+        "{called}"
+    );
+    assert_eq!(
+        timeless(&called["counted"]),
+        [
+            json!({ "write": "&4000", "ram": "&C000", "pc": "&8011", "count": 2 }),
+            json!({ "write": "&4000", "ram": "&10000", "pc": "&800A", "count": 1 }),
+        ],
+        "{called}"
+    );
+}
+
+// A Spectrum's ROM is below &4000 for good, so a condition on the RAM and one
+// on the ROM over the whole of memory each stop at the next instruction it
+// holds, and a match names neither, its address saying which.
+#[test]
+fn a_spectrums_conditions_tell_its_rom_from_its_ram() {
+    let roms = Roms::programmed("spectrum48.rom", &[DI, JP, 0x00, 0x90]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&9000"), &digit_pairs(&[JP, 0x01, 0x00]));
+    let everywhere = |memory: &str| json!([{ "execute": 0, "to": "&FFFF", "memory": memory }]);
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 100,
+            "until": everywhere("ram"),
+            "gather": [{ "execute": 0, "to": "&FFFF" }],
+        }),
+    );
+    assert_eq!(timeless(&ran["matched"]), [json!({ "execute": "&9000" })]);
+    assert_eq!(
+        timeless(&ran["gathered"]),
+        [json!({ "execute": "&0000" }), json!({ "execute": "&0001" })]
+    );
+    let ran = session.run(&handle, json!({ "ticks": 100, "until": everywhere("rom") }));
+    assert_eq!(timeless(&ran["matched"]), [json!({ "execute": "&0001" })]);
 }
 
 // The stand-in firmware is zeros, NOPs from &0000 on, each beginning at an
@@ -6401,7 +6684,7 @@ fn the_journal_writes_addresses_after_an_ampersand() {
     assert_eq!(poked, json!({ "address": "&8001", "length": 1 }));
     let ran = json!({
         "ticks": 100,
-        "until": [{ "execute": 4096, "to": "#1FFF" }],
+        "until": [{ "execute": 4096, "to": "#1FFF", "memory": "rom" }],
         "gather": [{ "write": "$9000", "to": "&9000" }, { "out": 254, "mask": 1 }],
         "gather_last": true,
         "count": [{ "in": "#FE", "mask": "0x1" }],
@@ -6432,7 +6715,7 @@ fn the_journal_writes_addresses_after_an_ampersand() {
             json!({ "address": "&8001", "bytes": "22" }),
             json!({
                 "ticks": 100,
-                "until": [{ "execute": "&1000", "to": "&1FFF" }],
+                "until": [{ "execute": "&1000", "to": "&1FFF", "memory": "rom" }],
                 "gather": [{ "write": "&9000" }, { "out": "&00FE", "mask": "&0001" }],
                 "gather_last": true,
                 "count": [{ "in": "&00FE", "mask": "&0001" }],
@@ -6568,6 +6851,11 @@ fn command_line_run(machine: &str, snapshot: &Path, frames: u32, saved: &Path) {
         OsStr::new("--save"),
         saved.as_os_str(),
     ]);
+}
+
+// Bytes as poke takes them, in pairs of hexadecimal digits.
+fn digit_pairs(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 fn bytes_of(hexadecimal: &str) -> Vec<u8> {
@@ -7121,6 +7409,157 @@ fn a_cpc_writes_its_psg_where_its_firmware_writes() {
             "{machine}"
         );
     }
+}
+
+// The 6128's firmware starts BASIC at &C006 of ROM 0, "execution address
+// for BASIC" (Kernel.asm, &007D, in Bread80's unassembly of it,
+// https://github.com/Bread80/CPC6128-Firmware-Source), and KL ROM WALK
+// selects each ROM from 15 down, "get ROM class" at &C000 (&033C), and calls
+// &C006 of each background ROM (&0346), passing by the foreground ROM, 0;
+// "if no ROM at this address then we'll get ROM 0 (BASIC)". AMSDOS, ROM 7,
+// has &01 at &C000 and its init at &C006, JP &C1BC (Kevin Thacker's AMSDOS
+// disassembly, https://cpctech.cpcwiki.de/docs/amsdos.asm). Counted, &C006
+// is a place in each ROM.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_6128s_firmware_walks_its_roms_where_its_listing_does() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({
+            "frames": 150,
+            "gather": [{ "execute": "&C006" }, { "read": "&C000" }],
+            "count": [{ "execute": "&C006" }],
+        }),
+    );
+    let gathered = timeless(&ran["gathered"]);
+    let started: Vec<&Value> = gathered
+        .iter()
+        .filter(|seen| seen.get("execute").is_some())
+        .collect();
+    assert_eq!(
+        started,
+        [
+            &json!({ "execute": "&C006", "rom": "upper 0" }),
+            &json!({ "execute": "&C006", "rom": "upper 7" }),
+        ],
+        "{ran}"
+    );
+    let classes: Vec<(Value, Option<Value>)> = gathered
+        .iter()
+        .filter(|seen| seen["pc"] == "&033C")
+        .map(|seen| {
+            assert_eq!(seen["pc_rom"], "lower", "{seen}");
+            let amsdos = seen["rom"] == "upper 7";
+            (seen["rom"].clone(), amsdos.then(|| seen["value"].clone()))
+        })
+        .collect();
+    let walked: Vec<(Value, Option<Value>)> = (1..=15)
+        .rev()
+        .map(|number| {
+            if number == 7 {
+                (json!("upper 7"), Some(json!("&01")))
+            } else {
+                (json!("upper 0"), None)
+            }
+        })
+        .collect();
+    assert_eq!(classes, walked, "{ran}");
+    let places: Vec<(&Value, &Value)> = ran["counted"]
+        .as_array()
+        .expect("a count")
+        .iter()
+        .map(|place| (&place["rom"], &place["count"]))
+        .collect();
+    assert_eq!(
+        places,
+        [
+            (&json!("upper 0"), &json!(1)),
+            (&json!("upper 7"), &json!(1))
+        ],
+        "{ran}"
+    );
+    assert_eq!(ran["counted"][1]["bytes"], "C3BCC1", "{ran}");
+}
+
+// The firmware does as Kernel.asm says at &0044, in Bread80's unassembly,
+// "copy first &40 bytes of this rom to &0000", in RAM, so the interrupt entry
+// at &0038, JP &B941 (LowJumpblock.asm), stands in the lower ROM and in the
+// RAM beneath it, and is run from the ROM while the Gate Array enables it,
+// and from the RAM while not ("The Gate Array", Grim). A condition on the
+// RAM's stops only where the lower ROM is disabled, and one on the ROM's
+// only where it is enabled.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_6128s_interrupt_entry_runs_from_its_rom_and_from_its_copy_in_ram() {
+    let mut session = Session::reading(&firmware());
+    for (memory, enabled) in [("ram", false), ("rom", true)] {
+        let handle = session.open("cpc6128");
+        let ran = session.run(
+            &handle,
+            json!({ "frames": 100, "until": [{ "execute": "&0038", "memory": memory }] }),
+        );
+        let entry = if enabled {
+            json!({ "execute": "&0038", "rom": "lower" })
+        } else {
+            json!({ "execute": "&0038" })
+        };
+        assert_eq!(timeless(&ran["matched"]), [entry], "{ran}");
+        assert_eq!(
+            session.inspect(&handle, "gate_array.lower_rom_enabled"),
+            enabled,
+            "{memory}"
+        );
+    }
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 100, "count": [{ "execute": "&0038" }] }),
+    );
+    let places: Vec<(Option<&Value>, &Value)> = ran["counted"]
+        .as_array()
+        .expect("a count")
+        .iter()
+        .map(|place| (place.get("rom"), &place["bytes"]))
+        .collect();
+    assert_eq!(
+        places,
+        [
+            (None, &json!("C341B9")),
+            (Some(&json!("lower")), &json!("C341B9"))
+        ],
+        "{ran}"
+    );
+}
+
+// The firmware copies its restarts as Kernel.asm says at &0044, in Bread80's
+// unassembly, "copy first &40 bytes of this rom to &0000", each by its
+// "write byte to ram" at &0049, with the lower ROM enabled under RAM
+// configuration 0, as Machine.asm leaves them ("select ram configuration 0",
+// &062D; "select mode 1, lower rom on, upper rom off", &0644); a write
+// reaches the RAM beneath an enabled ROM ("The Gate Array", Grim), so each
+// names its byte by its own address alone. Then &004E writes &C7 over the
+// USER RESTART at &0030.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_6128s_firmware_copies_its_restarts_into_the_ram_beneath_its_rom() {
+    let rom = fs::read(firmware().join("cpc6128.rom")).expect("the firmware");
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 2 * CPC_FRAME_TICKS, "gather": [{ "write": 0, "to": "&003F" }] }),
+    );
+    let mut copied: Vec<Value> = (0..0x40u16)
+        .rev()
+        .map(|address| {
+            let value = format!("&{:02X}", rom[usize::from(address)]);
+            json!({ "write": ampersand(address), "value": value, "pc": "&0049", "pc_rom": "lower" })
+        })
+        .collect();
+    copied.push(json!({ "write": "&0030", "value": "&C7", "pc": "&004E", "pc_rom": "lower" }));
+    assert_eq!(timeless(&ran["gathered"]), copied, "{ran}");
 }
 
 // SOUND QUEUE, at &BCAA, takes in HL "a sound program", whose bytes are the

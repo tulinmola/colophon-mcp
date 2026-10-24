@@ -21,6 +21,35 @@ static bool psg_written(const cpc_t *cpc, uint64_t before, uint64_t pins) {
          ppi_output_of(&cpc->ppi, PPI_PORT_C) >> 6 == PSG_WRITE;
 }
 
+/* The location an address reaches, as cpc_remap pages it: an enabled ROM
+   answers reads, a number with no upper ROM fitted selecting ROM 0's socket,
+   and the rest reach the RAM the configuration pages in (colophon-emulator's
+   cpc.c at 7a23101). */
+static uint32_t locate(const void *machine, uint16_t address, bool writing) {
+  const cpc_t *cpc = machine;
+  uint32_t quarter = address >> 14;
+  uint32_t offset = address & 0x3FFF;
+  if (!writing && quarter == 0 && cpc->gate_array.lower_rom_enabled) {
+    return MCP_FIRST_ROM_LOCATION + offset;
+  }
+  if (!writing && quarter == 3 && cpc->gate_array.upper_rom_enabled) {
+    uint32_t number = cpc->upper_roms[cpc->upper_rom_number] != NULL ? cpc->upper_rom_number : 0;
+    return MCP_FIRST_ROM_LOCATION + (1 + number) * MCP_ROM_BYTES + offset;
+  }
+  const uint8_t *page = writing ? cpc->write_page[quarter] : cpc->read_page[quarter];
+  return (uint32_t)(page - cpc->ram) + offset;
+}
+
+uint32_t mcp_cpc_locations(const cpc_t *cpc) {
+  uint32_t highest = 0;
+  for (uint32_t number = 0; number < 256; number++) {
+    if (cpc->upper_roms[number] != NULL) {
+      highest = number;
+    }
+  }
+  return MCP_FIRST_ROM_LOCATION + (2 + highest) * MCP_ROM_BYTES;
+}
+
 /* Ticks the machine, unless the watch stops it first. */
 static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
   if (watch != NULL && mcp_watch_before(watch, &cpc->cpu, z80_instruction_complete(&cpc->cpu),
@@ -59,6 +88,10 @@ static void finish(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
 
 mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch) {
   mcp_run_t run = {0};
+  if (watch != NULL) {
+    watch->locate = locate;
+    watch->machine = cpc;
+  }
   bool halting_stops = !mcp_z80_halted_for_good(&cpc->cpu);
   while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&
          !(halting_stops && mcp_z80_halted_for_good(&cpc->cpu))) {

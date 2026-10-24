@@ -25,8 +25,8 @@ use tokio::sync::oneshot;
 use crate::fields::hexadecimal_number;
 use crate::keys::Key;
 use crate::machine::{
-    COUNT, Condition, EXECUTE, GATHER, IN, Kind, List, Match, OUT, PSG, Place, READ, Run, UNTIL,
-    WRITE,
+    ANY_MEMORY, COUNT, Condition, EXECUTE, FIRST_ROM_LOCATION, GATHER, IN, Kind, List, Match,
+    Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
@@ -401,10 +401,12 @@ fn ram_address(value: &Value) -> Result<u32, String> {
 
 const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
                                {\"write\": address}, each with \"to\" and the last address if it \
-                               is a range, {\"in\": port, \"mask\": bits} or {\"out\": port, \
-                               \"mask\": bits}, the mask being the bits of the port's address that \
-                               its device decodes, or on a CPC {\"psg\": register}, with \"to\" and \
-                               the last register if it is a range";
+                               is a range, and an execute or a read with \"memory\": \"ram\" or \
+                               \"rom\" if only the RAM's bytes or only a ROM's are to match; \
+                               {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
+                               the mask being the bits of the port's address that its device \
+                               decodes; or on a CPC {\"psg\": register}, with \"to\" and the last \
+                               register if it is a range";
 
 const REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
 
@@ -439,9 +441,15 @@ impl JsonSchema for ConditionForms {
                 "additionalProperties": false,
             })
         };
+        let with_memory = |kind: &str| {
+            let mut branch = condition(kind, "to", &address, &[kind]);
+            let names: Vec<&str> = MEMORY_NAMES.iter().map(|(name, _)| *name).collect();
+            branch["properties"]["memory"] = json!({ "enum": names });
+            branch
+        };
         let branches = [
-            condition("execute", "to", &address, &["execute"]),
-            condition("read", "to", &address, &["read"]),
+            with_memory("execute"),
+            with_memory("read"),
             condition("write", "to", &address, &["write"]),
             condition("in", "mask", &address, &["in", "mask"]),
             condition("out", "mask", &address, &["out", "mask"]),
@@ -458,6 +466,8 @@ fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
         "items": generator.subschema_for::<ConditionForms>(),
     })
 }
+
+const MEMORY_NAMES: [(&str, Memory); 2] = [("ram", RAM), ("rom", ROM)];
 
 const KIND_NAMES: [(&str, Kind); 6] = [
     ("execute", EXECUTE),
@@ -490,9 +500,24 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
     let first = parse(&fields[name]).map_err(|problem| format!("{name} {problem}"))?;
     let port = kind == IN || kind == OUT;
     let other = if port { "mask" } else { "to" };
-    if let Some(unknown) = fields.keys().find(|key| *key != name && *key != other) {
+    let takes_memory = kind == EXECUTE || kind == READ;
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| *key != name && *key != other && !(takes_memory && *key == "memory"))
+    {
         return Err(format!("{value} has {unknown}, which {name} does not take"));
     }
+    let memory = fields
+        .get("memory")
+        .map(|given| {
+            MEMORY_NAMES
+                .iter()
+                .find(|(name, _)| given.as_str() == Some(name))
+                .map(|(_, memory)| *memory)
+                .ok_or_else(|| format!("memory {given} is neither \"ram\" nor \"rom\""))
+        })
+        .transpose()?
+        .unwrap_or(ANY_MEMORY);
     let (last, mask) = if port {
         let mask = fields
             .get("mask")
@@ -526,6 +551,7 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
         first,
         last,
         mask,
+        memory,
         list,
     })
 }
@@ -674,6 +700,12 @@ fn journal_conditions(arguments: &mut Value, conditions: &[Condition]) {
         } else if condition.last != condition.first {
             fields.insert("to".to_owned(), written_as(condition.last));
         }
+        if let Some((name, _)) = MEMORY_NAMES
+            .iter()
+            .find(|(_, memory)| *memory == condition.memory)
+        {
+            fields.insert("memory".to_owned(), json!(name));
+        }
         Value::Object(fields)
     };
     for (field, list) in [("until", UNTIL), ("gather", GATHER), ("count", COUNT)] {
@@ -807,7 +839,7 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
-    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
+    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -823,7 +855,7 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -1282,6 +1314,14 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
+    /// On a CPC, the ROM that held the instruction or answered the read: "lower", or "upper" and its number, a number with no upper ROM fitted selecting ROM 0. Not given where the RAM held the byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    rom: Option<String>,
+    /// On a CPC, where the RAM holds the byte, by the RAM's own addresses as peek's ram counts them, where that is not the address the processor reached it at: a 6128's RAM configurations page in its second 64K's blocks, and its base 64K's &C000 to &FFFF at &4000. Not given where it is, or where a ROM held the byte; a write reaches the RAM beneath an enabled ROM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
     /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took; for a register of the PSG, the byte the PPI's port A gave it, of which a register narrower than eight bits keeps only its low bits, as psg.registers then reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
@@ -1290,16 +1330,56 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc: Option<Hexadecimal>,
+    /// On a CPC, the ROM that held the instruction that made the access, as rom names it; not given where the RAM held it, or where pc is not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc_rom: Option<String>,
+    /// On a CPC, where the RAM holds the instruction that made the access, as ram gives it, where that is not pc; not given where it is, where a ROM held it, or where pc is not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc_ram: Option<Hexadecimal>,
     /// The monitor's beam across its line, as monitor.beam_x counts it, in samples: a line's picture is monitor.width of them, and the count runs on past it until a sync ends the line.
     beam_x: u16,
     /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines, of which monitor.height make a frame.
     beam_y: u16,
 }
 
+// Where a CPC holds a byte of memory, by its location, when the address the
+// processor reached it at does not say: the ROM that holds it, the lower ROM
+// or an upper ROM by its number, as WinAPE shows a breakpoint "at #C006 in an
+// Upper ROM [...] as 0006:Upper n"
+// (https://web.archive.org/web/20160525234943/http://www.winape.net/help/breakpoints.html),
+// or the RAM's own address.
+fn holder(location: u32, address: u16) -> (Option<String>, Option<Hexadecimal>) {
+    if location >= FIRST_ROM_LOCATION {
+        let rom = match (location - FIRST_ROM_LOCATION) / ROM_BYTES {
+            0 => "lower".to_owned(),
+            upper => format!("upper {}", upper - 1),
+        };
+        (Some(rom), None)
+    } else if location != u32::from(address) {
+        (None, Some(Hexadecimal::ram(location)))
+    } else {
+        (None, None)
+    }
+}
+
 impl Matched {
-    fn of(seen: &Match) -> Matched {
+    fn of(seen: &Match, paged: bool) -> Matched {
         let at = |kind| (seen.kind == kind).then_some(Hexadecimal::address(seen.address));
         let access = seen.kind != EXECUTE;
+        let made = access && !seen.response;
+        // A port's location and a register's are the port and the register.
+        let (rom, ram) = if paged {
+            holder(seen.location, seen.address)
+        } else {
+            (None, None)
+        };
+        let (pc_rom, pc_ram) = if paged && made {
+            holder(seen.pc_location, seen.pc)
+        } else {
+            (None, None)
+        };
         Matched {
             tick: seen.tick,
             execute: at(EXECUTE),
@@ -1308,8 +1388,12 @@ impl Matched {
             r#in: at(IN),
             out: at(OUT),
             psg: (seen.kind == PSG).then_some(seen.address),
+            rom,
+            ram,
             value: access.then_some(Hexadecimal::byte(seen.value)),
-            pc: (access && !seen.response).then_some(Hexadecimal::address(seen.pc)),
+            pc: made.then_some(Hexadecimal::address(seen.pc)),
+            pc_rom,
+            pc_ram,
             beam_x: seen.beam_x,
             beam_y: seen.beam_y,
         }
@@ -1345,10 +1429,26 @@ struct Counted {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
+    /// On a CPC, the ROM that held the instruction or answered the read, as a match's rom names it, which counted by address is part of the place; not given where the RAM held the byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    rom: Option<String>,
+    /// On a CPC, where the RAM holds the byte, as a match's ram gives it, which counted by address is part of the place; not given where that is the address the processor reached it at, or where a ROM held the byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
     /// Where the instruction that made the place's first match begins, in hexadecimal after &, which counted by pc is the place itself; not given for instructions, whose address is their own, or when the response to an interrupt made the access.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc: Option<Hexadecimal>,
+    /// On a CPC, the ROM that held the instruction at pc, as rom names it, which counted by pc is part of the place; not given where the RAM held it, or where pc is not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc_rom: Option<String>,
+    /// On a CPC, where the RAM holds the instruction at pc, as ram gives it, which counted by pc is part of the place; not given where that is pc, where a ROM held it, or where pc is not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    pc_ram: Option<Hexadecimal>,
     /// The instruction's bytes as the processor first fetched them there, as pairs of hexadecimal digits: its opcodes and its operands, so that code overwritten since still says what ran; of an instruction longer than four bytes, as only a chain of prefixes makes one, its first four. Given for instructions alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
@@ -1358,19 +1458,22 @@ struct Counted {
 }
 
 impl Counted {
-    fn of((place, count): &(Place, u32)) -> Counted {
-        let first = &place.first;
-        let at = |kind| (first.kind == kind).then_some(Hexadecimal::address(first.address));
-        let access = first.kind != EXECUTE;
+    fn of((place, count): &(Place, u32), paged: bool) -> Counted {
+        let first = Matched::of(&place.first, paged);
+        let access = place.first.kind != EXECUTE;
         Counted {
             tick: first.tick,
-            execute: at(EXECUTE),
-            read: at(READ),
-            write: at(WRITE),
-            r#in: at(IN),
-            out: at(OUT),
-            psg: (first.kind == PSG).then_some(first.address),
-            pc: (access && !first.response).then_some(Hexadecimal::address(first.pc)),
+            execute: first.execute,
+            read: first.read,
+            write: first.write,
+            r#in: first.r#in,
+            out: first.out,
+            psg: first.psg,
+            rom: first.rom,
+            ram: first.ram,
+            pc: first.pc,
+            pc_rom: first.pc_rom,
+            pc_ram: first.pc_ram,
             bytes: (!access).then(|| digit_pairs(&place.bytes[..usize::from(place.length)])),
             count: *count,
         }
@@ -1395,7 +1498,7 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes and the PSG's registers written, each by address or register, or by pc.
+    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes and the PSG's registers written, each by address or register, or by pc, and at one address the RAM's places first, by the RAM's own addresses, then the lower ROM's, then the upper ROMs' by their numbers. A byte of memory the processor reaches at two addresses is one place, told by the address of its first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
@@ -1443,10 +1546,10 @@ fn line<T: Serialize>(file: &mut NewFile, list: &'static str, entry: T) -> io::R
 
 fn write_lists(file: &mut NewFile, watched: &Watched) -> io::Result<()> {
     for seen in watched.matches.iter().filter(|seen| seen.gathers) {
-        line(file, "gather", Matched::of(seen))?;
+        line(file, "gather", Matched::of(seen, watched.paged))?;
     }
     for place in &watched.counts {
-        line(file, "count", Counted::of(place))?;
+        line(file, "count", Counted::of(place, watched.paged))?;
     }
     Ok(())
 }
@@ -1496,15 +1599,19 @@ impl Ran {
                 .matches
                 .iter()
                 .filter(|seen| chosen(seen))
-                .map(Matched::of)
+                .map(|seen| Matched::of(seen, watched.paged))
                 .collect()
         };
         self.matched = watched.matched.then(|| listed(|seen| seen.stops));
         let Some(mut file) = lists.file else {
             self.gathered = lists.gathering.then(|| listed(|seen| seen.gathers));
-            self.counted = lists
-                .counting
-                .then(|| watched.counts.iter().map(Counted::of).collect());
+            self.counted = lists.counting.then(|| {
+                watched
+                    .counts
+                    .iter()
+                    .map(|place| Counted::of(place, watched.paged))
+                    .collect()
+            });
             return Ok(self);
         };
         let written = write_lists(&mut file, watched);
@@ -1922,7 +2029,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood, and on a CPC which ROM held the instruction or the byte, or where in its RAM, when the address alone does not say. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,

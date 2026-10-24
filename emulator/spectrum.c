@@ -7,6 +7,17 @@
 #include "mcp.h"
 #include "watch.h"
 
+/* The location an address reaches: the ROM below SPECTRUM_RAM_BASE, which a
+   write reaches and leaves as it was, and the RAM above, numbered as though
+   48K were fitted. */
+static uint32_t locate(const void *machine, uint16_t address, bool writing) {
+  (void)machine;
+  (void)writing;
+  uint32_t location = address;
+  return location < SPECTRUM_RAM_BASE ? MCP_FIRST_ROM_LOCATION + location
+                                      : location - SPECTRUM_RAM_BASE;
+}
+
 /* Ticks the machine, unless the watch stops it first. */
 static bool tick(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
   if (watch != NULL &&
@@ -44,6 +55,10 @@ static void finish(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch) {
   mcp_run_t run = {0};
+  if (watch != NULL) {
+    watch->locate = locate;
+    watch->machine = spectrum;
+  }
   bool halting_stops = !mcp_z80_halted_for_good(&spectrum->cpu);
   while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&
          !(halting_stops && mcp_z80_halted_for_good(&spectrum->cpu))) {

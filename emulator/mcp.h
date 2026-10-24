@@ -45,10 +45,25 @@ typedef enum {
   MCP_PSG,
 } mcp_kind_t;
 
-/* How many kinds mcp_kind_t gives, and how many places each can name at
-   most: an address or a port, sixteen bits of either. */
+/* How many kinds mcp_kind_t gives. */
 #define MCP_KINDS 6
-#define MCP_COUNTS_PER_KIND 0x10000
+
+/* A location is a byte of memory, numbered as the machine holds it, whatever
+   address the processor reaches it at: the RAM's bytes from 0, as they stand
+   in the RAM, and from MCP_FIRST_ROM_LOCATION the ROMs', MCP_ROM_BYTES to a
+   ROM: the ROM at &0000, a CPC's lower ROM or a Spectrum's only one, then a
+   CPC's upper ROMs by their numbers. A Spectrum's locations end with its
+   ROM. */
+#define MCP_FIRST_ROM_LOCATION 0x20000
+#define MCP_ROM_BYTES 0x4000
+#define MCP_SPECTRUM_LOCATIONS (MCP_FIRST_ROM_LOCATION + SPECTRUM_ROM_SIZE)
+
+/* The memory a condition asks to hold an instruction or a byte read. */
+typedef enum {
+  MCP_ANY_MEMORY,
+  MCP_RAM,
+  MCP_ROM,
+} mcp_memory_t;
 
 /* The list a condition is given in, which says what its matches do. */
 typedef enum {
@@ -56,7 +71,7 @@ typedef enum {
   MCP_UNTIL,
   /* A match is kept, in the order it happened. */
   MCP_GATHER,
-  /* A match is counted, by its kind and its address. */
+  /* A match is counted, by its kind and its place. */
   MCP_COUNT,
 } mcp_list_t;
 
@@ -68,6 +83,7 @@ typedef struct {
   uint16_t last;
   /* The bits of a port's address that its device decodes. */
   uint16_t mask;
+  mcp_memory_t memory;
   mcp_list_t list;
 } mcp_condition_t;
 
@@ -78,12 +94,15 @@ typedef struct {
   mcp_kind_t kind;
   /* The address, the port, or the register. */
   uint16_t address;
+  /* The location the address reached; the port, or the register, again. */
+  uint32_t location;
   /* The byte read or written, a port's as the processor took it and a
      register's as port A gave it; 0 for an instruction. */
   uint8_t value;
   /* Where the instruction that made an access begins, unless the response to
-     an interrupt made it. */
+     an interrupt made it, and the location it began at. */
   uint16_t pc;
+  uint32_t pc_location;
   bool response;
   uint16_t beam_x;
   uint16_t beam_y;
@@ -122,20 +141,24 @@ typedef struct {
      gathers this many. */
   uint32_t most_gathered;
   /* Where the matches of the count list are counted, from zero:
-     MCP_COUNTS_PER_KIND counts to a kind, by address, or by pc where
-     counts_by_pc, for each of the MCP_KINDS kinds in the order mcp_kind_t
-     gives them; NULL if the list is empty. */
+     counts_per_kind counts to a kind, by location, port or register, or by
+     pc's location where counts_by_pc, for each of the MCP_KINDS kinds in the
+     order mcp_kind_t gives them; NULL if the list is empty. counts_per_kind
+     is at least mcp_cpc_locations, or MCP_SPECTRUM_LOCATIONS. */
   uint32_t *counts;
+  uint32_t counts_per_kind;
   /* Whether an access is counted by where the instruction that made it
-     begins, rather than by its address. The response to an interrupt is no
-     instruction, so its accesses are then not counted. */
+     begins, rather than by the location, port or register it reached. The
+     response to an interrupt is no instruction, so its accesses are then not
+     counted. */
   bool counts_by_pc;
   /* Where the places counted are kept, as many as there is room for, in the
      order each was first matched. */
   mcp_place_t *places;
   uint32_t place_room;
   /* The run stops at the end of the instruction that counts at this many
-     places, a place being a kind and an address, or a pc. */
+     places, a place being a kind and a location, a port or a register, or a
+     pc's location. */
   uint32_t most_counted;
   /* A call stops the run once the processor stands at return_pc with its
      stack at return_sp, where the routine's own return leaves it. */
@@ -156,6 +179,10 @@ typedef struct {
   bool begun;
   bool responding;
   uint16_t pc;
+  uint32_t pc_location;
+  /* The location an address reads, or writes, as the machine stands. */
+  uint32_t (*locate)(const void *machine, uint16_t address, bool writing);
+  const void *machine;
   /* A port read matched and kept, and still on the bus: where it is kept. */
   bool port_read_held;
   uint32_t port_read_match;
@@ -195,6 +222,11 @@ typedef struct {
 mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *watch);
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch);
+
+/* How many locations a CPC's numbering spans: to the end of the highest upper
+ * ROM it has fitted, and at least to the end of ROM 0, which a number with
+ * none fitted selects. */
+uint32_t mcp_cpc_locations(const cpc_t *cpc);
 
 /* Whether the processor waits on HALT with IFF1 clear, which it does for good
  * on either machine: INT is refused while IFF1 is clear, and neither drives
