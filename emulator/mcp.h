@@ -85,7 +85,30 @@ typedef struct {
   uint16_t mask;
   mcp_memory_t memory;
   mcp_list_t list;
+  /* Whether a match of it, in a list that keeps matches, captures the
+     machine: an instruction about to begin as it finds the machine, an access
+     as the instruction that made it leaves the machine, before any response
+     to an interrupt taken at its end, and an access the response to an
+     interrupt makes as the response leaves the machine. */
+  bool captures;
 } mcp_condition_t;
+
+/* The most bytes of memory one capture holds, the watch's spans together. */
+#define MCP_CAPTURED_BYTES 64
+
+/* A span of memory captured: the address the processor reaches its first
+   byte at, and how many bytes, the last no further than &FFFF. */
+typedef struct {
+  uint16_t address;
+  uint16_t length;
+} mcp_span_t;
+
+/* What a match captured: the processor, and the bytes of the watch's spans,
+   one span after another, as the processor reads them. */
+typedef struct {
+  z80_t cpu;
+  uint8_t memory[MCP_CAPTURED_BYTES];
+} mcp_capture_t;
 
 typedef struct {
   /* The ticks into the run: before an instruction begins, or once the tick
@@ -110,6 +133,13 @@ typedef struct {
      gathers. */
   bool stops;
   bool gathers;
+  /* The conditions it matched in the lists that keep it, by their places
+     among the watch's conditions, the first as bit 0. */
+  uint64_t agreed;
+  /* Whether one of those captures, and whether its capture, kept at the
+     match's own place among the watch's captures, has been taken. */
+  bool captures;
+  bool captured;
 } mcp_match_t;
 
 /* The bytes of the longest instruction but a chain of prefixes, such as
@@ -129,6 +159,7 @@ typedef struct {
 /* What a run watches for and what it saw. The caller sets what comes before
  * match_count and zeroes the rest; the run keeps the rest. */
 typedef struct {
+  /* At most 64 of them, one bit of a match's agreed to each. */
   const mcp_condition_t *conditions;
   uint32_t condition_count;
   /* Where the matches are kept, in the order they happened: as many of the
@@ -140,6 +171,13 @@ typedef struct {
   /* Unless gathers_last, the run stops at the end of the instruction that
      gathers this many. */
   uint32_t most_gathered;
+  /* Where a match that captures keeps what it captured: room captures, each
+     at its match's place among the matches; NULL if no condition captures.
+     The spans of memory every capture takes, MCP_CAPTURED_BYTES at most
+     together. */
+  mcp_capture_t *captures;
+  const mcp_span_t *spans;
+  uint32_t span_count;
   /* Where the matches of the count list are counted, from zero:
      counts_per_kind counts to a kind, by location, port or register, or by
      pc's location where counts_by_pc, for each of the MCP_KINDS kinds in the
@@ -180,9 +218,15 @@ typedef struct {
   bool responding;
   uint16_t pc;
   uint32_t pc_location;
-  /* The location an address reads, or writes, as the machine stands. */
+  /* The location an address reads, or writes, as the machine stands, and
+     the byte the processor reads there. */
   uint32_t (*locate)(const void *machine, uint16_t address, bool writing);
+  uint8_t (*peek)(const void *machine, uint16_t address);
   const void *machine;
+  /* The first of the matches still to capture: those of the instruction
+     under way, or of the response to an interrupt, which capture at its
+     end. */
+  uint32_t first_to_capture;
   /* A port read matched and kept, and still on the bus: where it is kept. */
   bool port_read_held;
   uint32_t port_read_match;

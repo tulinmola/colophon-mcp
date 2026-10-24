@@ -18,8 +18,8 @@ use crate::emulator::{
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, SPECTRUM_LOCATIONS, Spectrum,
-    SpectrumState, Watch, gate_array_rgb, ula_rgb,
+    COUNT, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, SPECTRUM_LOCATIONS,
+    Span, Spectrum, SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -708,9 +708,10 @@ pub struct Shown {
 // What a run watches for, and how many matches it gathers and places it
 // counts before it stops; where it gathers the last matches, how many of
 // them it keeps instead. A count with no most_counted never fills, and
-// keeps every place.
+// keeps every place. Every capture takes the spans.
 pub struct Watching<'a> {
     pub conditions: &'a [Condition],
+    pub spans: &'a [Span],
     pub most_gathered: u32,
     pub gathers_last: bool,
     pub most_counted: Option<u32>,
@@ -718,13 +719,16 @@ pub struct Watching<'a> {
 }
 
 // What a run saw, when it watched: every match, in the order it happened,
-// or the last it gathered, its tick counted from the machine's start, and
-// every place counted, by kind, then by address or pc, then by location,
+// or the last it gathered, its tick counted from the machine's start, and,
+// where a condition captures, the slot each was kept in, whose capture is its
+// own; every place counted, by kind, then by address or pc, then by location,
 // with how many times it matched; whether the machine pages ROMs and RAM, so
 // that an address does not say which holds a byte; and whether the processor
 // halting for good stopped it, which a run watched or not may.
 pub struct Watched {
     pub matches: Vec<Match>,
+    pub slots: Vec<u32>,
+    pub captures: Vec<Capture>,
     pub counts: Vec<(Place, u32)>,
     pub paged: bool,
     pub matched: bool,
@@ -868,6 +872,7 @@ impl Built {
     fn run_until(&mut self, until: u64, typed: &mut Run) {
         let nothing = Watching {
             conditions: &[],
+            spans: &[],
             most_gathered: 0,
             gathers_last: false,
             most_counted: Some(0),
@@ -933,9 +938,12 @@ impl Built {
         let conditions = watching.conditions;
         // A gathering that may hold nothing fills at its first match.
         let room = watching.most_gathered.max(1).saturating_add(ROOM_PAST_FULL);
+        // Room for the matches a gathering to a file keeps, some 56MB, is
+        // asked for zeroed rather than filled, as a count's places are below.
         // SAFETY: bindgen renders a match and a place as integers, bools and
         // arrays of them, and all-zero bytes are a value of each.
-        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; room as usize];
+        let mut matches =
+            unsafe { Box::<[Match]>::new_zeroed_slice(room as usize).assume_init() }.into_vec();
         let counting = conditions.iter().any(|condition| condition.list == COUNT);
         let locations = self.locations() as usize;
         let every_place = KINDS.len() * locations;
@@ -952,6 +960,17 @@ impl Built {
         let mut places =
             unsafe { Box::<[Place]>::new_zeroed_slice(place_room as usize).assume_init() }
                 .into_vec();
+        // Room for a capture beside each match a gathering to a file keeps,
+        // some 140MB, is asked for zeroed too, and stays where the run left
+        // it: each match kept says by its slot which capture is its own.
+        let capturing = conditions.iter().any(|condition| condition.captures);
+        // SAFETY: bindgen renders a capture as integers, bools, and arrays and
+        // structures of them, and all-zero bytes are a value of each.
+        let mut captures = unsafe {
+            Box::<[Capture]>::new_zeroed_slice(if capturing { room as usize } else { 0 })
+                .assume_init()
+        }
+        .into_vec();
         let mut watch = Watch::new(
             conditions,
             &mut matches,
@@ -960,6 +979,9 @@ impl Built {
             watching.most_gathered,
             most_counted,
         );
+        if capturing {
+            watch.capture(&mut captures, watching.spans);
+        }
         if watching.gathers_last {
             watch.gather_last();
         }
@@ -977,8 +999,17 @@ impl Built {
             }
         };
         let watch = *watch.seen();
+        let mut slots: Vec<u32> = if capturing {
+            (0..room).collect()
+        } else {
+            Vec::new()
+        };
         if watching.gathers_last && watch.match_count > room {
-            matches.rotate_left((watch.match_count % room) as usize);
+            let first = (watch.match_count % room) as usize;
+            matches.rotate_left(first);
+            if capturing {
+                slots.rotate_left(first);
+            }
         } else {
             assert!(
                 watch.match_count <= room,
@@ -986,20 +1017,36 @@ impl Built {
                 watch.match_count
             );
             matches.truncate(watch.match_count as usize);
+            slots.truncate(watch.match_count as usize);
         }
         if watching.gathers_last {
             // Of the matches kept, those gathered before the last
             // most_gathered are dropped.
             let gathered = matches.iter().filter(|seen| seen.gathers).count();
             let mut surplus = gathered.saturating_sub(watching.most_gathered as usize);
-            matches.retain_mut(|seen| {
-                if seen.gathers && surplus > 0 {
-                    surplus -= 1;
-                    seen.gathers = false;
-                }
-                seen.stops || seen.gathers
-            });
+            let kept: Vec<bool> = matches
+                .iter_mut()
+                .map(|seen| {
+                    if seen.gathers && surplus > 0 {
+                        surplus -= 1;
+                        seen.gathers = false;
+                    }
+                    seen.stops || seen.gathers
+                })
+                .collect();
+            let mut keeping = kept.iter();
+            matches.retain(|_| keeping.next() == Some(&true));
+            let mut keeping = kept.iter();
+            slots.retain(|_| keeping.next() == Some(&true));
         }
+        // A run ends unsettled only inside a chain of prefixes, before the end
+        // its instruction's matches capture at; a chain makes no access, so
+        // only an instruction set wrote into the processor's machinery has
+        // made one by then.
+        assert!(
+            !run.settled || matches.iter().all(|seen| seen.captured == seen.captures),
+            "a match that captures has captured by the end of its instruction"
+        );
         for seen in &mut matches {
             seen.tick += self.tick;
         }
@@ -1034,6 +1081,8 @@ impl Built {
         self.tick += run.ticks;
         let watched = Watched {
             matches,
+            slots,
+            captures,
             counts: counted,
             paged: matches!(self.hardware, Hardware::Cpc(_)),
             matched: watch.matched,

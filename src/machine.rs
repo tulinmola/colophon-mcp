@@ -25,18 +25,18 @@ use crate::emulator::{
 };
 
 pub use crate::emulator::{
-    mcp_condition_t as Condition, mcp_kind_t as Kind, mcp_kind_t_MCP_EXECUTE as EXECUTE,
-    mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_PSG as PSG,
-    mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List,
-    mcp_list_t_MCP_COUNT as COUNT, mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL,
-    mcp_match_t as Match, mcp_memory_t as Memory, mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY,
-    mcp_memory_t_MCP_RAM as RAM, mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place,
-    mcp_run_t as Run,
+    mcp_capture_t as Capture, mcp_condition_t as Condition, mcp_kind_t as Kind,
+    mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT,
+    mcp_kind_t_MCP_PSG as PSG, mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE,
+    mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT, mcp_list_t_MCP_GATHER as GATHER,
+    mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match, mcp_memory_t as Memory,
+    mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY, mcp_memory_t_MCP_RAM as RAM,
+    mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place, mcp_run_t as Run, mcp_span_t as Span,
 };
 
 pub use crate::emulator::{
-    MCP_FIRST_ROM_LOCATION as FIRST_ROM_LOCATION, MCP_ROM_BYTES as ROM_BYTES,
-    MCP_SPECTRUM_LOCATIONS as SPECTRUM_LOCATIONS,
+    MCP_CAPTURED_BYTES as CAPTURED_BYTES, MCP_FIRST_ROM_LOCATION as FIRST_ROM_LOCATION,
+    MCP_ROM_BYTES as ROM_BYTES, MCP_SPECTRUM_LOCATIONS as SPECTRUM_LOCATIONS,
 };
 
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
@@ -52,11 +52,13 @@ const _: () = {
     }
 };
 
-// A watch holds the conditions, the room for matches, the counts and the
-// room for places it is given as pointers, so it borrows them for as long as
-// it lives, and the bridge never reaches past any of them.
+// A watch holds the conditions, the room for matches, the counts, the room
+// for places and for captures, and the spans captured, it is given as
+// pointers, so it borrows them for as long as it lives, and the bridge never
+// reaches past any of them.
 pub struct Watch<'a> {
     watch: mcp_watch_t,
+    capturing: bool,
     _borrowed: PhantomData<Borrowed<'a>>,
 }
 
@@ -65,12 +67,15 @@ type Borrowed<'a> = (
     &'a mut [Match],
     &'a mut [u32],
     &'a mut [Place],
+    &'a mut [Capture],
+    &'a [Span],
 );
 
 impl<'a> Watch<'a> {
     // The counts are laid out as mcp_watch_t says, as many to a kind as the
     // machine it runs on has locations or more, and all zero where a
-    // condition is in the count list, and empty where none is.
+    // condition is in the count list, and empty where none is. A match tells
+    // the conditions it matched by the bits of its agreed, 64 of them.
     pub fn new(
         conditions: &'a [Condition],
         matches: &'a mut [Match],
@@ -87,8 +92,9 @@ impl<'a> Watch<'a> {
             "a count of zero for every kind and every location, where the count list has a \
              condition"
         );
-        // SAFETY: bindgen renders a watch as integers, bools, pointers and an
-        // Option of a function, and all-zero bytes are a value of each, the
+        assert!(conditions.len() <= 64, "64 conditions at most");
+        // SAFETY: bindgen renders a watch as integers, bools, pointers and
+        // Options of functions, and all-zero bytes are a value of each, an
         // Option's None.
         let mut watch: mcp_watch_t = unsafe { std::mem::zeroed() };
         watch.conditions = conditions.as_ptr();
@@ -106,6 +112,7 @@ impl<'a> Watch<'a> {
         watch.most_counted = most_counted;
         Watch {
             watch,
+            capturing: conditions.iter().any(|condition| condition.captures),
             _borrowed: PhantomData,
         }
     }
@@ -122,6 +129,30 @@ impl<'a> Watch<'a> {
         self.watch.counts_by_pc = true;
     }
 
+    // A match that captures keeps its capture at its own place among the
+    // matches.
+    pub fn capture(&mut self, captures: &'a mut [Capture], spans: &'a [Span]) {
+        assert_eq!(
+            captures.len(),
+            self.watch.room as usize,
+            "room for a capture beside each match"
+        );
+        let bytes: u64 = spans.iter().map(|span| u64::from(span.length)).sum();
+        assert!(
+            bytes <= u64::from(CAPTURED_BYTES),
+            "spans holding {bytes} bytes together, past the {CAPTURED_BYTES} a capture holds"
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|span| u32::from(span.address) + u32::from(span.length) <= 0x10000),
+            "a span past &FFFF"
+        );
+        self.watch.captures = captures.as_mut_ptr();
+        self.watch.spans = spans.as_ptr();
+        self.watch.span_count = u32::try_from(spans.len()).expect("a few spans");
+    }
+
     // The run stops once the processor stands at pc with its stack at sp.
     pub fn returning_to(&mut self, pc: u16, sp: u16) {
         self.watch.calling = true;
@@ -135,13 +166,18 @@ impl<'a> Watch<'a> {
 }
 
 // A run watches only when given a watch, whose counts, if it counts, reach
-// every location the machine has.
+// every location the machine has, and which has room for captures if a
+// condition captures.
 fn watching(watch: Option<&mut Watch>, locations: u32) -> *mut mcp_watch_t {
     watch.map_or(std::ptr::null_mut(), |watch| {
         let seen = &watch.watch;
         assert!(
             seen.counts.is_null() || seen.counts_per_kind >= locations,
             "counts for each of the {locations} locations the machine has"
+        );
+        assert!(
+            !watch.capturing || !seen.captures.is_null(),
+            "room for captures where a condition captures"
         );
         &raw mut watch.watch
     })
@@ -407,10 +443,12 @@ impl Cpc {
         let _running = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
         let watch = watching(watch, self.locations());
         // SAFETY: the machine and what it was handed stand where they were,
-        // and a watch borrows its conditions, its room for matches and its
-        // counts, which are as long as it says, for as long as it lives, and
-        // has counts for every location the machine has wherever a condition
-        // is in the count list.
+        // and a watch borrows its conditions, 64 at most, its room for
+        // matches, its counts, its room for captures and its spans, which are
+        // as long as it says, for as long as it lives, and has counts for
+        // every location the machine has wherever a condition is in the count
+        // list, and room for a capture beside each match, of spans holding
+        // CAPTURED_BYTES at most, wherever a condition captures.
         unsafe { mcp_cpc_run(self.machine.as_ptr(), frames, limit, watch) }
     }
 
@@ -1192,6 +1230,7 @@ mod tests {
             mask: 0,
             memory: ANY_MEMORY,
             list: UNTIL,
+            captures: false,
         }];
         for watched in [false, true] {
             // SAFETY: all-zero bytes are a value of every field of a match.
@@ -1268,6 +1307,7 @@ mod tests {
                 mask,
                 memory: ANY_MEMORY,
                 list: GATHER,
+                captures: false,
             });
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 400_000];
@@ -1308,6 +1348,7 @@ mod tests {
             mask: 0,
             memory: ANY_MEMORY,
             list: GATHER,
+            captures: false,
         }];
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 100_000];
@@ -1348,6 +1389,7 @@ mod tests {
             mask: 0,
             memory: ANY_MEMORY,
             list: COUNT,
+            captures: false,
         }];
         let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
         // SAFETY: all-zero bytes are a value of every field of a place.
@@ -1716,11 +1758,12 @@ mod tests {
     // for a few places, and answers whether the run saw more than there was
     // room for: matches past it are counted and never kept, or kept round
     // and round where the last are gathered, and places past it counted and
-    // never kept. Every other run gathers the last and counts by pc.
-    // The room is on the heap, where AddressSanitizer sees past its end. A
-    // count past a kind's locations would land in the next kind's counts,
-    // where it sees nothing amiss, so each kind is given room for twice the
-    // machine's locations, and the second half is to stay zero.
+    // never kept. Each match gathered captures two spans that fill a capture,
+    // the second ending at &FFFF. Every other run gathers the last and counts
+    // by pc. The room is on the heap, where AddressSanitizer sees past its
+    // end. A count past a kind's locations would land in the next kind's
+    // counts, where it sees nothing amiss, so each kind is given room for
+    // twice the machine's locations, and the second half is to stay zero.
     fn watching_everything(
         last: bool,
         locations: u32,
@@ -1736,6 +1779,7 @@ mod tests {
                     mask: 0,
                     memory: ANY_MEMORY,
                     list,
+                    captures: list == GATHER,
                 })
             })
             .collect();
@@ -1745,6 +1789,16 @@ mod tests {
         let mut counts = vec![0; KINDS.len() * per_kind];
         // SAFETY: all-zero bytes are a value of every field of a place.
         let mut places = vec![unsafe { std::mem::zeroed::<Place>() }; 4];
+        // SAFETY: bindgen renders a capture as integers, bools, and arrays
+        // and structures of them, and all-zero bytes are a value of each.
+        let mut captures = vec![unsafe { std::mem::zeroed::<Capture>() }; 4];
+        let half = (CAPTURED_BYTES / 2) as u16;
+        let spans: Vec<Span> = [0x10000 - 2 * u32::from(half), 0x10000 - u32::from(half)]
+            .map(|address| Span {
+                address: address as u16,
+                length: half,
+            })
+            .into();
         let mut watch = Watch::new(
             &conditions,
             &mut matches,
@@ -1753,6 +1807,7 @@ mod tests {
             u32::MAX,
             u32::MAX,
         );
+        watch.capture(&mut captures, &spans);
         if last {
             watch.gather_last();
             watch.count_by_pc();
@@ -2051,7 +2106,90 @@ mod tests {
             mask: 0,
             memory: ANY_MEMORY,
             list: COUNT,
+            captures: false,
         }]
+    }
+
+    fn capturing_everything() -> [Condition; 1] {
+        [Condition {
+            list: GATHER,
+            captures: true,
+            ..counting_everything()[0]
+        }]
+    }
+
+    #[test]
+    #[should_panic(expected = "64 conditions at most")]
+    fn a_watch_refuses_more_conditions_than_a_match_has_bits_for() {
+        let conditions = [counting_everything()[0]; 65];
+        let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
+        Watch::new(&conditions, &mut [], &mut counts, &mut [], 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "room for captures where a condition captures")]
+    fn a_watch_that_captures_refuses_to_run_without_room_for_captures() {
+        let mut spectrum = Spectrum::new(forty_eight_k(), rom(&[], HALT));
+        // SAFETY: all-zero bytes are a value of every field of a match.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
+        let conditions = capturing_everything();
+        let mut watch = Watch::new(&conditions, &mut matches, &mut [], &mut [], 1, 0);
+        spectrum.run(1, 100, Some(&mut watch));
+    }
+
+    #[test]
+    #[should_panic(expected = "room for a capture beside each match")]
+    fn a_watch_refuses_fewer_captures_than_matches() {
+        // SAFETY: as above, and as for a capture.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
+        let mut captures = vec![unsafe { std::mem::zeroed::<Capture>() }; 3];
+        let conditions = capturing_everything();
+        let mut watch = Watch::new(&conditions, &mut matches, &mut [], &mut [], 1, 0);
+        watch.capture(&mut captures, &[]);
+    }
+
+    fn capturing_spans(spans: &[Span]) {
+        // SAFETY: as above, and as for a capture.
+        let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 1];
+        let mut captures = vec![unsafe { std::mem::zeroed::<Capture>() }; 1];
+        let conditions = capturing_everything();
+        let mut watch = Watch::new(&conditions, &mut matches, &mut [], &mut [], 1, 0);
+        watch.capture(&mut captures, spans);
+    }
+
+    #[test]
+    fn a_watch_takes_spans_that_fill_a_capture() {
+        let halves = [0x0000, 0x0040].map(|address| Span {
+            address,
+            length: 0x20,
+        });
+        capturing_spans(&halves);
+    }
+
+    #[test]
+    #[should_panic(expected = "spans holding 65 bytes together, past the 64 a capture holds")]
+    fn a_watch_refuses_spans_a_capture_cannot_hold() {
+        capturing_spans(&[Span {
+            address: 0,
+            length: 65,
+        }]);
+    }
+
+    // Summed in 16 bits, these would come to 64.
+    #[test]
+    #[should_panic(expected = "spans holding 65600 bytes together, past the 64 a capture holds")]
+    fn a_watch_refuses_spans_whose_sum_wraps_in_16_bits() {
+        let spans = [0xFFFF, 0x41].map(|length| Span { address: 0, length });
+        capturing_spans(&spans);
+    }
+
+    #[test]
+    #[should_panic(expected = "a span past &FFFF")]
+    fn a_watch_refuses_a_span_past_ffff() {
+        capturing_spans(&[Span {
+            address: 0xFFF0,
+            length: 0x11,
+        }]);
     }
 
     #[test]

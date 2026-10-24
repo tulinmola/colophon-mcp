@@ -18,6 +18,10 @@ static uint32_t locate(const void *machine, uint16_t address, bool writing) {
                                       : location - SPECTRUM_RAM_BASE;
 }
 
+static uint8_t peek(const void *machine, uint16_t address) {
+  return spectrum_peek(machine, address);
+}
+
 /* Ticks the machine, unless the watch stops it first. */
 static bool tick(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
   if (watch != NULL &&
@@ -57,6 +61,7 @@ mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit
   mcp_run_t run = {0};
   if (watch != NULL) {
     watch->locate = locate;
+    watch->peek = peek;
     watch->machine = spectrum;
   }
   bool halting_stops = !mcp_z80_halted_for_good(&spectrum->cpu);

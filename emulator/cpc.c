@@ -40,6 +40,8 @@ static uint32_t locate(const void *machine, uint16_t address, bool writing) {
   return (uint32_t)(page - cpc->ram) + offset;
 }
 
+static uint8_t peek(const void *machine, uint16_t address) { return cpc_peek(machine, address); }
+
 uint32_t mcp_cpc_locations(const cpc_t *cpc) {
   uint32_t highest = 0;
   for (uint32_t number = 0; number < 256; number++) {
@@ -90,6 +92,7 @@ mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *
   mcp_run_t run = {0};
   if (watch != NULL) {
     watch->locate = locate;
+    watch->peek = peek;
     watch->machine = cpc;
   }
   bool halting_stops = !mcp_z80_halted_for_good(&cpc->cpu);

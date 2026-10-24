@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 #[allow(clippy::wildcard_imports)]
 use crate::emulator::*;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Segment {
     Field(String),
     Index(usize),

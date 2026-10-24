@@ -2516,6 +2516,521 @@ fn gathering_a_stretch_is_stopping_at_every_match_across_it() {
     }
 }
 
+// What a stop leaves to be read back as a capture names it: each value by
+// inspect and each span by peek.
+fn read_back(session: &mut Session, handle: &str, capture: &Value) -> Value {
+    let mut values = serde_json::Map::new();
+    for path in capture["values"].as_array().unwrap() {
+        let path = path.as_str().unwrap();
+        values.insert(path.to_owned(), session.inspect(handle, path));
+    }
+    let mut memory = Vec::new();
+    for span in capture["memory"].as_array().unwrap() {
+        let length = span["length"].as_u64().unwrap();
+        let bytes = session.peek(handle, span["address"].clone(), length as u16);
+        memory.push(json!({ "address": span["address"], "bytes": bytes }));
+    }
+    json!({ "values": values, "memory": memory })
+}
+
+// A run stopped at each match of passing in turn, every condition capturing A,
+// HL, DE and SP, the bytes the pass counts and the top of its stack, finds the
+// machine where each stop leaves it as each match there captured it, a stop on
+// an access standing at the end of the instruction that made it; interrupts
+// are disabled, so no response comes between. Its twin, gathering over the
+// same ticks, captures the same.
+#[test]
+fn a_capture_is_what_a_stop_at_its_match_reads_back() {
+    let capture = json!({
+        "values": ["cpu.a", "cpu.h", "cpu.l", "cpu.d", "cpu.e", "cpu.sp"],
+        "memory": [{ "address": "&9000", "length": 4 }, { "address": "&7FFE", "length": 2 }],
+    });
+    for (file, machine, port, port_address) in [
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            json!({ "out": "&7F00", "mask": "&C000" }),
+            0x7F00,
+        ),
+        (
+            "spectrum48.rom",
+            "spectrum48",
+            json!({ "out": "&FE", "mask": "&01" }),
+            0x00FE,
+        ),
+    ] {
+        let roms = Roms::programmed(file, &passing(port_address));
+        let mut session = Session::start(&roms);
+        let conditions: Vec<Value> = [
+            json!({ "execute": "&000D" }),
+            json!({ "read": "&9000", "to": "&90FF" }),
+            json!({ "write": "&9000", "to": "&90FF" }),
+            json!({ "write": "&7FFE", "to": "&7FFF" }),
+            port,
+        ]
+        .into_iter()
+        .map(|mut condition| {
+            condition["capture"] = capture.clone();
+            condition
+        })
+        .collect();
+        let stopping = session.open(machine);
+        let mut stops = Vec::new();
+        let mut ticks = 0;
+        for _ in 0..20 {
+            let stopped = session.run(&stopping, json!({ "ticks": 10000, "until": conditions }));
+            assert_eq!(stopped["stopped"], "matched", "{machine}: {stopped}");
+            ticks = stopped["tick"].as_u64().unwrap();
+            let read = read_back(&mut session, &stopping, &capture);
+            for seen in stopped["matched"].as_array().unwrap() {
+                assert_eq!(seen["captured"], read, "{machine}: {stopped}");
+            }
+            stops.extend(stopped["matched"].as_array().unwrap().iter().cloned());
+        }
+        let last = stops
+            .iter()
+            .rposition(|seen| seen.get("execute").is_none() || seen["tick"] != ticks)
+            .unwrap();
+        stops.truncate(last + 1);
+        let gathering = session.open(machine);
+        let gathered = session.run(&gathering, json!({ "ticks": ticks, "gather": conditions }));
+        assert_eq!(gathered["tick"], ticks, "{machine}: {gathered}");
+        assert_eq!(gathered["gathered"], json!(stops), "{machine}");
+    }
+}
+
+// WRITING's PUSH HL, at &0009, "first decrements SP and loads the
+// high-order byte of register pair qq to the memory address specified by the
+// SP. The SP is decremented again and loads the low-order byte of qq"
+// (UM0080, PUSH qq). Matched as it is about to begin, it captures the
+// machine it finds, as a run stopped before it does, and each of its two
+// writes the machine it leaves: both bytes written, SP two lower and PC past
+// it, the first write as much as the second.
+#[test]
+fn an_access_captures_the_machine_its_instruction_leaves() {
+    let capture = json!({
+        "values": ["cpu.sp", "cpu.pc"],
+        "memory": [{ "address": "&7FFE", "length": 2 }],
+    });
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &WRITING);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        let gathering = json!([
+            { "execute": "&0009", "capture": capture },
+            { "write": "&7FFE", "to": "&7FFF", "capture": capture },
+        ]);
+        let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+        let found = json!({
+            "values": { "cpu.sp": 0x8000, "cpu.pc": 0x0009 },
+            "memory": [{ "address": "&7FFE", "bytes": "0000" }],
+        });
+        let left = json!({
+            "values": { "cpu.sp": 0x7FFE, "cpu.pc": 0x000A },
+            "memory": [{ "address": "&7FFE", "bytes": "0090" }],
+        });
+        let captured: Vec<&Value> = ran["gathered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seen| &seen["captured"])
+            .collect();
+        assert_eq!(captured, [&found, &left, &left], "{machine}: {ran}");
+        let stopping = session.open(machine);
+        let until = json!([{ "execute": "&0009", "capture": capture }]);
+        let stopped = session.run(&stopping, json!({ "ticks": 200, "until": until }));
+        assert_eq!(
+            stopped["matched"][0]["captured"], found,
+            "{machine}: {stopped}"
+        );
+        // The run that begins on the PUSH gathers it, as its first
+        // instruction, by a condition that captures nothing, and until's
+        // capture, which does not stop it there, is not its own.
+        let gathered = session.run(
+            &stopping,
+            json!({ "ticks": 4, "until": until, "gather": [{ "execute": "&0009" }] }),
+        );
+        let first = &gathered["gathered"][0];
+        assert!(
+            first["execute"] == "&0009" && first.get("captured").is_none(),
+            "{machine}: {gathered}"
+        );
+    }
+}
+
+// From &0100 on every instruction is LD (HL),A, and the ULA's interrupt,
+// taken in mode 1 at the end of one of them, pushes the program counter and
+// restarts at &0038 (UM0080, Interrupt Response). until stops on the push
+// at the end of the response, the processor at &0038; the write before it
+// captured the machine at the end of its instruction, before the response:
+// PC just past it and SP where it was, but IFF1 clear, since "when the CPU
+// accepts a maskable interrupt, both IFF1 and IFF2 are automatically reset"
+// (UM0080, Interrupt Enable/Disable), where every write before it found them
+// set.
+#[test]
+fn an_access_captures_before_the_response_to_an_interrupt_taken_at_its_end() {
+    let mut program = vec![
+        LD_SP, 0x00, 0x80, LD_HL, 0x00, 0x90, IM_1[0], IM_1[1], EI, JP, 0x00, 0x01,
+    ];
+    program.resize(0x38, NOP);
+    program.extend([EI, RET]);
+    program.resize(0x100, NOP);
+    program.resize(0x4000, LD_AT_HL_A);
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let capture = json!({ "values": ["cpu.pc", "cpu.sp", "cpu.iff1", "cpu.iff2"] });
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 2 * SPECTRUM_FRAME_TICKS,
+            "until": [{ "write": "&7FFE", "to": "&7FFF", "capture": capture }],
+            "gather": [{ "write": "&9000", "capture": capture }],
+            "gather_last": true,
+        }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &ampersand(0x0038)),
+        "{ran}"
+    );
+    let pushed = json!({
+        "values": { "cpu.pc": 0x0038, "cpu.sp": 0x7FFE, "cpu.iff1": false, "cpu.iff2": false },
+    });
+    for seen in ran["matched"].as_array().unwrap() {
+        assert_eq!(seen["captured"], pushed, "{ran}");
+    }
+    let gathered = ran["gathered"].as_array().unwrap();
+    assert_eq!(gathered.len(), 32, "{ran}");
+    for (index, seen) in gathered.iter().enumerate() {
+        let interrupted = index == gathered.len() - 1;
+        let past = after_ampersand(&seen["pc"], 4) + 1;
+        let enabled = !interrupted;
+        assert_eq!(
+            seen["captured"],
+            json!({
+                "values": { "cpu.pc": past, "cpu.sp": 0x8000, "cpu.iff1": enabled, "cpu.iff2": enabled },
+            }),
+            "{ran}"
+        );
+    }
+}
+
+// A match carries what the conditions it matched name, each once, and no
+// other condition's: WRITING's PUSH HL writes &7FFF, which two conditions
+// capture, and then &7FFE, which one does; its LD (HL),n and LD (nn),HL write
+// where nothing captures.
+#[test]
+fn a_match_captures_what_the_conditions_it_matched_name() {
+    let roms = Roms::programmed("spectrum48.rom", &WRITING);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let stack = json!({ "address": "&7FFE", "length": 2 });
+    let gathering = json!([
+        { "execute": "&0009", "capture": { "values": ["cpu.sp"] } },
+        { "write": "&7FFE", "to": "&7FFF", "capture": { "values": ["cpu.pc"], "memory": [stack] } },
+        { "write": "&7FFF", "capture": { "values": ["cpu.h"], "memory": [stack] } },
+        { "write": "&9000", "to": "&90FF" },
+    ]);
+    let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
+    let captured: Vec<Option<Value>> = ran["gathered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seen| seen.get("captured").cloned())
+        .collect();
+    let pushed = json!([{ "address": "&7FFE", "bytes": "0090" }]);
+    let expected = [
+        None,
+        Some(json!({ "values": { "cpu.sp": 0x8000 } })),
+        Some(json!({ "values": { "cpu.pc": 0x000A, "cpu.h": 0x90 }, "memory": pushed })),
+        Some(json!({ "values": { "cpu.pc": 0x000A }, "memory": pushed })),
+        None,
+        None,
+    ];
+    assert_eq!(captured, expected, "{ran}");
+}
+
+// set can stand the processor at the first tick of a write, MEM_WRITE_T1,
+// step 7 in z80.c's own numbering, from M1_T1 as 0, with a DD prefix pending,
+// which no instruction that writes leaves behind it: the write is the
+// instruction's, and the chain of prefixes after it keeps the instruction
+// from ending within the run, so the run ends inside it, unsettled, and the
+// write answers no capture, the prefix still pending.
+#[test]
+fn a_run_ended_inside_an_instruction_set_wrote_answers_its_write_without_capture() {
+    let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x1000]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.set(
+        &handle,
+        json!({ "cpu.step": 7, "cpu.prefix": PREFIX_DD, "cpu.operand_address": "&C000" }),
+    );
+    let gathering = json!([{ "write": "&C000", "capture": { "values": ["cpu.a"] } }]);
+    let ran = session.run(&handle, json!({ "ticks": 1, "gather": gathering }));
+    assert_eq!(ran["stopped"], "unsettled", "{ran}");
+    let gathered = ran["gathered"].as_array().unwrap();
+    assert!(
+        gathered.len() == 1 && gathered[0].get("captured").is_none(),
+        "{ran}"
+    );
+    assert_eq!(session.inspect(&handle, "cpu.prefix"), PREFIX_DD);
+}
+
+// An NMI written in with set is taken at the end of LD (HL),A, and "when a
+// nonmaskable interrupt is accepted, IFF1 resets", while "the previous state
+// of IFF1 is saved" in IFF2 (UM0080, Interrupt Enable/Disable): the write
+// captures the machine at the end of its instruction, IFF1 clear and IFF2
+// kept, before the response, whose pushes capture it at &0066.
+#[test]
+fn an_access_captures_before_the_response_to_an_nmi_taken_at_its_end() {
+    let capture = json!({ "values": ["cpu.pc", "cpu.sp", "cpu.iff1", "cpu.iff2"] });
+    for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
+        let roms = Roms::programmed(file, &[LD_AT_HL_A, JR, 0xFE]);
+        roms.write_at(file, 0x66, &RETN);
+        let mut session = Session::start(&roms);
+        let handle = session.open(machine);
+        session.set(
+            &handle,
+            json!({
+                "cpu.sp": "&8000",
+                "cpu.h": "&90",
+                "cpu.iff1": true,
+                "cpu.iff2": true,
+                "cpu.nmi_pending": true,
+            }),
+        );
+        let ran = session.run(
+            &handle,
+            json!({
+                "ticks": 100,
+                "gather": [
+                    { "write": "&9000", "capture": capture },
+                    { "write": "&7FFE", "to": "&7FFF", "capture": capture },
+                ],
+            }),
+        );
+        let captured: Vec<&Value> = ran["gathered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seen| &seen["captured"]["values"])
+            .collect();
+        let written = json!({ "cpu.pc": 1, "cpu.sp": 0x8000, "cpu.iff1": false, "cpu.iff2": true });
+        let pushed =
+            json!({ "cpu.pc": 0x66, "cpu.sp": 0x7FFE, "cpu.iff1": false, "cpu.iff2": true });
+        assert_eq!(captured, [&written, &pushed, &pushed], "{machine}: {ran}");
+    }
+}
+
+// A gathering any of whose conditions captures fills at its 32nd match, and
+// one of the last keeps 32, while one written to a file runs past 128;
+// a capture in until leaves gather's 128 as they are. COUNTING_FROM_9000's
+// INC (HL) writes at HL and leaves it, so each write captures L as the low
+// byte of its own address.
+#[test]
+fn a_gathering_that_captures_fills_at_its_32nd_match() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING_FROM_9000);
+    let mut session = Session::start(&roms);
+    let capturing =
+        json!([{ "write": "&9000", "to": "&FFFF", "capture": { "values": ["cpu.l"] } }]);
+    let filled = session.open("spectrum48");
+    let ran = session.run(&filled, json!({ "ticks": 5000, "gather": capturing }));
+    assert_eq!(ran["stopped"], "full", "{ran}");
+    let gathered = ran["gathered"].as_array().unwrap();
+    assert_eq!(gathered.len(), 32, "{ran}");
+    for seen in gathered {
+        assert_eq!(
+            seen["captured"]["values"]["cpu.l"],
+            after_ampersand(&seen["write"], 4) & 0xFF,
+            "{seen}"
+        );
+    }
+    let last = session.open("spectrum48");
+    let ran = session.run(
+        &last,
+        json!({ "ticks": 5000, "gather": capturing, "gather_last": true }),
+    );
+    assert_eq!(ran["gathered"].as_array().unwrap().len(), 32, "{ran}");
+    let filing = session.open("spectrum48");
+    let path = roms.0.join("captured.jsonl");
+    let ran = session.run(
+        &filing,
+        json!({ "ticks": 5000, "gather": capturing, "path": path }),
+    );
+    assert_eq!(ran["stopped"], "ticks", "{ran}");
+    assert!(ran["written"]["gathered"].as_u64().unwrap() > 128, "{ran}");
+    let stopping = session.open("spectrum48");
+    let ran = session.run(
+        &stopping,
+        json!({
+            "ticks": 5000,
+            "until": [{ "execute": "&3FFF", "capture": { "values": ["cpu.l"] } }],
+            "gather": [{ "write": "&9000", "to": "&FFFF" }],
+        }),
+    );
+    assert_eq!(
+        (&ran["stopped"], ran["gathered"].as_array().unwrap().len()),
+        (&json!("full"), 128),
+        "{ran}"
+    );
+}
+
+#[test]
+fn what_capture_takes_is_said_when_it_is_given_otherwise() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let refused = |session: &mut Session, capture: Value| {
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "frames": 1, "until": [{ "execute": 1, "capture": capture }] }),
+        )
+    };
+    let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
+                 address}, each with \"to\" and the last address if it is a range, and an execute \
+                 or a read with \"memory\": \"ram\" or \"rom\" if only the RAM's bytes or only a \
+                 ROM's are to match; {\"in\": port, \"mask\": bits} or {\"out\": port, \
+                 \"mask\": bits}, the mask being the bits of the port's address that its device \
+                 decodes; or on a CPC {\"psg\": register}, with \"to\" and the last register if \
+                 it is a range; and any of them in until or gather may take \"capture\" too";
+    let capture_forms = "capture is {\"values\": paths, \"memory\": spans}, one of the two or \
+                         both: each path names one of the processor's values as inspect reads it, \
+                         under cpu, as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and each span is \
+                         {\"address\": address, \"length\": bytes}, from 1 to 64 bytes, 1 if \
+                         length is not given, none of them past &FFFF";
+    let said = |problem: &str| format!("until[0]: capture: {problem}; {capture_forms}; {forms}");
+    for (capture, problem) in [
+        (json!({}), "{} names nothing to capture".to_owned()),
+        (
+            json!({ "values": [], "memory": [] }),
+            "{\"values\":[],\"memory\":[]} names nothing to capture".to_owned(),
+        ),
+        (json!(["cpu.a"]), "[\"cpu.a\"] is not an object".to_owned()),
+        (
+            json!({ "registers": ["hl"] }),
+            "{\"registers\":[\"hl\"]} has registers, which capture does not take".to_owned(),
+        ),
+        (
+            json!({ "values": "cpu.a" }),
+            "values \"cpu.a\" is not a list".to_owned(),
+        ),
+        (
+            json!({ "values": [7] }),
+            "values holds 7, which is not a path".to_owned(),
+        ),
+        (
+            json!({ "values": vec!["cpu.a"; 17] }),
+            "values names 17 things to capture, and takes at most 16".to_owned(),
+        ),
+        (
+            json!({ "values": ["crtc.registers[12]"] }),
+            "crtc.registers[12] is not under cpu".to_owned(),
+        ),
+        (
+            json!({ "values": ["cpu"] }),
+            "cpu holds more than one value, and each is captured by a path of its own".to_owned(),
+        ),
+        (
+            json!({ "values": ["cpu.program"] }),
+            "cpu.program holds more than one value, and each is captured by a path of its own"
+                .to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": "&FFFF", "length": 2 }] }),
+            "2 bytes from &FFFF run past &FFFF, where the processor's memory ends; 1 fit from \
+             there"
+                .to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": 0, "length": 65 }] }),
+            "{\"address\":0,\"length\":65} has a length that is not from 1 to 64".to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": 0, "length": 0 }] }),
+            "{\"address\":0,\"length\":0} has a length that is not from 1 to 64".to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "length": 1 }] }),
+            "{\"length\":1} has no address".to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": 0, "bytes": 1 }] }),
+            "{\"address\":0,\"bytes\":1} has bytes, which a span does not take".to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": 70000 }] }),
+            "address 70000 is past &FFFF; an address is a number from 0 to 65535, or hexadecimal \
+             from &0000 to &FFFF, written with &, #, $ or 0x before it"
+                .to_owned(),
+        ),
+    ] {
+        assert_eq!(refused(&mut session, capture), said(&problem));
+    }
+    let no_pair = refused(&mut session, json!({ "values": ["cpu.hl"] }));
+    assert!(
+        no_pair.starts_with("until[0]: capture: cpu.hl: z80_t has no field hl; its fields are a, f, b, c, d, e, h, l,"),
+        "{no_pair}"
+    );
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({ "handle": handle, "frames": 1, "count": [{ "execute": 1, "capture": { "values": ["cpu.a"] } }] })
+        ),
+        format!(
+            "count[0]: count counts each place by its first match and captures nothing; capture \
+             in until or gather; {forms}"
+        )
+    );
+    let paths = [
+        "a", "f", "b", "c", "d", "e", "h", "l", "i", "r", "sp", "pc", "ixh", "ixl", "iyh",
+    ]
+    .map(|register| format!("cpu.{register}"));
+    assert_eq!(
+        session.refusal(
+            "call",
+            json!({
+                "handle": handle,
+                "address": 0,
+                "until": [{ "execute": 1, "capture": { "values": paths[..8] } }],
+                "gather": [
+                    { "write": 1, "capture": { "values": paths[4..], "memory": [{ "address": 0 }] } },
+                    { "write": 2, "capture": { "memory": [{ "address": 1 }] } },
+                ],
+            })
+        ),
+        "the captures of until and gather name 17 values and spans, each counted once, and take \
+         at most 16 together"
+    );
+    let span = |address: u16, length: u16| json!({ "address": address, "length": length });
+    assert_eq!(
+        session.refusal(
+            "run",
+            json!({
+                "handle": handle,
+                "ticks": 10,
+                "gather": [
+                    { "write": 1, "capture": { "memory": [span(0, 64)] } },
+                    { "write": 2, "capture": { "memory": [span(0, 64), span(64, 1)] } },
+                ],
+            })
+        ),
+        "the captures of until and gather read 65 bytes of memory, each span counted once, and \
+         take at most 64 together"
+    );
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 10,
+            "gather": [
+                { "write": 1, "capture": { "memory": [span(0, 64)] } },
+                { "write": 2, "capture": { "values": ["cpu.a"], "memory": [span(0, 64)] } },
+            ],
+        }),
+    );
+    assert_eq!(ran["stopped"], "ticks", "{ran}");
+}
+
 #[test]
 fn a_gathering_that_fills_stops_and_the_next_run_gathers_on() {
     let roms = Roms::programmed("cpc6128.rom", &COUNTING_FROM_9000);
@@ -3566,6 +4081,10 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "psg": 0, "to": 15 }),
         json!({ "execute": "&0038", "memory": "ram" }),
         json!({ "read": 1, "to": 2, "memory": "rom" }),
+        json!({ "execute": "&0038", "capture": { "values": ["cpu.a"] } }),
+        json!({ "write": 1, "capture": { "memory": [{ "address": "&9000", "length": 64 }] } }),
+        json!({ "out": "&7F00", "mask": "&C000", "capture": { "values": [], "memory": [{ "address": 0 }] } }),
+        json!({ "psg": 7, "capture": { "values": ["cpu.h"], "memory": [] } }),
     ] {
         if let Err(problem) = fitting(&condition) {
             panic!("{condition}: {problem}");
@@ -3578,9 +4097,21 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "in": "&F500" }),
         json!({ "write": 1, "memory": "ram" }),
         json!({ "execute": 1, "memory": "flash" }),
+        json!({ "execute": 1, "capture": {} }),
+        json!({ "execute": 1, "capture": { "values": [], "memory": [] } }),
+        json!({ "execute": 1, "capture": { "registers": ["hl"] } }),
+        json!({ "execute": 1, "capture": { "values": [7] } }),
+        json!({ "execute": 1, "capture": { "memory": [{ "address": 0, "length": 65 }] } }),
+        json!({ "execute": 1, "capture": { "memory": [{ "length": 1 }] } }),
     ] {
         assert!(fitting(&condition).is_err(), "{condition}");
     }
+    let counting = json!({
+        "handle": "cpc6128-1",
+        "frames": 1,
+        "count": [{ "execute": 1, "capture": { "values": ["cpu.a"] } }],
+    });
+    assert!(fits(&counting, &schema, &schema, "run").is_err());
 }
 
 #[test]
@@ -3600,7 +4131,7 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
                  ROM's are to match; {\"in\": port, \"mask\": bits} or {\"out\": port, \
                  \"mask\": bits}, the mask being the bits of the port's address that its device \
                  decodes; or on a CPC {\"psg\": register}, with \"to\" and the last register if \
-                 it is a range";
+                 it is a range; and any of them in until or gather may take \"capture\" too";
     assert_eq!(
         refused(&mut session, json!({ "read": 5, "out": 6 })),
         format!(
@@ -5240,17 +5771,18 @@ fn a_count_written_to_a_file_never_fills() {
 
 // A run that gathers and counts writes both lists to its one file, the
 // matches gathered first and the places counted after, each as the answer of
-// a twin given no path lists them, and what until matched, the read of the
-// 17th pass, stays in the answer; a gathering of the last matches that
-// never comes to its most writes the same file.
+// a twin given no path lists them, captures and all, and what until matched,
+// the read of the 17th pass, stays in the answer; a gathering of the last
+// matches that never comes to its most writes the same file.
 #[test]
 fn a_file_holds_what_gather_and_count_would_have_listed() {
     let roms = Roms::programmed("spectrum48.rom", &COUNTING_FROM_9000);
     let mut session = Session::start(&roms);
+    let capture = json!({ "values": ["cpu.l"], "memory": [{ "address": "&9000", "length": 2 }] });
     let asked = json!({
         "ticks": 1000,
         "until": [{ "read": "&9010" }],
-        "gather": [{ "write": "&9000", "to": "&FFFF" }],
+        "gather": [{ "write": "&9000", "to": "&FFFF", "capture": capture }],
         "count": [{ "execute": 0, "to": "&3FFF" }],
     });
     let twin = session.open("spectrum48");
@@ -6546,7 +7078,11 @@ fn the_journal_made_again_makes_the_machine_again() {
             "run",
             json!({
                 "ticks": 20000,
-                "gather": [{ "write": "&9000", "to": "&9FFF" }],
+                "gather": [{
+                    "write": "&9000",
+                    "to": "&9FFF",
+                    "capture": { "values": ["cpu.l"], "memory": [{ "address": "&9000", "length": 4 }] },
+                }],
                 "count": [{ "execute": "&0000", "to": "&3FFF" }],
                 "path": roms.0.join("written.jsonl"),
             }),
@@ -6669,8 +7205,8 @@ fn the_journal_names_the_snapshot_and_the_tape_by_their_hashes() {
 
 // The journal writes every address after &, whatever form a request gave it
 // in, so that a finding reads alike however it was asked for; a range of one
-// address is that address, and a port keeps its mask. Values set are kept as
-// given.
+// address is that address, a port keeps its mask, and a span captured its
+// length. Values set, and values captured, are kept as given.
 #[test]
 fn the_journal_writes_addresses_after_an_ampersand() {
     let roms = routine("spectrum48.rom", &[DI, HALT]);
@@ -6682,9 +7218,10 @@ fn the_journal_writes_addresses_after_an_ampersand() {
         json!({ "handle": handle, "address": "0x8001", "bytes": "22" }),
     );
     assert_eq!(poked, json!({ "address": "&8001", "length": 1 }));
+    let capture = json!({ "values": ["cpu.sp", "cpu.ixh"], "memory": [{ "address": "#9000" }] });
     let ran = json!({
         "ticks": 100,
-        "until": [{ "execute": 4096, "to": "#1FFF", "memory": "rom" }],
+        "until": [{ "execute": 4096, "to": "#1FFF", "memory": "rom", "capture": capture }],
         "gather": [{ "write": "$9000", "to": "&9000" }, { "out": 254, "mask": 1 }],
         "gather_last": true,
         "count": [{ "in": "#FE", "mask": "0x1" }],
@@ -6715,7 +7252,15 @@ fn the_journal_writes_addresses_after_an_ampersand() {
             json!({ "address": "&8001", "bytes": "22" }),
             json!({
                 "ticks": 100,
-                "until": [{ "execute": "&1000", "to": "&1FFF", "memory": "rom" }],
+                "until": [{
+                    "execute": "&1000",
+                    "to": "&1FFF",
+                    "memory": "rom",
+                    "capture": {
+                        "values": ["cpu.sp", "cpu.ixh"],
+                        "memory": [{ "address": "&9000", "length": 1 }],
+                    },
+                }],
                 "gather": [{ "write": "&9000" }, { "out": "&00FE", "mask": "&0001" }],
                 "gather_last": true,
                 "count": [{ "in": "&00FE", "mask": "&0001" }],
@@ -7409,6 +7954,41 @@ fn a_cpc_writes_its_psg_where_its_firmware_writes() {
             "{machine}"
         );
     }
+}
+
+// TXT OUTPUT, the firmware's entry for a character or a control code to the
+// screen, is at &13FE of the 6128's lower ROM and hands A on to IND: TXT OUT
+// ACTION, which takes it with LD C,A (Text.asm, &13FE to &140A, in Bread80's
+// unassembly of the firmware, https://github.com/Bread80/CPC6128-Firmware-Source).
+// A PRINT entered with RETURN passes it, one call at a time, the carriage
+// return and line feed that end the line typed, each character the PRINT
+// prints and the two that end its line, and BASIC's Ready, which a capture
+// of A at each call reads back.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn basic_prints_through_txt_output_a_character_at_a_time() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.answer(
+        "type",
+        json!({ "handle": handle, "text": "PRINT \"COLOPHON\"" }),
+    );
+    let ran = session.run(
+        &handle,
+        json!({
+            "frames": 10,
+            "keys": ["RETURN"],
+            "gather": [{ "execute": "&13FE", "memory": "rom", "capture": { "values": ["cpu.a"] } }],
+        }),
+    );
+    let printed: String = ran["gathered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seen| char::from(seen["captured"]["values"]["cpu.a"].as_u64().unwrap() as u8))
+        .collect();
+    assert_eq!(printed, "\r\nCOLOPHON\r\nReady\r\n", "{ran}");
 }
 
 // The 6128's firmware starts BASIC at &C006 of ROM 0, "execution address

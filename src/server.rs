@@ -22,11 +22,12 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
-use crate::fields::hexadecimal_number;
+use crate::emulator::z80_t;
+use crate::fields::{self, Fields, Segment, hexadecimal_number};
 use crate::keys::Key;
 use crate::machine::{
-    ANY_MEMORY, COUNT, Condition, EXECUTE, FIRST_ROM_LOCATION, GATHER, IN, Kind, List, Match,
-    Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, UNTIL, WRITE,
+    ANY_MEMORY, CAPTURED_BYTES, COUNT, Capture, Condition, EXECUTE, FIRST_ROM_LOCATION, GATHER, IN,
+    Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, Span, UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
@@ -57,14 +58,27 @@ const MOST_BYTES: u16 = 4096;
 // A match takes some 80 characters, so these come to about as many as
 // MOST_BYTES does.
 const MOST_GATHERED: u32 = 128;
-// A match written to a file takes a line of some 100 characters, so these
-// come to some 100MB, and the room a run keeps for them to 32MB.
+// A match that captures as much as a request may name, MOST_CAPTURED spans
+// holding CAPTURED_BYTES, takes some 750 characters, so these come to some
+// 24000, and with the ROOM_PAST_FULL kept past the fill and until's matches
+// listed again in matched, to some 37500 at the most: past the 10000 tokens at
+// which Claude Code warns, and under the 50000 characters past which it saves
+// an answer to a file, https://code.claude.com/docs/en/mcp. A match capturing
+// a few registers and bytes takes some 200.
+const MOST_GATHERED_CAPTURING: u32 = 32;
+// A match written to a file takes a line of some 100 characters, or 750 where
+// it captures all a request may name, so these come to some 100MB, or 750MB,
+// and the room a run keeps for them to some 56MB, and some 140MB more for what
+// they capture, taken up only where a match captures.
 const MOST_GATHERED_TO_A_FILE: u32 = 1 << 20;
 // A place counted takes some 60 characters, so these come to about twice what
 // MOST_BYTES does.
 const MOST_COUNTED: u32 = 256;
 // Each is weighed against every access a run makes.
 const MOST_CONDITIONS: usize = 16;
+// The values and the spans of memory a request's captures name together,
+// which hold a match that captures to some 750 characters.
+const MOST_CAPTURED: usize = 16;
 // An instruction listed takes some 50 characters, so these come to about half
 // as many again as MOST_BYTES does.
 const MOST_INSTRUCTIONS_LISTED: u16 = 256;
@@ -406,7 +420,14 @@ const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\":
                                {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
                                the mask being the bits of the port's address that its device \
                                decodes; or on a CPC {\"psg\": register}, with \"to\" and the last \
-                               register if it is a range";
+                               register if it is a range; and any of them in until or gather may \
+                               take \"capture\" too";
+
+const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, one of the two \
+                             or both: each path names one of the processor's values as inspect \
+                             reads it, under cpu, as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and \
+                             each span is {\"address\": address, \"length\": bytes}, from 1 to 64 \
+                             bytes, 1 if length is not given, none of them past &FFFF";
 
 const REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
 
@@ -421,25 +442,154 @@ fn register(value: &Value) -> Result<u16, String> {
         .ok_or_else(|| format!("{value} is no register; {REGISTER_FORMS}"))
 }
 
-// A condition, kept once in a tool's $defs, as until, gather and count all
-// take lists of them.
-struct ConditionForms;
+// What a condition's matches capture: the processor's values, each by its
+// path, kept as given and as it reaches into z80_t, and spans of memory.
+struct Capturing {
+    values: Vec<(String, Vec<Segment>)>,
+    memory: Vec<Span>,
+}
 
-impl JsonSchema for ConditionForms {
+fn same_span(one: &Span, other: &Span) -> bool {
+    (one.address, one.length) == (other.address, other.length)
+}
+
+// A value of the processor's, by inspect's path, which reaches no structure
+// or array but one value.
+fn captured_value(given: &Value) -> Result<(String, Vec<Segment>), String> {
+    let path = given
+        .as_str()
+        .ok_or_else(|| format!("values holds {given}, which is not a path"))?;
+    let mut segments = fields::parse(path)?;
+    if segments.first() != Some(&Segment::Field("cpu".to_owned())) {
+        return Err(format!("{path} is not under cpu"));
+    }
+    segments.remove(0);
+    // SAFETY: bindgen renders the processor as integers, bools, and arrays and
+    // structures of them, and all-zero bytes are a value of each; it is only
+    // read by path.
+    let processor: z80_t = unsafe { std::mem::zeroed() };
+    match processor.get(&segments) {
+        Ok(Value::Object(_) | Value::Array(_)) => Err(format!(
+            "{path} holds more than one value, and each is captured by a path of its own"
+        )),
+        Ok(_) => Ok((path.to_owned(), segments)),
+        Err(problem) => Err(format!("{path}: {problem}")),
+    }
+}
+
+fn captured_span(given: &Value) -> Result<Span, String> {
+    let fields = given
+        .as_object()
+        .ok_or_else(|| format!("memory holds {given}, which is not a span"))?;
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| *key != "address" && *key != "length")
+    {
+        return Err(format!("{given} has {unknown}, which a span does not take"));
+    }
+    let first = fields
+        .get("address")
+        .ok_or_else(|| format!("{given} has no address"))?;
+    let first = address(first).map_err(|problem| format!("address {problem}"))?;
+    let length = fields
+        .get("length")
+        .map_or(Some(1), Value::as_i64)
+        .filter(|length| (1..=i64::from(CAPTURED_BYTES)).contains(length))
+        .ok_or_else(|| format!("{given} has a length that is not from 1 to {CAPTURED_BYTES}"))?;
+    Ok(Span {
+        address: first,
+        length: span(first, length)?,
+    })
+}
+
+fn capturing(given: &Value) -> Result<Capturing, String> {
+    let fields = given
+        .as_object()
+        .ok_or_else(|| format!("{given} is not an object"))?;
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| *key != "values" && *key != "memory")
+    {
+        return Err(format!(
+            "{given} has {unknown}, which capture does not take"
+        ));
+    }
+    let list = |name: &str| {
+        let given = fields.get(name).map_or(Ok(&[][..]), |given| {
+            given
+                .as_array()
+                .map(Vec::as_slice)
+                .ok_or_else(|| format!("{name} {given} is not a list"))
+        })?;
+        if given.len() > MOST_CAPTURED {
+            return Err(format!(
+                "{name} names {} things to capture, and takes at most {MOST_CAPTURED}",
+                given.len()
+            ));
+        }
+        Ok(given)
+    };
+    let values = list("values")?
+        .iter()
+        .map(captured_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let memory = list("memory")?
+        .iter()
+        .map(captured_span)
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() && memory.is_empty() {
+        return Err(format!("{given} names nothing to capture"));
+    }
+    Ok(Capturing { values, memory })
+}
+
+// A condition, kept once in a tool's $defs, as until, gather and count all
+// take lists of them; count's take no capture.
+struct ConditionForms<const CAPTURING: bool>;
+
+impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
     fn schema_name() -> Cow<'static, str> {
-        "Condition".into()
+        if CAPTURING {
+            "Condition".into()
+        } else {
+            "CountCondition".into()
+        }
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let address = generator.subschema_for::<AddressForms>().to_value();
         let register = json!({ "type": "integer", "minimum": 0, "maximum": 15 });
+        let span = json!({
+            "type": "object",
+            "properties": {
+                "address": address,
+                "length": { "type": "integer", "minimum": 1, "maximum": CAPTURED_BYTES },
+            },
+            "required": ["address"],
+            "additionalProperties": false,
+        });
+        let named =
+            |list: &str| json!({ "properties": { list: { "minItems": 1 } }, "required": [list] });
+        let capture = json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": "array", "maxItems": MOST_CAPTURED, "items": { "type": "string" } },
+                "memory": { "type": "array", "maxItems": MOST_CAPTURED, "items": span },
+            },
+            "additionalProperties": false,
+            "anyOf": [named("values"), named("memory")],
+        });
         let condition = |kind: &str, other: &str, schema: &Value, required: &[&str]| {
-            json!({
+            let mut branch = json!({
                 "type": "object",
                 "properties": { kind: schema, other: schema },
                 "required": required,
                 "additionalProperties": false,
-            })
+            });
+            if CAPTURING {
+                branch["properties"]["capture"] = capture.clone();
+            }
+            branch
         };
         let with_memory = |kind: &str| {
             let mut branch = condition(kind, "to", &address, &[kind]);
@@ -463,7 +613,15 @@ fn conditions_schema(generator: &mut SchemaGenerator) -> Schema {
     json_schema!({
         "type": "array",
         "maxItems": MOST_CONDITIONS,
-        "items": generator.subschema_for::<ConditionForms>(),
+        "items": generator.subschema_for::<ConditionForms<true>>(),
+    })
+}
+
+fn count_conditions_schema(generator: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "array",
+        "maxItems": MOST_CONDITIONS,
+        "items": generator.subschema_for::<ConditionForms<false>>(),
     })
 }
 
@@ -478,7 +636,7 @@ const KIND_NAMES: [(&str, Kind); 6] = [
     ("psg", PSG),
 ];
 
-fn condition(value: &Value, list: List) -> Result<Condition, String> {
+fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>), String> {
     let fields = value
         .as_object()
         .ok_or_else(|| format!("{value} is not an object"))?;
@@ -501,12 +659,24 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
     let port = kind == IN || kind == OUT;
     let other = if port { "mask" } else { "to" };
     let takes_memory = kind == EXECUTE || kind == READ;
-    if let Some(unknown) = fields
-        .keys()
-        .find(|key| *key != name && *key != other && !(takes_memory && *key == "memory"))
-    {
+    if let Some(unknown) = fields.keys().find(|key| {
+        *key != name && *key != other && *key != "capture" && !(takes_memory && *key == "memory")
+    }) {
         return Err(format!("{value} has {unknown}, which {name} does not take"));
     }
+    let capture = fields
+        .get("capture")
+        .map(|given| {
+            if list == COUNT {
+                return Err(
+                    "count counts each place by its first match and captures nothing; capture \
+                     in until or gather"
+                        .to_owned(),
+                );
+            }
+            capturing(given).map_err(|problem| format!("capture: {problem}; {CAPTURE_FORMS}"))
+        })
+        .transpose()?;
     let memory = fields
         .get("memory")
         .map(|given| {
@@ -546,14 +716,16 @@ fn condition(value: &Value, list: List) -> Result<Condition, String> {
         }
         (last, 0)
     };
-    Ok(Condition {
+    let condition = Condition {
         kind,
         first,
         last,
         mask,
         memory,
         list,
-    })
+        captures: capture.is_some(),
+    };
+    Ok((condition, capture))
 }
 
 // The conditions of until, gather or count, added to those of the others.
@@ -561,7 +733,7 @@ fn conditions(
     field: &str,
     listed: Option<&Value>,
     list: List,
-    into: &mut Vec<Condition>,
+    into: &mut WatchedFor,
 ) -> Result<(), String> {
     let Some(listed) = listed else {
         return Ok(());
@@ -578,22 +750,105 @@ fn conditions(
         ));
     }
     for (index, value) in listed.iter().enumerate() {
-        let condition = condition(value, list)
+        let (condition, capture) = condition(value, list)
             .map_err(|problem| format!("{field}[{index}]: {problem}; {CONDITION_FORMS}"))?;
-        into.push(condition);
+        into.conditions.push(condition);
+        into.capturing.push(capture);
     }
     Ok(())
+}
+
+// The conditions of until, gather and count, in that order, with what each
+// captures beside it, as given; the values and the spans of memory every
+// capture takes, each once, in the order the conditions first name them; and
+// which of those each condition names, by their places among them.
+struct WatchedFor {
+    conditions: Vec<Condition>,
+    capturing: Vec<Option<Capturing>>,
+    values: Vec<(String, Vec<Segment>)>,
+    spans: Vec<Span>,
+    named: Vec<Named>,
+}
+
+// A bit to each of the values and the spans a request's captures name,
+// MOST_CAPTURED at most.
+#[derive(Clone, Copy, Default)]
+struct Named {
+    values: u16,
+    spans: u16,
 }
 
 fn watched_for(
     until: Option<&Value>,
     gather: Option<&Value>,
     count: Option<&Value>,
-) -> Result<Vec<Condition>, String> {
-    let mut watched = Vec::new();
+) -> Result<WatchedFor, String> {
+    let mut watched = WatchedFor {
+        conditions: Vec::new(),
+        capturing: Vec::new(),
+        values: Vec::new(),
+        spans: Vec::new(),
+        named: Vec::new(),
+    };
     conditions("until", until, UNTIL, &mut watched)?;
     conditions("gather", gather, GATHER, &mut watched)?;
     conditions("count", count, COUNT, &mut watched)?;
+    for capture in watched.capturing.iter().flatten() {
+        for value in &capture.values {
+            if !watched.values.iter().any(|(path, _)| *path == value.0) {
+                watched.values.push(value.clone());
+            }
+        }
+        for span in &capture.memory {
+            if !watched.spans.iter().any(|kept| same_span(kept, span)) {
+                watched.spans.push(*span);
+            }
+        }
+    }
+    let named = watched.values.len() + watched.spans.len();
+    if named > MOST_CAPTURED {
+        return Err(format!(
+            "the captures of until and gather name {named} values and spans, each counted once, \
+             and take at most {MOST_CAPTURED} together"
+        ));
+    }
+    let bytes: u32 = watched
+        .spans
+        .iter()
+        .map(|span| u32::from(span.length))
+        .sum();
+    if bytes > CAPTURED_BYTES {
+        return Err(format!(
+            "the captures of until and gather read {bytes} bytes of memory, each span counted \
+             once, and take at most {CAPTURED_BYTES} together"
+        ));
+    }
+    let bits = |chosen: &mut dyn Iterator<Item = bool>| {
+        chosen
+            .enumerate()
+            .filter(|(_, named)| *named)
+            .fold(0, |bits, (index, _)| bits | 1 << index)
+    };
+    watched.named = watched
+        .capturing
+        .iter()
+        .map(|capture| {
+            capture.as_ref().map_or(Named::default(), |capture| Named {
+                values: bits(
+                    &mut watched
+                        .values
+                        .iter()
+                        .map(|(path, _)| capture.values.iter().any(|(named, _)| named == path)),
+                ),
+                spans: bits(
+                    &mut watched
+                        .spans
+                        .iter()
+                        .map(|kept| capture.memory.iter().any(|span| same_span(kept, span))),
+                ),
+            })
+        })
+        .collect();
     Ok(watched)
 }
 
@@ -631,16 +886,23 @@ fn kept_as_asked(
 }
 
 fn watching(
-    conditions: &[Condition],
+    watched_for: &WatchedFor,
     gather_last: Option<bool>,
     count_by: Option<CountBy>,
     filing: bool,
 ) -> Watching<'_> {
+    let conditions = &watched_for.conditions;
     let gathering = conditions.iter().any(|condition| condition.list == GATHER);
+    let gathering_captures = conditions
+        .iter()
+        .any(|condition| condition.list == GATHER && condition.captures);
     Watching {
         conditions,
+        spans: &watched_for.spans,
         most_gathered: if filing && gathering {
             MOST_GATHERED_TO_A_FILE
+        } else if gathering_captures {
+            MOST_GATHERED_CAPTURING
         } else {
             MOST_GATHERED
         },
@@ -679,9 +941,10 @@ fn journaled<T: Serialize>(request: &T) -> Value {
 
 // Each list of conditions a request gave, as the journal keeps it, whatever
 // form it was given in: its addresses after &, its registers by their
-// numbers, and a range of one address or register as that one.
-fn journal_conditions(arguments: &mut Value, conditions: &[Condition]) {
-    let written = |condition: &Condition| {
+// numbers, a range of one address or register as that one, and a capture's
+// spans each with its length.
+fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
+    let written = |(condition, capture): (&Condition, &Option<Capturing>)| {
         let (name, _) = KIND_NAMES
             .iter()
             .find(|(_, kind)| *kind == condition.kind)
@@ -706,13 +969,33 @@ fn journal_conditions(arguments: &mut Value, conditions: &[Condition]) {
         {
             fields.insert("memory".to_owned(), json!(name));
         }
+        if let Some(capture) = capture {
+            let mut captured = Map::new();
+            if !capture.values.is_empty() {
+                let values: Vec<&String> = capture.values.iter().map(|(path, _)| path).collect();
+                captured.insert("values".to_owned(), json!(values));
+            }
+            if !capture.memory.is_empty() {
+                let memory: Vec<Value> = capture
+                    .memory
+                    .iter()
+                    .map(|span| {
+                        json!({ "address": Hexadecimal::address(span.address), "length": span.length })
+                    })
+                    .collect();
+                captured.insert("memory".to_owned(), json!(memory));
+            }
+            fields.insert("capture".to_owned(), Value::Object(captured));
+        }
         Value::Object(fields)
     };
     for (field, list) in [("until", UNTIL), ("gather", GATHER), ("count", COUNT)] {
         if let Some(listed) = arguments.get_mut(field) {
-            *listed = conditions
+            *listed = watched_for
+                .conditions
                 .iter()
-                .filter(|condition| condition.list == list)
+                .zip(&watched_for.capturing)
+                .filter(|(condition, _)| condition.list == list)
                 .map(written)
                 .collect();
         }
@@ -839,24 +1122,24 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
-    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. At most 16.
+    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. Any of these, and of gather's, may take "capture": {"values": paths, "memory": spans}, one of the two or both, and each of its matches then carries in captured what the machine held: each of the processor's values a path names, as inspect reads it, under cpu, a register by itself as the emulator's z80_t holds it, as "cpu.a", "cpu.h" or "cpu.ixh"; and each span, {"address": address, "length": bytes}, from 1 to 64 bytes, 1 if length is not given and none past &FFFF, as peek reads it. An instruction about to begin captures the machine it finds. An access captures the machine as the instruction that made it, or the response to an interrupt that made it, leaves it at its end, every access of one instruction alike: before the response to an interrupt taken there, which until's stop runs through, though the processor has taken the interrupt already, clearing IFF1, and for INT IFF2 as well, and the emulator's machinery for the processor, such as cpu.q, cpu.accepting and cpu.step, stands as the response begins, or for an NMI set has written in, two of the processor's ticks into it. A match of several conditions captures what each names. A request's captures name at most 16 values and spans together and read at most 64 bytes, each counted once. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the run goes, written as until's are, the instruction the run begins on among them, which until never stops before. The run stops at the end of the instruction that makes the 128th match, or with path the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
+    /// Conditions whose matches are gathered as the run goes, written as until's are, capture and all, the instruction the run begins on among them, which until never stops before. The run stops at the end of the instruction that makes the 128th match, the 32nd where one of these captures, or with path, capturing or not, the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last 128 matches rather than the first, or with path the last 1048576: true runs on past the 128th, or the 1048576th, and lists those gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
+    /// Whether gather keeps the last matches rather than the first, as many as it fills at, 128, 32 where one of its conditions captures, or with path, capturing or not, 1048576: true runs on past them and lists those gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
-    #[schemars(schema_with = "conditions_schema")]
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, save that they take no capture, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
+    #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -897,24 +1180,24 @@ struct CallRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<i64>,
-    /// Conditions that stop the call at their first match, written as run's until takes them. The routine's first instruction is never stopped before. At most 16.
+    /// Conditions that stop the call at their first match, written as run's until takes them, capture and all. The routine's first instruction is never stopped before. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the call goes, written as run's until takes them. The call stops at the end of the instruction that makes the 128th match, or with path the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
+    /// Conditions whose matches are gathered as the call goes, written as run's until takes them, capture and all. The call stops at the end of the instruction that makes the 128th match, the 32nd where one of these captures, or with path, capturing or not, the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last 128 matches rather than the first, or with path the last 1048576, as run's gather_last keeps them. false if not given, and refused without gather.
+    /// Whether gather keeps the last matches rather than the first, as run's gather_last keeps them. false if not given, and refused without gather.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. With path, a count never fills. At most 16.
-    #[schemars(schema_with = "conditions_schema")]
+    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them, and which take no capture. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. With path, a count never fills. At most 16.
+    #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1278,7 +1561,7 @@ enum Stopped {
     Unsettled,
     /// A condition of until matched.
     Matched,
-    /// The gathering came to 128 matches, or to 1048576 written to a file, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills, nor does a count written to a file.
+    /// The gathering came to 128 matches, 32 where one of gather's conditions captures, or to 1048576 written to a file, capturing or not, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills, nor does a count written to a file.
     Full,
     /// The processor halted on HALT with interrupts disabled, where it waits for good: IFF1 shuts out INT, and nothing on either machine raises the NMI that would wake it. A run from here runs as asked, halted throughout, unless set has written in an NMI; call wakes the processor for its routine alone, and set or state_restore takes it past the HALT.
     Halted,
@@ -1342,6 +1625,72 @@ struct Matched {
     beam_x: u16,
     /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines, of which monitor.height make a frame.
     beam_y: u16,
+    /// What the conditions it matched name in their captures, each once, taken at the moment run's until describes. Not given where none of them captures, nor for an access whose instruction a run ends inside, unsettled, which a run does only where set has written the emulator's machinery for the processor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    captured: Option<Captured>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Captured {
+    /// Each of the processor's values named, by its path, as inspect reads it, in the order until's conditions, then gather's, first name them; not given where none is named.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    #[schemars(schema_with = "values_schema")]
+    values: Map<String, Value>,
+    /// Each span of memory named, as peek reads it, in the order until's conditions, then gather's, first name them; not given where none is named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory: Vec<CapturedSpan>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct CapturedSpan {
+    /// The span's first address, as the processor reaches it, in hexadecimal after &.
+    address: Hexadecimal,
+    /// The bytes, as pairs of hexadecimal digits.
+    bytes: String,
+}
+
+impl Captured {
+    // What a match captured: the values and the spans the conditions it
+    // matched name, each once.
+    fn of(seen: &Match, capture: Option<&Capture>, watched_for: &WatchedFor) -> Option<Captured> {
+        let capture = capture?;
+        let named = watched_for
+            .named
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| seen.agreed & (1 << index) != 0)
+            .fold(Named::default(), |all, (_, named)| Named {
+                values: all.values | named.values,
+                spans: all.spans | named.spans,
+            });
+        let values = watched_for
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| named.values & (1 << index) != 0)
+            .map(|(_, (path, segments))| {
+                let value = capture
+                    .cpu
+                    .get(segments)
+                    .expect("a path read from the processor as it was checked");
+                (path.clone(), value)
+            })
+            .collect();
+        let mut memory = Vec::new();
+        let mut offset = 0;
+        for (index, span) in watched_for.spans.iter().enumerate() {
+            let length = usize::from(span.length);
+            if named.spans & (1 << index) != 0 {
+                memory.push(CapturedSpan {
+                    address: Hexadecimal::address(span.address),
+                    bytes: digit_pairs(&capture.memory[offset..offset + length]),
+                });
+            }
+            offset += length;
+        }
+        Some(Captured { values, memory })
+    }
 }
 
 // Where a CPC holds a byte of memory, by its location, when the address the
@@ -1365,7 +1714,29 @@ fn holder(location: u32, address: u16) -> (Option<String>, Option<Hexadecimal>) 
 }
 
 impl Matched {
-    fn of(seen: &Match, paged: bool) -> Matched {
+    // Each match a run kept that the list chose, with what it captured.
+    fn listed<'a>(
+        watched: &'a Watched,
+        watched_for: &'a WatchedFor,
+        chosen: fn(&Match) -> bool,
+    ) -> impl Iterator<Item = Matched> + 'a {
+        watched
+            .matches
+            .iter()
+            .enumerate()
+            .filter(move |(_, seen)| chosen(seen))
+            .map(|(index, seen)| {
+                let capture = watched
+                    .slots
+                    .get(index)
+                    .filter(|_| seen.captured)
+                    .map(|slot| &watched.captures[*slot as usize]);
+                let captured = Captured::of(seen, capture, watched_for);
+                Matched::of(seen, captured, watched.paged)
+            })
+    }
+
+    fn of(seen: &Match, captured: Option<Captured>, paged: bool) -> Matched {
         let at = |kind| (seen.kind == kind).then_some(Hexadecimal::address(seen.address));
         let access = seen.kind != EXECUTE;
         let made = access && !seen.response;
@@ -1396,6 +1767,7 @@ impl Matched {
             pc_ram,
             beam_x: seen.beam_x,
             beam_y: seen.beam_y,
+            captured,
         }
     }
 }
@@ -1459,7 +1831,7 @@ struct Counted {
 
 impl Counted {
     fn of((place, count): &(Place, u32), paged: bool) -> Counted {
-        let first = Matched::of(&place.first, paged);
+        let first = Matched::of(&place.first, None, paged);
         let access = place.first.kind != EXECUTE;
         Counted {
             tick: first.tick,
@@ -1494,7 +1866,7 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     matched: Option<Vec<Matched>>,
-    /// What matched the conditions of gather, in the order it happened: the first matches, or with gather_last the last 128.
+    /// What matched the conditions of gather, in the order it happened: the first matches, or with gather_last the last 128, 32 where one of gather's conditions captures.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
@@ -1544,9 +1916,9 @@ fn line<T: Serialize>(file: &mut NewFile, list: &'static str, entry: T) -> io::R
     file.write_all(b"\n")
 }
 
-fn write_lists(file: &mut NewFile, watched: &Watched) -> io::Result<()> {
-    for seen in watched.matches.iter().filter(|seen| seen.gathers) {
-        line(file, "gather", Matched::of(seen, watched.paged))?;
+fn write_lists(file: &mut NewFile, watched: &Watched, watched_for: &WatchedFor) -> io::Result<()> {
+    for matched in Matched::listed(watched, watched_for, |seen| seen.gathers) {
+        line(file, "gather", matched)?;
     }
     for place in &watched.counts {
         line(file, "count", Counted::of(place, watched.paged))?;
@@ -1582,7 +1954,12 @@ impl Ran {
     // halt for good stopped it. The lists go to the file, if one was given,
     // and a file that cannot be written takes nothing back: the machine
     // stands where the run left it.
-    fn watched(mut self, watched: &Watched, lists: Lists) -> Result<Ran, String> {
+    fn watched(
+        mut self,
+        watched: &Watched,
+        watched_for: &WatchedFor,
+        lists: Lists,
+    ) -> Result<Ran, String> {
         if self.run.settled {
             if watched.returned {
                 self.stopped = Stopped::Returned;
@@ -1594,17 +1971,13 @@ impl Ran {
                 self.stopped = Stopped::Full;
             }
         }
-        let listed = |chosen: fn(&Match) -> bool| {
-            watched
-                .matches
-                .iter()
-                .filter(|seen| chosen(seen))
-                .map(|seen| Matched::of(seen, watched.paged))
-                .collect()
-        };
-        self.matched = watched.matched.then(|| listed(|seen| seen.stops));
+        self.matched = watched
+            .matched
+            .then(|| Matched::listed(watched, watched_for, |seen| seen.stops).collect());
         let Some(mut file) = lists.file else {
-            self.gathered = lists.gathering.then(|| listed(|seen| seen.gathers));
+            self.gathered = lists
+                .gathering
+                .then(|| Matched::listed(watched, watched_for, |seen| seen.gathers).collect());
             self.counted = lists.counting.then(|| {
                 watched
                     .counts
@@ -1614,7 +1987,7 @@ impl Ran {
             });
             return Ok(self);
         };
-        let written = write_lists(&mut file, watched);
+        let written = write_lists(&mut file, watched, watched_for);
         let file = file.finish(written).map_err(|problem| {
             format!(
                 "{problem}. The request is not taken back: it ran {} ticks, and the machine stands \
@@ -2029,7 +2402,7 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood, and on a CPC which ROM held the instruction or the byte, or where in its RAM, when the address alone does not say. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood, and on a CPC which ROM held the instruction or the byte, or where in its RAM, when the address alone does not say. A condition of until or gather may capture the machine at each match, values of the processor and spans of memory, so that a routine's arguments, or what an instruction left, come with the match rather than from a stop and a read after it. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2042,12 +2415,12 @@ impl Server {
     ) -> Result<Json<Ran>, String> {
         let (machine, orders) = self.thread(&request.handle)?;
         let most_ticks = u64::from(MOST_FRAMES) * machine.standard_frame();
-        let conditions = watched_for(
+        let watched_for = watched_for(
             request.until.as_ref(),
             request.gather.as_ref(),
             request.count.as_ref(),
         )?;
-        machine.watchable(&conditions)?;
+        machine.watchable(&watched_for.conditions)?;
         kept_as_asked(
             request.gather.as_ref(),
             request.gather_last,
@@ -2062,7 +2435,7 @@ impl Server {
             .map(machines::absolute)
             .transpose()?;
         let mut arguments = journaled(&request);
-        journal_conditions(&mut arguments, &conditions);
+        journal_conditions(&mut arguments, &watched_for);
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let (gather_last, count_by) = (request.gather_last, request.count_by);
@@ -2082,7 +2455,7 @@ impl Server {
                 Server::ask(&request.handle, orders, move |built| {
                     let file = path.as_deref().map(NewFile::create).transpose()?;
                     let tick = built.tick();
-                    let watching = watching(&conditions, gather_last, count_by, file.is_some());
+                    let watching = watching(&watched_for, gather_last, count_by, file.is_some());
                     let (run, watched) = built.run(frames, limit, &watching, &keys);
                     let stopped = if run.frames >= frames {
                         Stopped::Frames
@@ -2094,7 +2467,7 @@ impl Server {
                         counting,
                         file,
                     };
-                    let ran = Ran::of(run, built, stopped).watched(&watched, lists);
+                    let ran = Ran::of(run, built, stopped).watched(&watched, &watched_for, lists);
                     built.record(tick, "run", arguments, None, wrote(&ran));
                     ran
                 })
@@ -2115,14 +2488,15 @@ impl Server {
                 Server::ask(&request.handle, orders, move |built| {
                     let file = path.as_deref().map(NewFile::create).transpose()?;
                     let tick = built.tick();
-                    let watching = watching(&conditions, gather_last, count_by, file.is_some());
+                    let watching = watching(&watched_for, gather_last, count_by, file.is_some());
                     let (run, watched) = built.run(u32::MAX, ticks, &watching, &keys);
                     let lists = Lists {
                         gathering,
                         counting,
                         file,
                     };
-                    let ran = Ran::of(run, built, Stopped::Ticks).watched(&watched, lists);
+                    let ran =
+                        Ran::of(run, built, Stopped::Ticks).watched(&watched, &watched_for, lists);
                     built.record(tick, "run", arguments, None, wrote(&ran));
                     ran
                 })
@@ -2161,7 +2535,7 @@ impl Server {
                      again to carry the routine further"
                 )
             })?;
-        let conditions = watched_for(
+        let watched_for = watched_for(
             request.until.as_ref(),
             request.gather.as_ref(),
             request.count.as_ref(),
@@ -2183,16 +2557,16 @@ impl Server {
         let (gather_last, count_by) = (request.gather_last, request.count_by);
         let mut arguments = journaled(&request);
         arguments["address"] = json!(Hexadecimal::address(address));
-        journal_conditions(&mut arguments, &conditions);
+        journal_conditions(&mut arguments, &watched_for);
         let values = request.values.unwrap_or_default();
         let path = request.path;
         let (machine, orders) = self.thread(&request.handle)?;
-        machine.watchable(&conditions)?;
+        machine.watchable(&watched_for.conditions)?;
         let limit = 2 * u64::from(frames) * machine.standard_frame();
         let ran = Server::ask(&request.handle, orders, move |built| {
             let file = path.as_deref().map(NewFile::create).transpose()?;
             let tick = built.tick();
-            let watching = watching(&conditions, gather_last, count_by, file.is_some());
+            let watching = watching(&watched_for, gather_last, count_by, file.is_some());
             let (run, watched) = match built.call(address, &values, frames, limit, &watching) {
                 Ok(called) => called,
                 Err(problem) => {
@@ -2212,7 +2586,7 @@ impl Server {
                 counting,
                 file,
             };
-            let ran = Ran::of(run, built, stopped).watched(&watched, lists);
+            let ran = Ran::of(run, built, stopped).watched(&watched, &watched_for, lists);
             built.record(tick, "call", arguments, None, wrote(&ran));
             ran
         })
@@ -2870,8 +3244,8 @@ mod tests {
             .build(machine)
             .expect("a machine without a snapshot is always built");
         let gathering = json!([{ "write": 0, "to": "&FFFF" }]);
-        let conditions = watched_for(None, Some(&gathering), None).expect("a gathering");
-        let watching = watching(&conditions, gather_last, None, true);
+        let watched_for = watched_for(None, Some(&gathering), None).expect("a gathering");
+        let watching = watching(&watched_for, gather_last, None, true);
         let (run, watched) = built.run(u32::MAX, TICKS, &watching, &[]);
         assert_eq!(watched.full, gather_last.is_none(), "{run:?}");
         let gathered = watched.matches.into_iter().filter(|seen| seen.gathers);
