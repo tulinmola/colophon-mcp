@@ -6,8 +6,9 @@
 #include <stddef.h>
 
 static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t address,
-                   uint32_t location) {
-  if (condition->kind != kind) {
+                   uint32_t location, uint8_t value, bool changed) {
+  if (condition->kind != kind || value < condition->first_value || value > condition->last_value ||
+      (condition->changes && !changed)) {
     return false;
   }
   if (kind == MCP_IN || kind == MCP_OUT) {
@@ -49,7 +50,7 @@ static void count(mcp_watch_t *watch, const mcp_match_t *match) {
 /* Keeps what was seen if a condition of the lists allowed matches it. A
    match is counted where it may be gathered. */
 static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp_kind_t kind,
-                uint16_t address, uint8_t value, bool may_stop, bool may_gather) {
+                uint16_t address, uint8_t value, bool changed, bool may_stop, bool may_gather) {
   bool memory = kind == MCP_EXECUTE || kind == MCP_READ || kind == MCP_WRITE;
   uint32_t location = memory ? watch->locate(watch->machine, address, kind == MCP_WRITE) : address;
   bool stops = false;
@@ -59,7 +60,7 @@ static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp
   bool captures = false;
   for (uint32_t index = 0; index < watch->condition_count; index++) {
     const mcp_condition_t *condition = &watch->conditions[index];
-    if (agrees(condition, kind, address, location)) {
+    if (agrees(condition, kind, address, location, value, changed)) {
       bool stopping = condition->list == MCP_UNTIL && may_stop;
       bool gathering = condition->list == MCP_GATHER && may_gather;
       stops |= stopping;
@@ -139,7 +140,7 @@ static void fetch(mcp_watch_t *watch, uint8_t value) {
 /* At an instruction the run has come to: whether it stops before it. */
 static bool arrived(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor, uint64_t tick) {
   if (!cpu->halted) {
-    see(watch, monitor, tick, MCP_EXECUTE, cpu->pc, 0, true, false);
+    see(watch, monitor, tick, MCP_EXECUTE, cpu->pc, 0, false, true, false);
   }
   if (watch->calling && cpu->pc == watch->return_pc && cpu->sp == watch->return_sp) {
     watch->returned = true;
@@ -182,9 +183,18 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
     return true;
   }
   if (!cpu->halted) {
-    see(watch, monitor, tick, MCP_EXECUTE, cpu->pc, 0, false, true);
+    see(watch, monitor, tick, MCP_EXECUTE, cpu->pc, 0, false, false, true);
   }
   capture(watch, cpu);
+  return false;
+}
+
+bool mcp_watch_compares(const mcp_watch_t *watch) {
+  for (uint32_t index = 0; index < watch->condition_count; index++) {
+    if (watch->conditions[index].changes) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -199,7 +209,7 @@ bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request) {
    IO_READ_T4), so a port read matched is given each tick's byte while it is
    held; memory answers the same byte throughout. */
 void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor,
-                     uint64_t before, uint64_t pins, uint64_t tick) {
+                     uint64_t before, uint64_t pins, uint64_t tick, bool changed) {
   uint16_t address = z80_address(pins);
   uint8_t value = z80_data(pins);
   if ((pins & (Z80_IORQ | Z80_RD)) != (Z80_IORQ | Z80_RD)) {
@@ -225,24 +235,24 @@ void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *moni
       watch->fetched |= opcode;
       fetch(watch, value);
     } else {
-      see(watch, monitor, tick, MCP_READ, address, value, true, true);
+      see(watch, monitor, tick, MCP_READ, address, value, false, true, true);
     }
   } else if (mcp_request_began(before, pins, Z80_MREQ | Z80_WR)) {
-    see(watch, monitor, tick, MCP_WRITE, address, value, true, true);
+    see(watch, monitor, tick, MCP_WRITE, address, value, changed, true, true);
   } else if (mcp_request_began(before, pins, Z80_IORQ | Z80_RD)) {
     uint32_t match = watch->match_count;
     uint32_t slot = kept_at(watch, match);
-    see(watch, monitor, tick, MCP_IN, address, value, true, true);
+    see(watch, monitor, tick, MCP_IN, address, value, false, true, true);
     watch->port_read_held = watch->match_count > match && slot < watch->room;
     watch->port_read_match = slot;
   } else if (mcp_request_began(before, pins, Z80_IORQ | Z80_WR)) {
-    see(watch, monitor, tick, MCP_OUT, address, value, true, true);
+    see(watch, monitor, tick, MCP_OUT, address, value, false, true, true);
   }
 }
 
-void mcp_watch_psg(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, uint8_t selected,
-                   uint8_t value) {
-  see(watch, monitor, tick, MCP_PSG, selected, value, true, true);
+void mcp_watch_register(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick,
+                        mcp_kind_t kind, uint8_t number, uint8_t value, bool changed) {
+  see(watch, monitor, tick, kind, number, value, changed, true, true);
 }
 
 void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor, uint64_t tick) {

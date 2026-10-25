@@ -18,8 +18,8 @@ use crate::emulator::{
 use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run, SPECTRUM_LOCATIONS,
-    Span, Spectrum, SpectrumState, Watch, gate_array_rgb, ula_rgb,
+    COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run,
+    SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -609,7 +609,8 @@ impl Machine {
 
     // Whether the machine has what the conditions watch, and what does if it
     // has not. On a Spectrum's ULA port, "a one in bit 4 activates the EAR
-    // output and the internal speaker" ("16K/48K reference",
+    // output and the internal speaker", and "The lowest three bits specify the
+    // border colour" ("16K/48K reference",
     // https://worldofspectrum.org/faq/reference/48kreference.htm).
     pub fn watchable(&self, conditions: &[Condition]) -> Result<(), String> {
         match self.board {
@@ -618,6 +619,14 @@ impl Machine {
                     "a {} has no PSG, whose registers psg watches: its speaker is bit 4 of its \
                      ULA's port, which {{\"out\": \"&FE\", \"mask\": \"&01\"}} watches, and a \
                      cpc464, a cpc664 or a cpc6128 has a PSG",
+                    self.name
+                ))
+            }
+            Board::Spectrum { .. } if conditions.iter().any(|condition| condition.kind == CRTC) => {
+                Err(format!(
+                    "a {} has no 6845, whose registers crtc watches: its border's colour is the \
+                     lowest three bits of its ULA's port, which {{\"out\": \"&FE\", \"mask\": \
+                     \"&01\"}} watches, and a cpc464, a cpc664 or a cpc6128 has a 6845",
                     self.name
                 ))
             }
@@ -739,8 +748,9 @@ pub struct Watched {
 
 // Past the match that fills a gathering or a count, a run sees out the
 // instruction under way, which makes four matches at most (EX (SP),IX's
-// accesses; OUTI makes three, a read, a port written and a PSG register
-// written through it), then the response to an interrupt taken at its end,
+// accesses; OUTI to a port that reaches both the 6845 and the PPI makes four
+// too, a read, a port written, and a 6845 register and a PSG register written
+// through it), then the response to an interrupt taken at its end,
 // four more (in mode 2), and the instruction it stops before. The last nine
 // matches therefore hold every match of until, which stops the run at the
 // first.
@@ -953,7 +963,7 @@ impl Built {
             (true, None) => (every_place, every_place as u32, u32::MAX),
         };
         let mut counts = vec![0; size];
-        // Room for every place a count to a file can reach, 1671168 on a 6128,
+        // Room for every place a count to a file can reach, 1949696 on a 6128,
         // is asked for zeroed rather than filled, so that room no place is
         // kept in is never written.
         // SAFETY: as for a match.

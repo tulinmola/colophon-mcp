@@ -43,10 +43,13 @@ typedef enum {
   MCP_OUT,
   /* One of a CPC's PSG registers written, by its number. */
   MCP_PSG,
+  /* One of a CPC's 6845 registers written, by the number its address
+     register holds. */
+  MCP_CRTC,
 } mcp_kind_t;
 
 /* How many kinds mcp_kind_t gives. */
-#define MCP_KINDS 6
+#define MCP_KINDS 7
 
 /* A location is a byte of memory, numbered as the machine holds it, whatever
    address the processor reaches it at: the RAM's bytes from 0, as they stand
@@ -83,6 +86,13 @@ typedef struct {
   uint16_t last;
   /* The bits of a port's address that its device decodes. */
   uint16_t mask;
+  /* The bytes an access matches: from first_value to last_value, 0 to &FF
+     for any. An instruction carries none, and is matched as carrying 0. */
+  uint8_t first_value;
+  uint8_t last_value;
+  /* Whether a write matches only where it leaves the byte, or the register,
+     holding other than it held. */
+  bool changes;
   mcp_memory_t memory;
   mcp_list_t list;
   /* Whether a match of it, in a list that keeps matches, captures the
@@ -119,8 +129,9 @@ typedef struct {
   uint16_t address;
   /* The location the address reached; the port, or the register, again. */
   uint32_t location;
-  /* The byte read or written, a port's as the processor took it and a
-     register's as port A gave it; 0 for an instruction. */
+  /* The byte read or written, a port's as the processor took it, a PSG
+     register's as port A gave it and a 6845 register's as the bus carried
+     it; 0 for an instruction. */
   uint8_t value;
   /* Where the instruction that made an access begins, unless the response to
      an interrupt made it, and the location it began at. */
@@ -223,6 +234,9 @@ typedef struct {
   uint32_t (*locate)(const void *machine, uint16_t address, bool writing);
   uint8_t (*peek)(const void *machine, uint16_t address);
   const void *machine;
+  /* Whether a condition asks for changes, so that the run reads what a write
+     can change before each tick and after it. */
+  bool compares;
   /* The first of the matches still to capture: those of the instruction
      under way, or of the response to an interrupt, which capture at its
      end. */

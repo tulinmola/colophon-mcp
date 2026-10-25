@@ -14,17 +14,23 @@
 bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const monitor_t *monitor,
                       uint64_t tick);
 
+/* Whether a condition asks for changes. */
+bool mcp_watch_compares(const mcp_watch_t *watch);
+
 /* Whether a request first reaches the bus on this tick. */
 bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request);
 
-/* After a tick, given the bus before it and after it. */
+/* After a tick, given the bus before it and after it, and whether the tick
+ * changed the byte at the address the bus carried before it, as a write there
+ * reaches it. */
 void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor,
-                     uint64_t before, uint64_t pins, uint64_t tick);
+                     uint64_t before, uint64_t pins, uint64_t tick, bool changed);
 
-/* After a tick that wrote one of the PSG's registers: its number, and the
- * byte it was given. */
-void mcp_watch_psg(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, uint8_t selected,
-                   uint8_t value);
+/* After a tick that wrote one of a CPC's PSG or 6845 registers: the kind, the
+ * register's number, the byte it was given, and whether the register then
+ * holds other than it held. */
+void mcp_watch_register(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick,
+                        mcp_kind_t kind, uint8_t number, uint8_t value, bool changed);
 
 /* At the instruction a run ends before. */
 void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor, uint64_t tick);

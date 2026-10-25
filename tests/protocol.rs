@@ -2887,13 +2887,7 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
             json!({ "handle": handle, "frames": 1, "until": [{ "execute": 1, "capture": capture }] }),
         )
     };
-    let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
-                 address}, each with \"to\" and the last address if it is a range, and an execute \
-                 or a read with \"memory\": \"ram\" or \"rom\" if only the RAM's bytes or only a \
-                 ROM's are to match; {\"in\": port, \"mask\": bits} or {\"out\": port, \
-                 \"mask\": bits}, the mask being the bits of the port's address that its device \
-                 decodes; or on a CPC {\"psg\": register}, with \"to\" and the last register if \
-                 it is a range; and any of them in until or gather may take \"capture\" too";
+    let forms = CONDITION_FORMS;
     let capture_forms = "capture is {\"values\": paths, \"memory\": spans}, one of the two or \
                          both: each path names one of the processor's values as inspect reads it, \
                          under cpu, as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and each span is \
@@ -3382,6 +3376,326 @@ fn a_psg_write_is_matched_at_each_access_to_the_ppi_that_leaves_it_writing() {
             (7, 0x0037, 1),
             (1, 0x0115, 2),
         ]
+    );
+}
+
+// "The 6845 is selected when bit 14 of the I/O port address is set to '0'",
+// and its ports are "&BCxx Select 6845 register", "&BDxx Write 6845 register
+// data" and "&BFxx (note 1) Read only" ("CRTC", Kevin Thacker's cpctech,
+// https://web.archive.org/web/20220626145908id_/https://cpctech.cpcwiki.de/docs/crtcnew.html).
+// "the CRTCs are not connected to the Z80A's RD and WR pins", so "with the IN
+// A,(n) instruction, it is possible to send the contents of A to the An
+// port", as LD A,%00011001 then IN A,(#FF) "Sends the value of A (#19) to the
+// last selected CRTC register" (Longshot's Amstrad CPC CRTC Compendium,
+// v1.11, ch. 4.4.2, https://shaker.logonsystem.eu/ACCC1.11-EN.pdf), and "if
+// a read instruction is used on a write register of the CRTC, then a data is
+// sent to the CRTC" (the same), so that IN A,(&00) with A at &0C selects R12.
+// IN A,(&FF) with A at &01 reaches &01FF, the PPI's port B as well as the
+// 6845's write port, since "It is entirely possible to select multiple devices
+// and access these simultaneously" ("I/O port allocation", cpctech,
+// https://web.archive.org/web/20220626023021id_/https://cpctech.cpcwiki.de/docs/iopord.html),
+// where the Compendium's example, at a port the PPI does not answer, does not
+// say what the 6845 is given; the emulator gives it A, &01, all the same. The
+// address register "is a 5-bit register used to select 18 internal control
+// registers (R0--R17) [...] Programming the data from 18 to 31 produces no
+// results", R16 and R17 are "read only", and R4's "data is within 7-bit"
+// (Hitachi's HD6845S datasheet, as cpctech transcribes it,
+// https://web.archive.org/web/20220626023757id_/https://cpctech.cpcwiki.de/docs/hd6845s/hd6845sp.htm).
+const WRITING_THE_6845: [u8; 65] = [
+    DI, LD_BC, 0x04, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_BC, 0xFF, 0xBD, OUT_C_C[0], OUT_C_C[1],
+    OUT_C_C[0], OUT_C_C[1], LD_BC, 0x0C, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_A, 0x19, IN_A_N, 0xFF,
+    LD_BC, 0x14, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x55, 0xBD, OUT_C_C[0], OUT_C_C[1], LD_BC,
+    0x10, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_BC, 0xAA, 0xBD, OUT_C_C[0], OUT_C_C[1], LD_B, 0xBF,
+    IN_A_C[0], IN_A_C[1], LD_A, 0x0C, IN_A_N, 0x00, LD_BC, 0x20, 0xBD, OUT_C_C[0], OUT_C_C[1],
+    LD_BC, 0x0D, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_A, 0x01, IN_A_N, 0xFF, HALT,
+];
+
+// Each match as its register, its byte and where the instruction that made it
+// begins.
+fn crtc_writes(list: &Value) -> Vec<(u64, u64, u64)> {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|seen| {
+            (
+                seen["crtc"].as_u64().expect("a register"),
+                after_ampersand(&seen["value"], 2),
+                after_ampersand(&seen["pc"], 4),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_6845_register_is_matched_where_its_write_port_is_reached_an_in_among_them() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_THE_6845);
+    let mut session = Session::start(&roms);
+    let gathered = |session: &mut Session, condition: Value| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(&handle, json!({ "frames": 1, "gather": [condition] }));
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        (
+            crtc_writes(&ran["gathered"]),
+            journal["entries"][1]["arguments"]["gather"][0].clone(),
+            handle,
+        )
+    };
+    let (written, journaled, handle) = gathered(&mut session, json!({ "crtc": 0, "to": 31 }));
+    assert_eq!(
+        written,
+        [
+            (4, 0xFF, 0x0009),
+            (4, 0xFF, 0x000B),
+            (12, 0x19, 0x0014),
+            (20, 0x55, 0x001E),
+            (16, 0xAA, 0x0028),
+            (12, 0x20, 0x0035),
+            (13, 0x01, 0x003E),
+        ]
+    );
+    assert_eq!(journaled, json!({ "crtc": 0, "to": 31 }));
+    assert_eq!(session.inspect(&handle, "crtc.registers[4]"), 0x7F);
+    assert_eq!(session.inspect(&handle, "crtc.registers[12]"), 0x20);
+    assert_eq!(session.inspect(&handle, "crtc.registers[13]"), 0x01);
+    assert_eq!(session.inspect(&handle, "crtc.registers[16]"), 0);
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 1, "gather": [{ "in": "&BC00", "mask": "&4300" }] }),
+    );
+    let selected: Vec<(&str, u64, Option<u64>)> = seen(&ran["gathered"])
+        .into_iter()
+        .map(|(kind, port, _, pc)| (kind, port, pc))
+        .collect();
+    assert_eq!(selected, [("in", 0x0C00, Some(0x0030))]);
+    let (written, journaled, _) = gathered(
+        &mut session,
+        json!({ "crtc": 0, "to": 31, "changes": true }),
+    );
+    assert_eq!(
+        written,
+        [
+            (4, 0xFF, 0x0009),
+            (12, 0x19, 0x0014),
+            (12, 0x20, 0x0035),
+            (13, 0x01, 0x003E),
+        ]
+    );
+    assert_eq!(journaled, json!({ "crtc": 0, "to": 31, "changes": true }));
+    let (written, journaled, _) = gathered(
+        &mut session,
+        json!({ "crtc": 4, "to": 20, "value": "&10", "value_to": "&60" }),
+    );
+    assert_eq!(
+        written,
+        [(12, 0x19, 0x0014), (20, 0x55, 0x001E), (12, 0x20, 0x0035)]
+    );
+    assert_eq!(
+        journaled,
+        json!({ "crtc": 4, "to": 20, "value": "&10", "value_to": "&60" })
+    );
+
+    let handle = session.open("cpc6128");
+    let ran = session.run(&handle, json!({ "frames": 1, "until": [{ "crtc": 12 }] }));
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &json!("&0016"))
+    );
+    assert_eq!(crtc_writes(&ran["matched"]), [(12, 0x19, 0x0014)]);
+
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 1, "count": [{ "crtc": 0, "to": 31 }] }),
+    );
+    let counted: Vec<(u64, u64)> = ran["counted"]
+        .as_array()
+        .expect("a count")
+        .iter()
+        .map(|place| {
+            (
+                place["crtc"].as_u64().expect("a register"),
+                place["count"].as_u64().expect("a count"),
+            )
+        })
+        .collect();
+    assert_eq!(counted, [(4, 2), (12, 2), (13, 1), (16, 1), (20, 1)]);
+}
+
+// Writes from &0000 on: LD (HL),n at &0004 and again at &0006 writes 5 to
+// &8000, LD A,(HL) at &0008 reads it back, LD (HL),n at &0009 writes 6 there,
+// and LD (nn),A at &000D writes &AA to &0001, in "the 16K ROM which occupies
+// the lowest part of the address space" ("16K/48K reference",
+// https://worldofspectrum.org/faq/reference/48kreference.htm).
+const WRITING_THE_SAME_AND_OTHERWISE: [u8; 17] = [
+    DI, LD_HL, 0x00, 0x80, LD_AT_HL, 5, LD_AT_HL, 5, LD_A_AT_HL, LD_AT_HL, 6, LD_A, 0xAA, LD_TO_A,
+    0x01, 0x00, HALT,
+];
+
+#[test]
+fn a_value_and_changes_match_only_the_bytes_they_name() {
+    let roms = Roms::programmed("spectrum48.rom", &WRITING_THE_SAME_AND_OTHERWISE);
+    let mut session = Session::start(&roms);
+    let mut gathered = |condition: Value| {
+        let handle = session.open("spectrum48");
+        let ran = session.run(&handle, json!({ "ticks": 1000, "gather": [condition] }));
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        (
+            seen(&ran["gathered"]),
+            journal["entries"][1]["arguments"]["gather"][0].clone(),
+        )
+    };
+    let write = |address, value, pc| ("write", address, Some(value), Some(pc));
+    assert_eq!(
+        gathered(json!({ "write": 0, "to": "&FFFF" })).0,
+        [
+            write(0x8000, 5, 0x0004),
+            write(0x8000, 5, 0x0006),
+            write(0x8000, 6, 0x0009),
+            write(0x0001, 0xAA, 0x000D),
+        ]
+    );
+    assert_eq!(
+        gathered(json!({ "write": 0, "to": "&FFFF", "changes": true })).0,
+        [write(0x8000, 5, 0x0004), write(0x8000, 6, 0x0009)]
+    );
+    assert_eq!(
+        gathered(json!({ "write": "&8000", "value": 5 })),
+        (
+            vec![write(0x8000, 5, 0x0004), write(0x8000, 5, 0x0006)],
+            json!({ "write": "&8000", "value": "&05" })
+        )
+    );
+    assert_eq!(
+        gathered(json!({ "write": "&8000", "value": "#05", "changes": true })),
+        (
+            vec![write(0x8000, 5, 0x0004)],
+            json!({ "write": "&8000", "value": "&05", "changes": true })
+        )
+    );
+    assert_eq!(
+        gathered(json!({ "write": 0, "to": "&FFFF", "value": 6, "value_to": 255 })),
+        (
+            vec![write(0x8000, 6, 0x0009), write(0x0001, 0xAA, 0x000D)],
+            json!({ "write": "&0000", "to": "&FFFF", "value": "&06", "value_to": "&FF" })
+        )
+    );
+    assert_eq!(
+        gathered(json!({ "write": "&8000", "value": 0, "value_to": "&FF", "changes": false })),
+        (
+            vec![
+                write(0x8000, 5, 0x0004),
+                write(0x8000, 5, 0x0006),
+                write(0x8000, 6, 0x0009),
+            ],
+            json!({ "write": "&8000" })
+        )
+    );
+    assert_eq!(
+        gathered(json!({ "read": "&8000", "value": 5 })).0,
+        [("read", 0x8000, Some(5), Some(0x0008))]
+    );
+    assert_eq!(gathered(json!({ "read": "&8000", "value": 6 })).0, []);
+
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 1000, "until": [{ "write": "&8000", "value": 6, "changes": true }] }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &json!("&000B"))
+    );
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 1000, "count": [{ "write": "&8000", "value": 5 }] }),
+    );
+    assert_eq!(ran["counted"][0]["count"], 2, "{ran}");
+    assert_eq!(ran["counted"].as_array().map(Vec::len), Some(1), "{ran}");
+}
+
+// The Gate Array's "registers are selected with bit7 to 5 of the 8bit
+// command-code", and "On a real Gate Array (CPC 464,664 and 6128), bit5 of
+// the command have absolutly no effect", so its top two bits name the command:
+// 00 "Select a color register", 01 "Change the value of the currently
+// selected color register", 10 "Control Interrupt counter, ROM mapping and
+// video mode", and 11 the PAL's "Memory mapping" ("The Gate Array", Grim,
+// https://web.archive.org/web/20260710174425/https://www.grimware.org/doku.php/documentations/devices/gatearray).
+// A write to &0010 under the lower ROM reaches the RAM beneath it, which the
+// emulator powers on holding 0, so 0 written there changes nothing and 7
+// does.
+const TELLING_THE_GATE_ARRAY: [u8; 32] = [
+    DI, LD_BC, 0x00, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x54, 0x7F, OUT_C_C[0], OUT_C_C[1],
+    LD_BC, 0x89, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_BC, 0xC0, 0x7F, OUT_C_C[0], OUT_C_C[1], LD_A, 0,
+    LD_TO_A, 0x10, 0x00, LD_A, 7, LD_TO_A, 0x10, 0x00, HALT,
+];
+
+#[test]
+fn a_value_tells_the_gate_arrays_functions_apart_and_changes_reads_beneath_a_rom() {
+    let roms = Roms::programmed("cpc6128.rom", &TELLING_THE_GATE_ARRAY);
+    let mut session = Session::start(&roms);
+    let mut gathered = |condition: Value| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(&handle, json!({ "frames": 1, "gather": [condition] }));
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        seen(&ran["gathered"])
+    };
+    let gate_array = |first: &str, last: &str| {
+        let mut condition = json!({ "out": "&7F00", "mask": "&C000" });
+        condition["value"] = json!(first);
+        condition["value_to"] = json!(last);
+        condition
+    };
+    let out = |value, pc| ("out", 0x7F00 | value, Some(value), Some(pc));
+    assert_eq!(gathered(gate_array("&00", "&3F")), [out(0x00, 0x0004)]);
+    assert_eq!(gathered(gate_array("&40", "&7F")), [out(0x54, 0x0009)]);
+    assert_eq!(gathered(gate_array("&80", "&BF")), [out(0x89, 0x000E)]);
+    assert_eq!(gathered(gate_array("&C0", "&FF")), [out(0xC0, 0x0013)]);
+    let write = |value, pc| ("write", 0x0010, Some(value), Some(pc));
+    assert_eq!(
+        gathered(json!({ "write": "&0010" })),
+        [write(0, 0x0017), write(7, 0x001C)]
+    );
+    assert_eq!(
+        gathered(json!({ "write": "&0010", "changes": true })),
+        [write(7, 0x001C)]
+    );
+}
+
+// "The period of the noise generator is set by bits 0..4 of the noise period
+// register", R6 (SOFT 968, Appendix IX), and those five bits are all the
+// emulator keeps of it (its psg.c), so &FF written after &1F leaves it holding
+// what it held. The routine at &0100 is cpctech's .write_to_psg, as above.
+const WRITING_R6_TWICE: [u8; 24] = [
+    DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_C, 6, LD_A, 0x1F, CALL,
+    0x00, 0x01, LD_C, 6, LD_A, 0xFF, CALL, 0x00, 0x01, HALT,
+];
+
+#[test]
+fn a_psg_write_changes_by_the_bits_its_register_keeps() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_R6_TWICE);
+    roms.write_at("cpc6128.rom", 0x100, &WRITE_TO_PSG);
+    let mut session = Session::start(&roms);
+    let mut gathered = |condition: Value| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(&handle, json!({ "frames": 1, "gather": [condition] }));
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        psg_writes(&ran["gathered"])
+    };
+    assert_eq!(
+        gathered(json!({ "psg": 0, "to": 15 })),
+        [(6, 0x1F, 0x0115), (6, 0xFF, 0x0115)]
+    );
+    assert_eq!(
+        gathered(json!({ "psg": 0, "to": 15, "changes": true })),
+        [(6, 0x1F, 0x0115)]
+    );
+    assert_eq!(
+        gathered(json!({ "psg": 6, "value": "&FF" })),
+        [(6, 0xFF, 0x0115)]
     );
 }
 
@@ -4058,6 +4372,20 @@ fn an_argument_of_the_wrong_kind_is_named() {
     );
 }
 
+// What a refused condition is told a condition is.
+const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
+                               {\"write\": address}, each with \"to\" and the last address if it \
+                               is a range, and an execute or a read with \"memory\": \"ram\" or \
+                               \"rom\" if only the RAM's bytes or only a ROM's are to match; \
+                               {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
+                               the mask being the bits of the port's address that its device \
+                               decodes; or on a CPC {\"psg\": register} or {\"crtc\": register}, \
+                               with \"to\" and the last register if it is a range; any but an \
+                               execute or an in may take \"value\", a byte, with \"value_to\" and \
+                               the last byte if it is a range, and a write, a psg or a crtc \
+                               \"changes\": true; and any of them in until or gather may take \
+                               \"capture\" too";
+
 // Clients SHOULD follow $ref resolution "when validating tool inputs and
 // outputs against `inputSchema` and `outputSchema`" (2026-07-28, tools), so
 // the schema admits what the server takes; being the tool's reference, it
@@ -4085,6 +4413,12 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "write": 1, "capture": { "memory": [{ "address": "&9000", "length": 64 }] } }),
         json!({ "out": "&7F00", "mask": "&C000", "capture": { "values": [], "memory": [{ "address": 0 }] } }),
         json!({ "psg": 7, "capture": { "values": ["cpu.h"], "memory": [] } }),
+        json!({ "crtc": 12 }),
+        json!({ "crtc": 0, "to": 31, "value": "&19", "changes": true }),
+        json!({ "write": "&C7EC", "value": 6, "changes": true }),
+        json!({ "read": 1, "value": "&20", "value_to": 255, "memory": "ram" }),
+        json!({ "out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF" }),
+        json!({ "psg": 7, "value": 0, "changes": false }),
     ] {
         if let Err(problem) = fitting(&condition) {
             panic!("{condition}: {problem}");
@@ -4094,6 +4428,14 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "psg": 16 }),
         json!({ "psg": "&07" }),
         json!({ "psg": 1, "mask": 2 }),
+        json!({ "crtc": 32 }),
+        json!({ "crtc": 1, "mask": 2 }),
+        json!({ "execute": 1, "value": 1 }),
+        json!({ "in": "&F500", "mask": "&0B00", "value": 1 }),
+        json!({ "read": 1, "changes": true }),
+        json!({ "out": "&7F00", "mask": "&C000", "changes": true }),
+        json!({ "write": 1, "value": 256 }),
+        json!({ "write": 1, "value": 1, "changes": "yes" }),
         json!({ "in": "&F500" }),
         json!({ "write": 1, "memory": "ram" }),
         json!({ "execute": 1, "memory": "flash" }),
@@ -4125,13 +4467,7 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             json!({ "handle": handle, "frames": 1, "until": [{ "execute": 1 }, condition] }),
         )
     };
-    let forms = "a condition is {\"execute\": address}, {\"read\": address} or {\"write\": \
-                 address}, each with \"to\" and the last address if it is a range, and an execute \
-                 or a read with \"memory\": \"ram\" or \"rom\" if only the RAM's bytes or only a \
-                 ROM's are to match; {\"in\": port, \"mask\": bits} or {\"out\": port, \
-                 \"mask\": bits}, the mask being the bits of the port's address that its device \
-                 decodes; or on a CPC {\"psg\": register}, with \"to\" and the last register if \
-                 it is a range; and any of them in until or gather may take \"capture\" too";
+    let forms = CONDITION_FORMS;
     assert_eq!(
         refused(&mut session, json!({ "read": 5, "out": 6 })),
         format!(
@@ -4212,6 +4548,79 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         ),
         no_psg
     );
+    let crtc_registers = "a register of the 6845 is a number from 0 to 31, as its address \
+                          register of five bits names them, of which 0 to 17 are the chip's";
+    assert_eq!(
+        refused(&mut session, json!({ "crtc": 32 })),
+        format!("until[1]: crtc 32 is no register; {crtc_registers}; {forms}")
+    );
+    let no_6845 = "a spectrum48 has no 6845, whose registers crtc watches: its border's colour \
+                   is the lowest three bits of its ULA's port, which {\"out\": \"&FE\", \
+                   \"mask\": \"&01\"} watches, and a cpc464, a cpc664 or a cpc6128 has a 6845";
+    assert_eq!(
+        refused(&mut session, json!({ "crtc": 12, "to": 13 })),
+        no_6845
+    );
+    let bytes = "a byte is a number from 0 to 255, or hexadecimal from &00 to &FF, written with \
+                 &, #, $ or 0x before it";
+    for (condition, problem) in [
+        (
+            json!({ "execute": 1, "value": 1 }),
+            "{\"execute\":1,\"value\":1} has value, which execute does not take".to_owned(),
+        ),
+        (
+            json!({ "in": "&FE", "mask": "&01", "value": 1 }),
+            "{\"in\":\"&FE\",\"mask\":\"&01\",\"value\":1} has value, which in does not take"
+                .to_owned(),
+        ),
+        (
+            json!({ "read": 1, "changes": true }),
+            "{\"read\":1,\"changes\":true} has changes, which read does not take".to_owned(),
+        ),
+        (
+            json!({ "out": "&FE", "mask": "&01", "changes": true }),
+            "{\"out\":\"&FE\",\"mask\":\"&01\",\"changes\":true} has changes, which out does \
+             not take"
+                .to_owned(),
+        ),
+        (
+            json!({ "write": 1, "value_to": 3 }),
+            "{\"write\":1,\"value_to\":3} has value_to and no value, and a range of bytes runs \
+             from value to value_to"
+                .to_owned(),
+        ),
+        (
+            json!({ "write": 1, "value": 9, "value_to": 3 }),
+            "{\"write\":1,\"value\":9,\"value_to\":3} runs back from value &09 to &03, and a \
+             range runs upward"
+                .to_owned(),
+        ),
+        (
+            json!({ "write": 1, "value": 256 }),
+            format!("value 256 is past &FF; {bytes}"),
+        ),
+        (
+            json!({ "write": 1, "value": "&100" }),
+            format!("value \"&100\" is no byte; {bytes}"),
+        ),
+        (
+            json!({ "write": 1, "value": "&0FF" }),
+            format!("value \"&0FF\" is no byte; {bytes}"),
+        ),
+        (
+            json!({ "write": 1, "value": 5, "value_to": -1 }),
+            format!("value_to -1 is no byte; {bytes}"),
+        ),
+        (
+            json!({ "psg": 1, "changes": 1 }),
+            "changes 1 is neither true nor false".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut session, condition),
+            format!("until[1]: {problem}; {forms}")
+        );
+    }
     let many = vec![json!({ "execute": 1 }); 17];
     assert_eq!(
         session.refusal(
@@ -7747,43 +8156,43 @@ fn a_cpc_takes_six_interrupts_a_frame() {
     assert_eq!(seen(&gathered["gathered"]).len(), 60, "{gathered}");
 }
 
-// The 6845's registers are selected through &BCxx and written through &BDxx:
-// the chip answers A14 low, its RS is A8 and its R/W A9, and "register index
-// is 5bit wide" ("The CRTC", Grim, I/O ports,
-// https://web.archive.org/web/20240924035112/https://www.grimware.org/doku.php/documentations/devices/crtc).
-// What the firmware writes there first, as it starts, is its own table for a
-// 50Hz screen at &5C5 (Compendium ch. 4.1), all sixteen registers of it.
+// What the firmware writes to the 6845 first, as it starts, is its own table
+// for a 50Hz screen at &05C5 (Compendium ch. 4.1), all sixteen registers of it,
+// "starting with register 15, then down to 0", each with the OUT (C),A at
+// &05BC: "write data to selected CRTC register" (Machine.asm, &05B4 to &05C0,
+// in Bread80's unassembly of the 6128's firmware,
+// https://github.com/Bread80/CPC6128-Firmware-Source). The 464's and the
+// 664's firmware load the same table the same way, from an OUT (C),A of their
+// own.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn the_firmware_writes_the_6845_its_own_table() {
     let roms = firmware();
-    let table =
-        fs::read(roms.join("cpc6128.rom")).expect("the firmware")[0x05C5..0x05C5 + 16].to_vec();
+    let table: Vec<u64> = fs::read(roms.join("cpc6128.rom")).expect("the firmware")
+        [0x05C5..0x05C5 + 16]
+        .iter()
+        .map(|&value| u64::from(value))
+        .collect();
     let mut session = Session::reading(&roms);
-    let handle = session.open("cpc6128");
-    let crtc = json!([
-        { "out": "&BC00", "mask": "&4300" },
-        { "out": "&BD00", "mask": "&4300" },
-    ]);
-    let mut written = [None; 16];
-    let mut selected = 0;
-    loop {
-        let ran = session.run(&handle, json!({ "frames": 100, "gather": crtc }));
-        for (_, port, value, _) in seen(&ran["gathered"]) {
-            let value = value.expect("a byte");
-            if port & 0x0100 == 0 {
-                selected = usize::from(value as u8 & 0x1F);
-            } else if selected < 16 {
-                written[selected].get_or_insert(value);
-            }
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let handle = session.open(machine);
+        let ran = session.run(
+            &handle,
+            json!({ "ticks": CPC_FRAME_TICKS, "gather": [{ "crtc": 0, "to": 31 }] }),
+        );
+        let written = crtc_writes(&ran["gathered"]);
+        assert!(written.len() >= 16, "{machine}: {ran}");
+        let pc = written[0].2;
+        let loaded: Vec<(u64, u64, u64)> = (0..16)
+            .rev()
+            .map(|register| (register, table[register as usize], pc))
+            .collect();
+        assert_eq!(written[..16], loaded, "{machine}");
+        if machine == "cpc6128" {
+            assert_eq!(pc, 0x05BC);
         }
-        if ran["stopped"] != "full" {
-            break;
-        }
+        assert_eq!(session.peek(&handle, json!(pc), 2), "ED79", "{machine}");
     }
-    let written: Vec<Option<u64>> = written[..16].to_vec();
-    let expected: Vec<Option<u64>> = table.iter().map(|&value| Some(u64::from(value))).collect();
-    assert_eq!(written, expected);
 }
 
 // PIXEL-ADD, at &22AA in the 48K ROM, "is entered with the co-ordinates of a
@@ -7953,6 +8362,51 @@ fn a_cpc_writes_its_psg_where_its_firmware_writes() {
             0x0F,
             "{machine}"
         );
+    }
+}
+
+// MC SCREEN OFFSET, at &BD1F, takes "the new screen base" in A and "the new
+// screen offset" in HL (SOFT 968, The Amstrad 6128 Firmware Manual,
+// https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual, entry
+// 181). At &07C0 the 6128's firmware makes R12 of the base's top two bits,
+// RRCA twice and AND &30, and H's bits 2 and 1, RRA and AND &03, and writes it
+// at &07D1; and R13 of H's bit 0 above L's top seven, RRA from H into RRA of
+// L, and writes it at &07DC (Machine.asm, in Bread80's unassembly of it,
+// https://github.com/Bread80/CPC6128-Firmware-Source).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn mc_screen_offset_writes_the_6845s_start_address() {
+    let mut session = Session::reading(&firmware());
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        for (base, offset, written) in [(0xC0, 0x07FE, [0x33, 0xFF]), (0x40, 0x0050, [0x10, 0x28])]
+        {
+            let called = session.answer(
+                "call",
+                json!({
+                    "handle": handle,
+                    "address": "&BD1F",
+                    "values": { "cpu.a": base, "cpu.h": offset >> 8, "cpu.l": offset & 0xFF },
+                    "gather": [{ "crtc": 0, "to": 31 }],
+                }),
+            );
+            assert_eq!(called["stopped"], "returned", "{machine}: {called}");
+            let registers: Vec<(u64, u64)> = crtc_writes(&called["gathered"])
+                .iter()
+                .map(|(register, value, _)| (*register, *value))
+                .collect();
+            assert_eq!(registers, [(12, written[0]), (13, written[1])], "{machine}");
+            if machine == "cpc6128" {
+                let pcs: Vec<u64> = crtc_writes(&called["gathered"])
+                    .iter()
+                    .map(|(_, _, pc)| *pc)
+                    .collect();
+                assert_eq!(pcs, [0x07D1, 0x07DC]);
+            }
+            assert_eq!(session.inspect(&handle, "crtc.registers[12]"), written[0]);
+            assert_eq!(session.inspect(&handle, "crtc.registers[13]"), written[1]);
+        }
     }
 }
 

@@ -26,11 +26,11 @@ use crate::emulator::{
 
 pub use crate::emulator::{
     mcp_capture_t as Capture, mcp_condition_t as Condition, mcp_kind_t as Kind,
-    mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT,
-    mcp_kind_t_MCP_PSG as PSG, mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE,
-    mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT, mcp_list_t_MCP_GATHER as GATHER,
-    mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match, mcp_memory_t as Memory,
-    mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY, mcp_memory_t_MCP_RAM as RAM,
+    mcp_kind_t_MCP_CRTC as CRTC, mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN,
+    mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_PSG as PSG, mcp_kind_t_MCP_READ as READ,
+    mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT,
+    mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
+    mcp_memory_t as Memory, mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY, mcp_memory_t_MCP_RAM as RAM,
     mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place, mcp_run_t as Run, mcp_span_t as Span,
 };
 
@@ -41,7 +41,7 @@ pub use crate::emulator::{
 
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
 // are laid out.
-pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT, PSG];
+pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT, PSG, CRTC];
 
 // Each kind's counts stand at its own value in mcp_kind_t.
 const _: () = {
@@ -1228,6 +1228,9 @@ mod tests {
             first: 0x8000,
             last: 0x8000,
             mask: 0,
+            first_value: 0,
+            last_value: 0xFF,
+            changes: false,
             memory: ANY_MEMORY,
             list: UNTIL,
             captures: false,
@@ -1305,6 +1308,9 @@ mod tests {
                 first,
                 last: first,
                 mask,
+                first_value: 0,
+                last_value: 0xFF,
+                changes: false,
                 memory: ANY_MEMORY,
                 list: GATHER,
                 captures: false,
@@ -1346,6 +1352,9 @@ mod tests {
             first: 0x7FFE,
             last: 0x9000,
             mask: 0,
+            first_value: 0,
+            last_value: 0xFF,
+            changes: false,
             memory: ANY_MEMORY,
             list: GATHER,
             captures: false,
@@ -1387,6 +1396,9 @@ mod tests {
             first: 0,
             last: 0xFFFF,
             mask: 0,
+            first_value: 0,
+            last_value: 0xFF,
+            changes: false,
             memory: ANY_MEMORY,
             list: COUNT,
             captures: false,
@@ -1407,8 +1419,9 @@ mod tests {
     // AddressSanitizer and UBSan's bounds checks; elsewhere it shows only that
     // nothing crashes outright. 4 is the step at which z80.c begins a memory
     // read, which z80_reading_operand answers from the cycle's place in the
-    // micro-program.
-    const EXTREMES: [u64; 18] = [
+    // micro-program, and 18 the first number of the 6845's address register
+    // that names none of its registers.
+    const EXTREMES: [u64; 19] = [
         0,
         1,
         4,
@@ -1418,6 +1431,7 @@ mod tests {
         15,
         16,
         17,
+        18,
         28,
         29,
         30,
@@ -1763,25 +1777,34 @@ mod tests {
     // by pc. The room is on the heap, where AddressSanitizer sees past its
     // end. A count past a kind's locations would land in the next kind's
     // counts, where it sees nothing amiss, so each kind is given room for
-    // twice the machine's locations, and the second half is to stay zero.
+    // twice the machine's locations, and the second half is to stay zero. A
+    // count of the writes that change what they reach has the run read, before
+    // and after each tick, what a write can change, so that AddressSanitizer
+    // sees those reads too.
     fn watching_everything(
         last: bool,
         locations: u32,
         run: impl FnOnce(Option<&mut Watch>) -> Run,
     ) -> bool {
+        let every = |kind, list| Condition {
+            kind,
+            first: 0,
+            last: 0xFFFF,
+            mask: 0,
+            first_value: 0,
+            last_value: 0xFF,
+            changes: false,
+            memory: ANY_MEMORY,
+            list,
+            captures: list == GATHER,
+        };
         let conditions: Vec<Condition> = [GATHER, COUNT]
             .into_iter()
-            .flat_map(|list| {
-                KINDS.map(|kind| Condition {
-                    kind,
-                    first: 0,
-                    last: 0xFFFF,
-                    mask: 0,
-                    memory: ANY_MEMORY,
-                    list,
-                    captures: list == GATHER,
-                })
-            })
+            .flat_map(|list| KINDS.map(|kind| every(kind, list)))
+            .chain([Condition {
+                changes: true,
+                ..every(WRITE, COUNT)
+            }])
             .collect();
         // SAFETY: all-zero bytes are a value of every field of a match.
         let mut matches = vec![unsafe { std::mem::zeroed::<Match>() }; 4];
@@ -2104,6 +2127,9 @@ mod tests {
             first: 0,
             last: 0xFFFF,
             mask: 0,
+            first_value: 0,
+            last_value: 0xFF,
+            changes: false,
             memory: ANY_MEMORY,
             list: COUNT,
             captures: false,

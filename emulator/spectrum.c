@@ -31,13 +31,19 @@ static bool tick(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
   }
   bool retraced_before = spectrum->monitor.frame_retraced;
   uint64_t before = spectrum->pins;
+  /* The byte a write in the tick replaces, at the address z80.c's
+     MEM_WRITE_T1 puts on the bus a tick before MEM_WRITE_T2 writes there; a
+     write to the ROM leaves it as it was. */
+  bool comparing = watch != NULL && watch->compares;
+  uint8_t was = comparing ? spectrum_peek(spectrum, z80_address(before)) : 0;
   uint64_t pins = spectrum_tick(spectrum);
   run->ticks++;
   if (spectrum->monitor.frame_retraced && !retraced_before) {
     run->frames++;
   }
   if (watch != NULL) {
-    mcp_watch_after(watch, &spectrum->cpu, &spectrum->monitor, before, pins, run->ticks);
+    mcp_watch_after(watch, &spectrum->cpu, &spectrum->monitor, before, pins, run->ticks,
+                    comparing && spectrum_peek(spectrum, z80_address(before)) != was);
   }
   return true;
 }
@@ -63,6 +69,7 @@ mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit
     watch->locate = locate;
     watch->peek = peek;
     watch->machine = spectrum;
+    watch->compares = mcp_watch_compares(watch);
   }
   bool halting_stops = !mcp_z80_halted_for_good(&spectrum->cpu);
   while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&

@@ -26,8 +26,9 @@ use crate::emulator::z80_t;
 use crate::fields::{self, Fields, Segment, hexadecimal_number};
 use crate::keys::Key;
 use crate::machine::{
-    ANY_MEMORY, CAPTURED_BYTES, COUNT, Capture, Condition, EXECUTE, FIRST_ROM_LOCATION, GATHER, IN,
-    Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, Span, UNTIL, WRITE,
+    ANY_MEMORY, CAPTURED_BYTES, COUNT, CRTC, Capture, Condition, EXECUTE, FIRST_ROM_LOCATION,
+    GATHER, IN, Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, Span,
+    UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
@@ -413,15 +414,52 @@ fn ram_address(value: &Value) -> Result<u32, String> {
         .ok_or_else(|| format!("{value} is no address in the RAM; {RAM_ADDRESS_FORMS}"))
 }
 
+const BYTE_FORMS: &str = "a byte is a number from 0 to 255, or hexadecimal from &00 to &FF, \
+                          written with &, #, $ or 0x before it";
+
+fn byte_value() -> Value {
+    json!({
+        "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 255 },
+            { "type": "string", "pattern": "^(&|#|\\$|0x|0X)[0-9A-Fa-f]{1,2}$" },
+        ]
+    })
+}
+
+// A byte, kept once in a tool's $defs and named from wherever it is taken.
+struct ByteForms;
+
+impl JsonSchema for ByteForms {
+    fn schema_name() -> Cow<'static, str> {
+        "Byte".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        Schema::try_from(byte_value()).expect("an object is a schema")
+    }
+}
+
+fn byte(value: &Value) -> Result<u8, String> {
+    if let Some(number) = value.as_u64() {
+        return u8::try_from(number).map_err(|_| format!("{value} is past &FF; {BYTE_FORMS}"));
+    }
+    hexadecimal_number(value, 2)
+        .and_then(|number| u8::try_from(number).ok())
+        .ok_or_else(|| format!("{value} is no byte; {BYTE_FORMS}"))
+}
+
 const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
                                {\"write\": address}, each with \"to\" and the last address if it \
                                is a range, and an execute or a read with \"memory\": \"ram\" or \
                                \"rom\" if only the RAM's bytes or only a ROM's are to match; \
                                {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
                                the mask being the bits of the port's address that its device \
-                               decodes; or on a CPC {\"psg\": register}, with \"to\" and the last \
-                               register if it is a range; and any of them in until or gather may \
-                               take \"capture\" too";
+                               decodes; or on a CPC {\"psg\": register} or {\"crtc\": register}, \
+                               with \"to\" and the last register if it is a range; any but an \
+                               execute or an in may take \"value\", a byte, with \"value_to\" and \
+                               the last byte if it is a range, and a write, a psg or a crtc \
+                               \"changes\": true; and any of them in until or gather may take \
+                               \"capture\" too";
 
 const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, one of the two \
                              or both: each path names one of the processor's values as inspect \
@@ -429,17 +467,38 @@ const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, 
                              each span is {\"address\": address, \"length\": bytes}, from 1 to 64 \
                              bytes, 1 if length is not given, none of them past &FFFF";
 
-const REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
+const PSG_REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
+
+const CRTC_REGISTER_FORMS: &str = "a register of the 6845 is a number from 0 to 31, as its \
+                                   address register of five bits names them, of which 0 to 17 \
+                                   are the chip's";
 
 // "The PSG has 16 internal registers" ("AY-3-8912 PSG", Kevin Thacker's
 // cpctech,
 // https://web.archive.org/web/20220626135348/https://cpctech.cpcwiki.de/docs/psg.html).
-fn register(value: &Value) -> Result<u16, String> {
+const MOST_PSG_REGISTER: u16 = 15;
+
+// The 6845's address register "is a 5-bit register used to select 18
+// internal control registers (R0--R17) [...] Programming the data from 18 to
+// 31 produces no results" (Hitachi's HD6845S datasheet, as cpctech transcribes
+// it,
+// https://web.archive.org/web/20220626023757id_/https://cpctech.cpcwiki.de/docs/hd6845s/hd6845sp.htm).
+const MOST_CRTC_REGISTER: u16 = 31;
+
+fn register(value: &Value, most: u16, forms: &str) -> Result<u16, String> {
     value
         .as_u64()
-        .filter(|number| *number <= 15)
         .and_then(|number| u16::try_from(number).ok())
-        .ok_or_else(|| format!("{value} is no register; {REGISTER_FORMS}"))
+        .filter(|number| *number <= most)
+        .ok_or_else(|| format!("{value} is no register; {forms}"))
+}
+
+fn psg_register(value: &Value) -> Result<u16, String> {
+    register(value, MOST_PSG_REGISTER, PSG_REGISTER_FORMS)
+}
+
+fn crtc_register(value: &Value) -> Result<u16, String> {
+    register(value, MOST_CRTC_REGISTER, CRTC_REGISTER_FORMS)
 }
 
 // What a condition's matches capture: the processor's values, each by its
@@ -558,7 +617,8 @@ impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let address = generator.subschema_for::<AddressForms>().to_value();
-        let register = json!({ "type": "integer", "minimum": 0, "maximum": 15 });
+        let byte = generator.subschema_for::<ByteForms>().to_value();
+        let register = |most: u16| json!({ "type": "integer", "minimum": 0, "maximum": most });
         let span = json!({
             "type": "object",
             "properties": {
@@ -591,19 +651,38 @@ impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
             }
             branch
         };
-        let with_memory = |kind: &str| {
-            let mut branch = condition(kind, "to", &address, &[kind]);
+        let with_memory = |mut branch: Value| {
             let names: Vec<&str> = MEMORY_NAMES.iter().map(|(name, _)| *name).collect();
             branch["properties"]["memory"] = json!({ "enum": names });
             branch
         };
+        let with_value = |mut branch: Value| {
+            branch["properties"]["value"] = byte.clone();
+            branch["properties"]["value_to"] = byte.clone();
+            branch
+        };
+        let with_changes = |mut branch: Value| {
+            branch["properties"]["changes"] = json!({ "type": "boolean" });
+            branch
+        };
         let branches = [
-            with_memory("execute"),
-            with_memory("read"),
-            condition("write", "to", &address, &["write"]),
+            with_memory(condition("execute", "to", &address, &["execute"])),
+            with_value(with_memory(condition("read", "to", &address, &["read"]))),
+            with_changes(with_value(condition("write", "to", &address, &["write"]))),
             condition("in", "mask", &address, &["in", "mask"]),
-            condition("out", "mask", &address, &["out", "mask"]),
-            condition("psg", "to", &register, &["psg"]),
+            with_value(condition("out", "mask", &address, &["out", "mask"])),
+            with_changes(with_value(condition(
+                "psg",
+                "to",
+                &register(MOST_PSG_REGISTER),
+                &["psg"],
+            ))),
+            with_changes(with_value(condition(
+                "crtc",
+                "to",
+                &register(MOST_CRTC_REGISTER),
+                &["crtc"],
+            ))),
         ];
         Schema::try_from(json!({ "oneOf": branches })).expect("an object is a schema")
     }
@@ -627,14 +706,38 @@ fn count_conditions_schema(generator: &mut SchemaGenerator) -> Schema {
 
 const MEMORY_NAMES: [(&str, Memory); 2] = [("ram", RAM), ("rom", ROM)];
 
-const KIND_NAMES: [(&str, Kind); 6] = [
+const KIND_NAMES: [(&str, Kind); 7] = [
     ("execute", EXECUTE),
     ("read", READ),
     ("write", WRITE),
     ("in", IN),
     ("out", OUT),
     ("psg", PSG),
+    ("crtc", CRTC),
 ];
+
+// The kinds whose matches carry a byte a value tests: all but an instruction,
+// which carries none, and a port read, which a CPC's Gate Array holds over
+// several ticks, the processor taking the byte the last of them leaves on the
+// bus (colophon-emulator's cpc_tick and z80.c's IO_READ_T4, at 7a23101), where
+// a condition is decided at the first; a Spectrum's is refused alike, so that
+// a condition means the same on either machine.
+fn takes_value(kind: Kind) -> bool {
+    kind != EXECUTE && kind != IN
+}
+
+// The kinds that write a byte that is then held, which changes compares.
+fn takes_changes(kind: Kind) -> bool {
+    kind == WRITE || kind == PSG || kind == CRTC
+}
+
+fn written_as(kind: Kind, number: u16) -> Value {
+    if kind == PSG || kind == CRTC {
+        json!(number)
+    } else {
+        json!(Hexadecimal::address(number))
+    }
+}
 
 fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>), String> {
     let fields = value
@@ -654,16 +757,59 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
             ),
         });
     };
-    let parse: fn(&Value) -> Result<u16, String> = if kind == PSG { register } else { address };
+    let parse: fn(&Value) -> Result<u16, String> = match kind {
+        PSG => psg_register,
+        CRTC => crtc_register,
+        _ => address,
+    };
     let first = parse(&fields[name]).map_err(|problem| format!("{name} {problem}"))?;
     let port = kind == IN || kind == OUT;
     let other = if port { "mask" } else { "to" };
     let takes_memory = kind == EXECUTE || kind == READ;
     if let Some(unknown) = fields.keys().find(|key| {
-        *key != name && *key != other && *key != "capture" && !(takes_memory && *key == "memory")
+        *key != name
+            && *key != other
+            && *key != "capture"
+            && !(takes_memory && *key == "memory")
+            && !(takes_value(kind) && (*key == "value" || *key == "value_to"))
+            && !(takes_changes(kind) && *key == "changes")
     }) {
         return Err(format!("{value} has {unknown}, which {name} does not take"));
     }
+    let first_value = fields
+        .get("value")
+        .map(|given| byte(given).map_err(|problem| format!("value {problem}")))
+        .transpose()?;
+    let last_value = fields
+        .get("value_to")
+        .map(|given| byte(given).map_err(|problem| format!("value_to {problem}")))
+        .transpose()?;
+    let (first_value, last_value) = match (first_value, last_value) {
+        (None, None) => (0, 0xFF),
+        (None, Some(_)) => {
+            return Err(format!(
+                "{value} has value_to and no value, and a range of bytes runs from value to \
+                 value_to"
+            ));
+        }
+        (Some(first), last) => (first, last.unwrap_or(first)),
+    };
+    if last_value < first_value {
+        return Err(format!(
+            "{value} runs back from value {} to {}, and a range runs upward",
+            Hexadecimal::byte(first_value),
+            Hexadecimal::byte(last_value)
+        ));
+    }
+    let changes = fields
+        .get("changes")
+        .map(|given| {
+            given
+                .as_bool()
+                .ok_or_else(|| format!("changes {given} is neither true nor false"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     let capture = fields
         .get("capture")
         .map(|given| {
@@ -701,12 +847,9 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
             .transpose()?
             .unwrap_or(first);
         if last < first {
-            let shown = |at: u16| {
-                if kind == PSG {
-                    at.to_string()
-                } else {
-                    Hexadecimal::address(at).to_string()
-                }
+            let shown = |at: u16| match written_as(kind, at) {
+                Value::String(text) => text,
+                number => number.to_string(),
             };
             return Err(format!(
                 "{value} runs back from {} to {}, and a range runs upward",
@@ -721,6 +864,9 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         first,
         last,
         mask,
+        first_value,
+        last_value,
+        changes,
         memory,
         list,
         captures: capture.is_some(),
@@ -940,28 +1086,43 @@ fn journaled<T: Serialize>(request: &T) -> Value {
 }
 
 // Each list of conditions a request gave, as the journal keeps it, whatever
-// form it was given in: its addresses after &, its registers by their
-// numbers, a range of one address or register as that one, and a capture's
-// spans each with its length.
+// form it was given in: its addresses and its bytes after &, its registers by
+// their numbers, a range of one address, register or byte as that one, the
+// bytes from 0 to &FF as none, changes where it is true, and a capture's spans
+// each with its length.
 fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
     let written = |(condition, capture): (&Condition, &Option<Capturing>)| {
         let (name, _) = KIND_NAMES
             .iter()
             .find(|(_, kind)| *kind == condition.kind)
             .expect("every kind is named");
-        let written_as = |number: u16| {
-            if condition.kind == PSG {
-                json!(number)
-            } else {
-                json!(Hexadecimal::address(number))
-            }
-        };
         let mut fields = Map::new();
-        fields.insert((*name).to_owned(), written_as(condition.first));
+        fields.insert(
+            (*name).to_owned(),
+            written_as(condition.kind, condition.first),
+        );
         if condition.kind == IN || condition.kind == OUT {
-            fields.insert("mask".to_owned(), written_as(condition.mask));
+            fields.insert(
+                "mask".to_owned(),
+                written_as(condition.kind, condition.mask),
+            );
         } else if condition.last != condition.first {
-            fields.insert("to".to_owned(), written_as(condition.last));
+            fields.insert("to".to_owned(), written_as(condition.kind, condition.last));
+        }
+        if (condition.first_value, condition.last_value) != (0, 0xFF) {
+            fields.insert(
+                "value".to_owned(),
+                json!(Hexadecimal::byte(condition.first_value)),
+            );
+            if condition.last_value != condition.first_value {
+                fields.insert(
+                    "value_to".to_owned(),
+                    json!(Hexadecimal::byte(condition.last_value)),
+                );
+            }
+        }
+        if condition.changes {
+            fields.insert("changes".to_owned(), json!(true));
         }
         if let Some((name, _)) = MEMORY_NAMES
             .iter()
@@ -1122,7 +1283,7 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
-    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. Any of these, and of gather's, may take "capture": {"values": paths, "memory": spans}, one of the two or both, and each of its matches then carries in captured what the machine held: each of the processor's values a path names, as inspect reads it, under cpu, a register by itself as the emulator's z80_t holds it, as "cpu.a", "cpu.h" or "cpu.ixh"; and each span, {"address": address, "length": bytes}, from 1 to 64 bytes, 1 if length is not given and none past &FFFF, as peek reads it. An instruction about to begin captures the machine it finds. An access captures the machine as the instruction that made it, or the response to an interrupt that made it, leaves it at its end, every access of one instruction alike: before the response to an interrupt taken there, which until's stop runs through, though the processor has taken the interrupt already, clearing IFF1, and for INT IFF2 as well, and the emulator's machinery for the processor, such as cpu.q, cpu.accepting and cpu.step, stands as the response begins, or for an NMI set has written in, two of the processor's ticks into it. A match of several conditions captures what each names. A request's captures name at most 16 values and spans together and read at most 64 bytes, each counted once. At most 16.
+    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. {"crtc": register} stops at the end of an instruction that writes one of the 6845's registers, numbered as its address register names them, 0 to 31, of which 0 to 17 are the chip's, R16 and R17 keeping nothing written, and takes "to" and a last register for a range. The 6845 takes its direction from the port's address and not from the processor, so each access to a port whose address has A14 and A9 low and A8 high, &BDxx, writes the selected register, an IN among them, which the emulator gives the top half of its port's address, A for an IN A,(n); and each access to &BCxx, an IN among them, selects a register, which in and out on {"in": "&BC00", "mask": "&4300"} and {"out": "&BC00", "mask": "&4300"} match. Any but execute and in may take "value", a byte, and "value_to" and a last byte for a range, to match only an access whose byte is there, the byte read, written, or given to the register: {"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"} is the Gate Array told its mode, its ROMs and its interrupt counter. A port read's byte is not tested, on either machine, since a CPC holds the read over several ticks and the processor takes the byte the last of them leaves. write, psg and crtc may take "changes": true, to match only a write that leaves the byte or the register holding other than it held, as it holds it, so that a register keeps and compares only the bits it has; with value, {"write": "&C7EC", "value": 6, "changes": true} matches the write that makes the byte there 6, while a register's value is the byte given it, of which it may keep only some bits. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. Any of these, and of gather's, may take "capture": {"values": paths, "memory": spans}, one of the two or both, and each of its matches then carries in captured what the machine held: each of the processor's values a path names, as inspect reads it, under cpu, a register by itself as the emulator's z80_t holds it, as "cpu.a", "cpu.h" or "cpu.ixh"; and each span, {"address": address, "length": bytes}, from 1 to 64 bytes, 1 if length is not given and none past &FFFF, as peek reads it. An instruction about to begin captures the machine it finds. An access captures the machine as the instruction that made it, or the response to an interrupt that made it, leaves it at its end, every access of one instruction alike: before the response to an interrupt taken there, which until's stop runs through, though the processor has taken the interrupt already, clearing IFF1, and for INT IFF2 as well, and the emulator's machinery for the processor, such as cpu.q, cpu.accepting and cpu.step, stands as the response begins, or for an NMI set has written in, two of the processor's ticks into it. A match of several conditions captures what each names. A request's captures name at most 16 values and spans together and read at most 64 bytes, each counted once. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -1138,13 +1299,13 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, save that they take no capture, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
+    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG or the 6845 written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, save that they take no capture, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
     #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
-    /// What count counts an access by: "address", the byte's address, the port's or the PSG register's number, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
+    /// What count counts an access by: "address", the byte's address, the port's, or the number of the PSG's or the 6845's register, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
@@ -1226,7 +1387,7 @@ struct TypeRequest {
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum CountBy {
-    /// The byte's address, the port's, or the PSG register's number.
+    /// The byte's address, the port's, or the PSG's or the 6845's register's number.
     Address,
     /// Where the instruction that made the access begins.
     Pc,
@@ -1597,6 +1758,10 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
+    /// One of a CPC's 6845 registers written, by the number its address register holds, from 0 to 31, of which 0 to 17 are the chip's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    crtc: Option<u16>,
     /// On a CPC, the ROM that held the instruction or answered the read: "lower", or "upper" and its number, a number with no upper ROM fitted selecting ROM 0. Not given where the RAM held the byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
@@ -1605,7 +1770,7 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     ram: Option<Hexadecimal>,
-    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took; for a register of the PSG, the byte the PPI's port A gave it, of which a register narrower than eight bits keeps only its low bits, as psg.registers then reads.
+    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took; for a register of the PSG, the byte the PPI's port A gave it, of which a register narrower than eight bits keeps only its low bits, as psg.registers then reads; for a register of the 6845, the byte on the bus, or for an IN the top half of the port's address, of which crtc.registers keeps as many bits as the register has.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     value: Option<Hexadecimal>,
@@ -1759,6 +1924,7 @@ impl Matched {
             r#in: at(IN),
             out: at(OUT),
             psg: (seen.kind == PSG).then_some(seen.address),
+            crtc: (seen.kind == CRTC).then_some(seen.address),
             rom,
             ram,
             value: access.then_some(Hexadecimal::byte(seen.value)),
@@ -1801,6 +1967,10 @@ struct Counted {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
+    /// One of a CPC's 6845 registers written, by the number its address register holds, from 0 to 31; counted by pc, the register of the place's first match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    crtc: Option<u16>,
     /// On a CPC, the ROM that held the instruction or answered the read, as a match's rom names it, which counted by address is part of the place; not given where the RAM held the byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
@@ -1841,6 +2011,7 @@ impl Counted {
             r#in: first.r#in,
             out: first.out,
             psg: first.psg,
+            crtc: first.crtc,
             rom: first.rom,
             ram: first.ram,
             pc: first.pc,
@@ -1870,7 +2041,7 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes and the PSG's registers written, each by address or register, or by pc, and at one address the RAM's places first, by the RAM's own addresses, then the lower ROM's, then the upper ROMs' by their numbers. A byte of memory the processor reaches at two addresses is one place, told by the address of its first match.
+    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes, the PSG's registers written and the 6845's, each by address or register, or by pc, and at one address the RAM's places first, by the RAM's own addresses, then the lower ROM's, then the upper ROMs' by their numbers. A byte of memory the processor reaches at two addresses is one place, told by the address of its first match.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
@@ -2896,7 +3067,7 @@ impl Server {
         }))
     }
 
-    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address or a port is written in hexadecimal after &, a register of the PSG as a number, a range of one address or register as that one, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well, and a file a run or a call wrote named by what it holds. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, and write files that hold what these hold, each at a path that names nothing yet, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address, a port or a byte a condition tests is written in hexadecimal after &, a register of the PSG or the 6845 as a number, a range of one address, register or byte as that one, a test of every byte and changes that is false left out, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well, and a file a run or a call wrote named by what it holds. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, and write files that hold what these hold, each at a path that names nothing yet, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn journal(
         &self,
