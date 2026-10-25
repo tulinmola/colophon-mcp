@@ -120,8 +120,8 @@ pub fn cpc_key(machine: &str, given: &Value) -> Result<Key, String> {
     };
     found.map(|index| index as Key).ok_or_else(|| {
         format!(
-            "no key of a {machine} is {given}; a key is given by its name, or by its number from \
-             0 to 79 as the firmware numbers it, its line of the matrix times eight and its bit: {}",
+            "a {machine} has no key {given}; give a key's name, or its number from 0 to 79 as \
+             the firmware numbers it, its line of the matrix times 8 plus its bit: {}",
             listed(
                 CPC_KEYS
                     .iter()
@@ -143,7 +143,7 @@ pub fn spectrum_key(machine: &str, given: &Value) -> Result<Key, String> {
     });
     found.ok_or_else(|| {
         format!(
-            "no key of a {machine} is {given}; a key is given by its name: {}",
+            "a {machine} has no key {given}; give a key's name: {}",
             listed(
                 SPECTRUM_KEYS
                     .iter()
@@ -157,13 +157,13 @@ pub fn spectrum_key(machine: &str, given: &Value) -> Result<Key, String> {
 fn unkeyed(machine: &str, character: char) -> String {
     if character.is_ascii() {
         format!(
-            "no key of a {machine} types {character:?}, alone or with a shift; any key is held \
-             through run's keys"
+            "no key of a {machine} types {character:?}, with or without a shift; press the \
+             machine's keys directly with run's keys"
         )
     } else {
         format!(
-            "{character:?} is no ASCII character, and text is typed from ASCII; a key it has is \
-             held through run's keys"
+            "{character:?} is not ASCII, and type takes ASCII only; if the machine has a key for \
+             it, hold that key with run's keys"
         )
     }
 }
@@ -398,16 +398,13 @@ mod tests {
         assert_eq!(spectrum_key("spectrum48", &Value::from("SPACE")), Ok(56));
         let refused = cpc_key("cpc6128", &Value::from(80)).unwrap_err();
         assert!(
-            refused.starts_with(
-                "no key of a cpc6128 is 80; a key is given by its name, or by its number"
-            ),
+            refused.starts_with("a cpc6128 has no key 80; give a key's name, or its number"),
             "{refused}"
         );
         assert!(refused.contains("47 SPACE"), "{refused}");
         let refused = spectrum_key("spectrum48", &Value::from(56)).unwrap_err();
         assert!(
-            refused
-                .starts_with("no key of a spectrum48 is 56; a key is given by its name: CAPS, Z"),
+            refused.starts_with("a spectrum48 has no key 56; give a key's name: CAPS, Z"),
             "{refused}"
         );
     }
@@ -416,13 +413,13 @@ mod tests {
     fn a_character_no_key_types_is_refused() {
         assert_eq!(
             cpc_keystroke("cpc6128", '£').unwrap_err(),
-            "'£' is no ASCII character, and text is typed from ASCII; a key it has is held \
-             through run's keys"
+            "'£' is not ASCII, and type takes ASCII only; if the machine has a key for it, hold \
+             that key with run's keys"
         );
         assert_eq!(
             spectrum_keystroke("spectrum48", '\t').unwrap_err(),
-            "no key of a spectrum48 types '\\t', alone or with a shift; any key is held through \
-             run's keys"
+            "no key of a spectrum48 types '\\t', with or without a shift; press the machine's keys \
+             directly with run's keys"
         );
     }
 }

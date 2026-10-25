@@ -15,13 +15,14 @@
 
 /* What a run did. */
 typedef struct {
-  /* The ticks it took. */
+  /* The ticks the run took. */
   uint64_t ticks;
-  /* The frames the monitor retraced in them. */
+  /* The number of frames the monitor retraced during the run. */
   uint32_t frames;
-  /* Whether it ended between instructions and owing the machine nothing,
-     which on a board that stops the processor's clock is later than the
-     instruction's end. */
+  /* Whether the run ended between instructions with the processor's clock
+     running. On a Spectrum the ULA can hold the clock past an instruction's
+     end, and the run waits for the hold to end. False only when the run
+     ended inside a chain of prefixes. */
   bool settled;
 } mcp_run_t;
 

@@ -20,8 +20,8 @@ pub trait Fields {
     fn set(&mut self, path: &[Segment], value: &Value) -> Result<(), String>;
 }
 
-const PATH_FORM: &str = "a path names fields with dots and indexes arrays in decimal in brackets, \
-                         as cpu.pc or crtc.registers[12] do";
+const PATH_FORM: &str = "a path names fields with dots and array elements with decimal indexes in \
+                         brackets, such as cpu.pc or crtc.registers[12]";
 
 pub fn parse(path: &str) -> Result<Vec<Segment>, String> {
     let mut segments = Vec::new();
@@ -72,19 +72,19 @@ fn no_field(structure: &str, name: &str, fields: &[&str]) -> String {
 
 fn not_an_array(structure: &str, index: usize, fields: &[&str]) -> String {
     format!(
-        "{structure} is a structure, reached by the name of a field and not by [{index}]; its \
+        "{structure} is a structure, so use a field name, not [{index}]; its \
          fields are {}",
         fields.join(", ")
     )
 }
 
 fn pointer() -> String {
-    "a pointer, which is not followed; peek and poke reach memory as the processor does".to_owned()
+    "a pointer, which is not followed; use peek and poke for memory".to_owned()
 }
 
 fn inside_a_value(path: &[Segment]) -> String {
     format!(
-        "a single value is read and written whole, and has nothing in it named {}",
+        "a single value has nothing inside named {}; read or write it whole",
         describe(&path[0])
     )
 }
@@ -92,7 +92,8 @@ fn inside_a_value(path: &[Segment]) -> String {
 fn set_fields<T: Fields>(structure: &mut T, name: &str, value: &Value) -> Result<(), String> {
     let Value::Object(fields) = value else {
         return Err(format!(
-            "{name} is a structure, set from an object of some of its fields, not from {value}"
+            "{name} is a structure, so set it from an object of some of its fields, not from \
+             {value}"
         ));
     };
     for (field, value) in fields {
@@ -233,8 +234,8 @@ impl<T: Fields, const LENGTH: usize> Fields for [T; LENGTH] {
             None => {
                 let Some(values) = value.as_array().filter(|values| values.len() == LENGTH) else {
                     return Err(format!(
-                        "an array of {LENGTH} is set from an array of {LENGTH} values, not from \
-                         {value}"
+                        "an array of {LENGTH} must be set from an array of {LENGTH} values, not \
+                         from {value}"
                     ));
                 };
                 for (index, (element, value)) in self.iter_mut().zip(values).enumerate() {
@@ -263,7 +264,7 @@ fn past_the_end(index: usize, length: usize) -> String {
 
 fn not_a_structure(length: usize, name: &str) -> String {
     format!(
-        "an array of {length} is reached by an index, [0] to [{}], and not by the name {name}",
+        "an array of {length}, so use an index, [0] to [{}], not the name {name}",
         length - 1
     )
 }
@@ -457,7 +458,7 @@ mod tests {
         );
         assert!(
             refusal("crtc[0]").starts_with(
-                "crtc_t is a structure, reached by the name of a field and not by [0]; its fields \
+                "crtc_t is a structure, so use a field name, not [0]; its fields \
                  are registers, address_register,"
             ),
             "{}",
@@ -465,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             refusal("crtc.registers.r12"),
-            "an array of 18 is reached by an index, [0] to [17], and not by the name r12"
+            "an array of 18, so use an index, [0] to [17], not the name r12"
         );
         assert_eq!(
             refusal("crtc.registers[18]"),
@@ -473,11 +474,11 @@ mod tests {
         );
         assert_eq!(
             refusal("cpu.pc.low"),
-            "a single value is read and written whole, and has nothing in it named low"
+            "a single value has nothing inside named low; read or write it whole"
         );
         assert_eq!(
             refusal("ram"),
-            "a pointer, which is not followed; peek and poke reach memory as the processor does"
+            "a pointer, which is not followed; use peek and poke for memory"
         );
     }
 
@@ -519,11 +520,11 @@ mod tests {
         );
         assert_eq!(
             refusal("crtc.registers", Value::from(vec![1, 2])),
-            "an array of 18 is set from an array of 18 values, not from [1,2]"
+            "an array of 18 must be set from an array of 18 values, not from [1,2]"
         );
         assert_eq!(
             refusal("cpu", Value::from(5)),
-            "z80_t is a structure, set from an object of some of its fields, not from 5"
+            "z80_t is a structure, so set it from an object of some of its fields, not from 5"
         );
         assert_eq!(
             refusal("cpu", serde_json::json!({ "a": 1, "pc": "high" })),

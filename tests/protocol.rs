@@ -651,12 +651,26 @@ fn the_tools_are_the_same_whatever_has_been_done() {
     session.answer("machine_close", json!({ "handle": handle }));
     assert_eq!(tools(&mut session), first);
     assert_eq!(tools(&mut Session::start(&roms)), first);
-    // A description is read as one paragraph, whatever lines its header kept
-    // it on.
+    // A description breaks its lines only before a list's items, and after
+    // the last of them for a blank line, so that the lines of its doc comment
+    // never wrap a sentence. rmcp drops blank lines, so a tool's list comes
+    // last.
+    let listed = |line: &str| line.starts_with("- ");
     let mut texts = Vec::new();
     descriptions(&first, &mut texts);
     for text in texts {
-        assert!(!text.contains('\n'), "{text:?}");
+        let lines: Vec<&str> = text.split('\n').collect();
+        for (line, before) in lines.iter().skip(1).zip(&lines) {
+            let broken = if listed(line) {
+                !before.is_empty()
+            } else if line.is_empty() {
+                listed(before)
+            } else {
+                before.is_empty()
+            };
+            assert!(broken, "{text:?}");
+        }
+        assert!(lines.iter().all(|line| line.trim() == *line), "{text:?}");
     }
 }
 
@@ -752,7 +766,7 @@ fn an_unknown_machine_is_refused_with_the_names_there_are() {
     assert_eq!(
         refusal,
         format!(
-            "no machine is called zx81; the machines are {}",
+            "no machine is named zx81; the machines are {}",
             names.join(", ")
         )
     );
@@ -764,15 +778,14 @@ fn an_unknown_handle_is_refused_with_the_handles_there_are() {
     let mut session = Session::start(&roms);
     assert_eq!(
         session.refusal("machine_close", json!({ "handle": "cpc6128-9" })),
-        "no machine has the handle cpc6128-9; no machine is standing, and machine_open stands \
-         one up"
+        "no machine has the handle cpc6128-9; no machine is open, and machine_open opens one"
     );
     let first = session.open("cpc6128");
     let second = session.open("spectrum48");
     assert_eq!(
         session.refusal("machine_close", json!({ "handle": "cpc6128-9" })),
         format!(
-            "no machine has the handle cpc6128-9; the machines standing have the handles \
+            "no machine has the handle cpc6128-9; open handles: \
              {first}, {second}"
         )
     );
@@ -1014,7 +1027,7 @@ fn an_unknown_tool_is_a_protocol_error_and_unfit_arguments_a_tool_error() {
     assert_eq!(
         response["error"]["message"],
         format!(
-            "no tool is called machine_run; the tools are {}",
+            "no tool is named machine_run; the tools are {}",
             TOOLS.join(", ")
         ),
         "{response}"
@@ -1384,7 +1397,7 @@ fn what_a_run_or_a_step_may_ask_is_said_when_it_asks_otherwise() {
     let roms = Roms::all();
     let mut session = Session::start(&roms);
     let cpc = session.open("cpc6128");
-    let one_of_two = "a run takes frames or ticks, one of the two: {\"frames\": 50} runs to the 50th \
+    let one_of_two = "give frames or ticks, exactly one: {\"frames\": 50} runs to the 50th \
                       retrace, {\"ticks\": 3993600} runs that many ticks";
     assert_eq!(session.refusal("run", json!({ "handle": cpc })), one_of_two);
     assert_eq!(
@@ -1394,10 +1407,7 @@ fn what_a_run_or_a_step_may_ask_is_said_when_it_asks_otherwise() {
     for frames in [-1, 0, 1501] {
         assert_eq!(
             session.refusal("run", json!({ "handle": cpc, "frames": frames })),
-            format!(
-                "frames is {frames}, and a run takes from 1 to 1500 frames; run again to go \
-                 further"
-            )
+            format!("frames is {frames}; give 1 to 1500, and run again to go further")
         );
     }
     assert_eq!(
@@ -1405,8 +1415,8 @@ fn what_a_run_or_a_step_may_ask_is_said_when_it_asks_otherwise() {
             "run",
             json!({ "handle": cpc, "ticks": 1500 * CPC_FRAME_TICKS + 1 })
         ),
-        "ticks is 119808001, and a run on a cpc6128 takes from 1 to 119808000 ticks, the ticks \
-         of 1500 standard frames; run again to go further"
+        "ticks is 119808001; a cpc6128 runs from 1 to 119808000 ticks a request, the ticks \
+         of 1500 standard frames, so run again to go further"
     );
     for instructions in [-5, 0, 100_001] {
         assert_eq!(
@@ -1415,8 +1425,7 @@ fn what_a_run_or_a_step_may_ask_is_said_when_it_asks_otherwise() {
                 json!({ "handle": cpc, "instructions": instructions })
             ),
             format!(
-                "instructions is {instructions}, and a step takes from 1 to 100000 \
-                 instructions; step again to go further"
+                "instructions is {instructions}; give 1 to 100000, and step again to go further"
             )
         );
     }
@@ -1447,7 +1456,7 @@ fn every_tool_refuses_a_handle_never_given_with_the_handles_there_are() {
         assert_eq!(
             session.refusal(tool, arguments),
             format!(
-                "no machine has the handle cpc6128-9; the machines standing have the handles \
+                "no machine has the handle cpc6128-9; open handles: \
                  {cpc}"
             ),
             "{tool}"
@@ -1706,7 +1715,7 @@ fn set_refuses_what_the_emulator_could_not_run_from() {
             "set",
             json!({ "handle": handle, "values": { "cpu.pc": 5, "gate_array.pen": 17 } })
         ),
-        "gate_array.pen selects one of the seventeen inks, 0 to 16"
+        "gate_array.pen selects one of the 17 inks; write 0 to 16"
     );
     assert_eq!(session.inspect(&handle, "cpu.pc"), 0);
     session.set(&handle, json!({ "gate_array.pen": 16 }));
@@ -1775,7 +1784,8 @@ fn memory_ends_at_ffff_and_says_so() {
             "peek",
             json!({ "handle": handle, "address": "&FFF0", "length": 17 })
         ),
-        "17 bytes from &FFF0 run past &FFFF, where the processor's memory ends; 16 fit from there"
+        "17 bytes from &FFF0 run past &FFFF, the end of the processor's memory; give at most 16 \
+         from there"
     );
     for length in [-1, 0, 4097] {
         assert_eq!(
@@ -1783,7 +1793,7 @@ fn memory_ends_at_ffff_and_says_so() {
                 "peek",
                 json!({ "handle": handle, "address": 0, "length": length })
             ),
-            format!("{length} bytes is not from 1 to 4096")
+            format!("give 1 to 4096 bytes, not {length}")
         );
     }
     for address in [
@@ -1809,8 +1819,8 @@ fn memory_ends_at_ffff_and_says_so() {
                 json!({ "handle": handle, "address": 0, "bytes": bytes })
             ),
             format!(
-                "{bytes} is not bytes: bytes are written as pairs of hexadecimal digits, as \
-                 3E05C9 or 3E 05 C9"
+                "{bytes} is not bytes; write bytes as pairs of hexadecimal digits, such as 3E05C9 \
+                 or 3E 05 C9"
             )
         );
     }
@@ -1865,13 +1875,14 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
             &handle,
             json!({ "ram": "&1FFFF", "length": 2 })
         ),
-        "2 bytes from &1FFFF run past &1FFFF, where the machine's RAM ends; 1 fit from there"
+        "2 bytes from &1FFFF run past &1FFFF, the end of the RAM; give at most 1 \
+         from there"
     );
     assert_eq!(
         refused(&mut session, &handle, json!({ "ram": 0, "length": 4097 })),
-        "4097 bytes is not from 1 to 4096"
+        "give 1 to 4096 bytes, not 4097"
     );
-    let either = "peek reads from address or from ram, one of the two: {\"address\": \"&C000\"} \
+    let either = "give address or ram, exactly one: {\"address\": \"&C000\"} \
                   reads as the processor does, through the banking and the ROMs, and {\"ram\": \
                   \"&1C000\"} reads a CPC's RAM by its own addresses";
     assert_eq!(refused(&mut session, &handle, json!({})), either);
@@ -1888,13 +1899,13 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
     let cpc464 = session.open("cpc464");
     assert_eq!(
         refused(&mut session, &cpc464, json!({ "ram": "&10000" })),
-        "&10000 is past &FFFF, where the machine's RAM ends"
+        "&10000 is past &FFFF, the end of the RAM"
     );
     let spectrum = session.open("spectrum48");
     assert_eq!(
         refused(&mut session, &spectrum, json!({ "ram": "&4000" })),
-        "ram reads a CPC's RAM by its own addresses, past its banking and its ROMs; a Spectrum's \
-         RAM stands at &4000 to &FFFF, where address reads it"
+        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+         read it with address"
     );
 }
 
@@ -2198,9 +2209,9 @@ fn a_spectrum_opens_from_its_snapshot() {
 fn a_snapshot_the_machine_cannot_take_is_refused_with_what_it_can() {
     let roms = Roms::all();
     let mut session = Session::start(&roms);
-    let cpc_takes = "a CPC opens an SNA snapshot of version 1, 2 or 3 holding no more RAM than it \
-                     has, in the dump that follows its header: 128K on a cpc6128, 64K on a \
-                     cpc664 or a cpc464, which have no PAL and take only RAM configuration 0";
+    let cpc_takes = "a CPC opens an SNA snapshot of version 1, 2 or 3 whose memory dump, after its \
+                     header, holds no more RAM than the machine has: 128K on a cpc6128, 64K on \
+                     a cpc664 or a cpc464, which have no PAL and take only RAM configuration 0";
     let not_a_snapshot = roms.write("notes.sna", b"nothing to see");
     assert_eq!(
         session.refusal(
@@ -2888,22 +2899,27 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
         )
     };
     let forms = CONDITION_FORMS;
-    let capture_forms = "capture is {\"values\": paths, \"memory\": spans}, one of the two or \
-                         both: each path names one of the processor's values as inspect reads it, \
-                         under cpu, as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and each span is \
-                         {\"address\": address, \"length\": bytes}, from 1 to 64 bytes, 1 if \
-                         length is not given, none of them past &FFFF";
+    let capture_forms = "capture is {\"values\": paths, \"memory\": spans}, with at least one \
+                         of the two: a path names one of the processor's values under cpu, such \
+                         as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and a span is {\"address\": \
+                         address, \"length\": bytes}, 1 to 64 bytes, 1 if length is not given, \
+                         none past &FFFF";
     let said = |problem: &str| format!("until[0]: capture: {problem}; {capture_forms}; {forms}");
     for (capture, problem) in [
-        (json!({}), "{} names nothing to capture".to_owned()),
+        (
+            json!({}),
+            "{} captures nothing; give values or memory".to_owned(),
+        ),
         (
             json!({ "values": [], "memory": [] }),
-            "{\"values\":[],\"memory\":[]} names nothing to capture".to_owned(),
+            "{\"values\":[],\"memory\":[]} captures nothing; give values or memory".to_owned(),
         ),
         (json!(["cpu.a"]), "[\"cpu.a\"] is not an object".to_owned()),
         (
             json!({ "registers": ["hl"] }),
-            "{\"registers\":[\"hl\"]} has registers, which capture does not take".to_owned(),
+            "{\"registers\":[\"hl\"]} has registers; capture takes only values and \
+             memory"
+                .to_owned(),
         ),
         (
             json!({ "values": "cpu.a" }),
@@ -2915,7 +2931,7 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
         ),
         (
             json!({ "values": vec!["cpu.a"; 17] }),
-            "values names 17 things to capture, and takes at most 16".to_owned(),
+            "values names 17 things to capture; give at most 16".to_owned(),
         ),
         (
             json!({ "values": ["crtc.registers[12]"] }),
@@ -2923,26 +2939,29 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
         ),
         (
             json!({ "values": ["cpu"] }),
-            "cpu holds more than one value, and each is captured by a path of its own".to_owned(),
+            "cpu holds more than one value; capture each with a path of its own".to_owned(),
         ),
         (
             json!({ "values": ["cpu.program"] }),
-            "cpu.program holds more than one value, and each is captured by a path of its own"
-                .to_owned(),
+            "cpu.program holds more than one value; capture each with a path of its own".to_owned(),
         ),
         (
             json!({ "memory": [{ "address": "&FFFF", "length": 2 }] }),
-            "2 bytes from &FFFF run past &FFFF, where the processor's memory ends; 1 fit from \
-             there"
+            "2 bytes from &FFFF run past &FFFF, the end of the processor's memory; give at most \
+             1 from there"
                 .to_owned(),
         ),
         (
             json!({ "memory": [{ "address": 0, "length": 65 }] }),
-            "{\"address\":0,\"length\":65} has a length that is not from 1 to 64".to_owned(),
+            "{\"address\":0,\"length\":65} has a length that is not an integer from 1 to \
+             64"
+            .to_owned(),
         ),
         (
             json!({ "memory": [{ "address": 0, "length": 0 }] }),
-            "{\"address\":0,\"length\":0} has a length that is not from 1 to 64".to_owned(),
+            "{\"address\":0,\"length\":0} has a length that is not an integer from 1 to \
+             64"
+            .to_owned(),
         ),
         (
             json!({ "memory": [{ "length": 1 }] }),
@@ -2950,7 +2969,9 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
         ),
         (
             json!({ "memory": [{ "address": 0, "bytes": 1 }] }),
-            "{\"address\":0,\"bytes\":1} has bytes, which a span does not take".to_owned(),
+            "{\"address\":0,\"bytes\":1} has bytes; a span takes only address and \
+             length"
+                .to_owned(),
         ),
         (
             json!({ "memory": [{ "address": 70000 }] }),
@@ -2972,8 +2993,7 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
             json!({ "handle": handle, "frames": 1, "count": [{ "execute": 1, "capture": { "values": ["cpu.a"] } }] })
         ),
         format!(
-            "count[0]: count counts each place by its first match and captures nothing; capture \
-             in until or gather; {forms}"
+            "count[0]: count conditions take no capture; capture in until or gather; {forms}"
         )
     );
     let paths = [
@@ -2993,8 +3013,8 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
                 ],
             })
         ),
-        "the captures of until and gather name 17 values and spans, each counted once, and take \
-         at most 16 together"
+        "the captures of until and gather name 17 distinct values and spans; give at most 16 \
+         together"
     );
     let span = |address: u16, length: u16| json!({ "address": address, "length": length });
     assert_eq!(
@@ -3009,8 +3029,8 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
                 ],
             })
         ),
-        "the captures of until and gather read 65 bytes of memory, each span counted once, and \
-         take at most 64 together"
+        "the captures of until and gather read 65 bytes, each distinct span counted once; give at \
+         most 64 together"
     );
     let ran = session.run(
         &handle,
@@ -4170,9 +4190,9 @@ fn a_call_that_cannot_return_is_refused_and_changes_nothing() {
     );
     assert_eq!(
         refusal,
-        "cannot call &0100: the return address would be pushed under a ROM, which answers the \
-         processor's reads there, and the routine's return would not read it back; give cpu.sp \
-         in values, pointing into RAM that no ROM enabled covers"
+        "cannot call &0100: the return address would be pushed under an enabled ROM, where the \
+         routine's return could not read it back; give cpu.sp in values so that the 2 bytes below \
+         it are RAM that no enabled ROM covers"
     );
     assert_eq!(session.inspect(&handle, "cpu"), before);
     let roms = routine("spectrum48.rom", &[DI, LD_SP, 0x00, 0x40, HALT]);
@@ -4180,7 +4200,11 @@ fn a_call_that_cannot_return_is_refused_and_changes_nothing() {
     let handle = session.open("spectrum48");
     session.step(&handle, 2);
     let refusal = session.refusal("call", json!({ "handle": handle, "address": 256 }));
-    assert!(refusal.contains("pushed into the ROM"), "{refusal}");
+    assert_eq!(
+        refusal,
+        "cannot call &0100: the return address would be pushed into the ROM or past the RAM, where \
+         it is lost; give cpu.sp in values so that the 2 bytes below it are RAM"
+    );
     for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
         let roms = Roms::programmed(file, &[PREFIX_DD; 0x4000]);
         let mut session = Session::start(&roms);
@@ -4192,8 +4216,8 @@ fn a_call_that_cannot_return_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             refusal,
-            "cannot call &0100: the processor stands inside a chain of prefixes, and a routine \
-             is called only between instructions; step or run on to the end of the chain first",
+            "cannot call &0100: the processor is inside a chain of prefixes, and a routine can be \
+             called only between instructions; step or run to the end of the chain first",
             "{machine}"
         );
     }
@@ -4373,18 +4397,16 @@ fn an_argument_of_the_wrong_kind_is_named() {
 }
 
 // What a refused condition is told a condition is.
-const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
-                               {\"write\": address}, each with \"to\" and the last address if it \
-                               is a range, and an execute or a read with \"memory\": \"ram\" or \
-                               \"rom\" if only the RAM's bytes or only a ROM's are to match; \
-                               {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
-                               the mask being the bits of the port's address that its device \
-                               decodes; or on a CPC {\"psg\": register} or {\"crtc\": register}, \
-                               with \"to\" and the last register if it is a range; any but an \
-                               execute or an in may take \"value\", a byte, with \"value_to\" and \
-                               the last byte if it is a range, and a write, a psg or a crtc \
-                               \"changes\": true; and any of them in until or gather may take \
-                               \"capture\" too";
+const CONDITION_FORMS: &str = "a condition is one of {\"execute\": address}, {\"read\": address}, \
+                               {\"write\": address}, {\"in\": port, \"mask\": bits}, {\"out\": \
+                               port, \"mask\": bits}, or on a CPC {\"psg\": register} or \
+                               {\"crtc\": register}; port and mask are addresses, mask's set bits \
+                               being those the port's device decodes; all but in and out may add \
+                               \"to\", the last address or register of a range; execute and read \
+                               may add \"memory\": \"ram\" or \"rom\"; all but execute and in may \
+                               add \"value\", a byte, and with it \"value_to\", the last byte of a \
+                               range; write, psg and crtc may add \"changes\": true; in until and \
+                               gather, any may add \"capture\"";
 
 // Clients SHOULD follow $ref resolution "when validating tool inputs and
 // outputs against `inputSchema` and `outputSchema`" (2026-07-28, tools), so
@@ -4445,6 +4467,8 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "execute": 1, "capture": { "values": [7] } }),
         json!({ "execute": 1, "capture": { "memory": [{ "address": 0, "length": 65 }] } }),
         json!({ "execute": 1, "capture": { "memory": [{ "length": 1 }] } }),
+        json!({ "execute": 1, "capture": { "values": vec!["cpu.a"; 17] } }),
+        json!({ "execute": 1, "capture": { "memory": vec![json!({ "address": 0 }); 17] } }),
     ] {
         assert!(fitting(&condition).is_err(), "{condition}");
     }
@@ -4471,23 +4495,24 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
     assert_eq!(
         refused(&mut session, json!({ "read": 5, "out": 6 })),
         format!(
-            "until[1]: {{\"read\":5,\"out\":6}} names read and out, and a condition names one; {forms}"
+            "until[1]: {{\"read\":5,\"out\":6}} has more than one kind, read and out; give one; \
+             {forms}"
         )
     );
     assert_eq!(
         refused(&mut session, json!({ "to": 5 })),
-        format!("until[1]: {{\"to\":5}} names no kind; {forms}")
+        format!("until[1]: {{\"to\":5}} has no kind; {forms}")
     );
     assert_eq!(
         refused(&mut session, json!({ "write": 5, "memory": "ram" })),
         format!(
-            "until[1]: {{\"write\":5,\"memory\":\"ram\"}} has memory, which write does not \
-             take; {forms}"
+            "until[1]: {{\"write\":5,\"memory\":\"ram\"}} has memory, which write conditions do \
+             not take; {forms}"
         )
     );
     assert_eq!(
         refused(&mut session, json!({ "execute": 5, "memory": "flash" })),
-        format!("until[1]: memory \"flash\" is neither \"ram\" nor \"rom\"; {forms}")
+        format!("until[1]: memory is \"flash\"; give \"ram\" or \"rom\"; {forms}")
     );
     assert_eq!(
         refused(&mut session, json!({ "out": "&FE", "mask": 70000 })),
@@ -4501,45 +4526,57 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             "run",
             json!({ "handle": handle, "frames": 1, "until": { "execute": "&0038" } })
         ),
-        format!("until is a list of conditions, as [{{\"execute\": \"&0038\"}}]; {forms}")
+        format!(
+            "until must be a list of conditions, such as [{{\"execute\": \"&0038\"}}]; {forms}"
+        )
     );
     assert_eq!(
         refused(&mut session, json!({ "in": "&FE" })),
         format!("until[1]: {{\"in\":\"&FE\"}} has no mask; {forms}")
     );
     assert_eq!(
+        refused(
+            &mut session,
+            json!({ "in": "&FE", "mask": "&01", "to": "&FF" })
+        ),
+        format!(
+            "until[1]: {{\"in\":\"&FE\",\"mask\":\"&01\",\"to\":\"&FF\"}} has to, which in \
+             conditions do not take; {forms}"
+        )
+    );
+    assert_eq!(
         refused(&mut session, json!({ "write": 10, "to": 5 })),
         format!(
-            "until[1]: {{\"write\":10,\"to\":5}} runs back from &000A to &0005, and a range runs \
+            "until[1]: {{\"write\":10,\"to\":5}} runs from &000A down to &0005; a range must run \
              upward; {forms}"
         )
     );
     assert_eq!(
         refused(&mut session, json!({ "execute": 1, "mask": 2 })),
         format!(
-            "until[1]: {{\"execute\":1,\"mask\":2}} has mask, which execute does not take; \
-             {forms}"
+            "until[1]: {{\"execute\":1,\"mask\":2}} has mask, which execute conditions do not \
+             take; {forms}"
         )
     );
-    let registers = "a register of the PSG is a number from 0 to 15";
+    let registers = "a PSG register is a number from 0 to 15";
     assert_eq!(
         refused(&mut session, json!({ "psg": 16 })),
-        format!("until[1]: psg 16 is no register; {registers}; {forms}")
+        format!("until[1]: psg 16 is not a register; {registers}; {forms}")
     );
     assert_eq!(
         refused(&mut session, json!({ "psg": "&07" })),
-        format!("until[1]: psg \"&07\" is no register; {registers}; {forms}")
+        format!("until[1]: psg \"&07\" is not a register; {registers}; {forms}")
     );
     assert_eq!(
         refused(&mut session, json!({ "psg": 13, "to": 0 })),
         format!(
-            "until[1]: {{\"psg\":13,\"to\":0}} runs back from 13 to 0, and a range runs upward; \
+            "until[1]: {{\"psg\":13,\"to\":0}} runs from 13 down to 0; a range must run upward; \
              {forms}"
         )
     );
-    let no_psg = "a spectrum48 has no PSG, whose registers psg watches: its speaker is bit 4 of \
-                  its ULA's port, which {\"out\": \"&FE\", \"mask\": \"&01\"} watches, and a \
-                  cpc464, a cpc664 or a cpc6128 has a PSG";
+    let no_psg = "a spectrum48 has no PSG for psg to watch; its speaker is bit 4 of its ULA's \
+                  port, which {\"out\": \"&FE\", \"mask\": \"&01\"} watches; a cpc464, a cpc664 or \
+                  a cpc6128 has a PSG";
     assert_eq!(refused(&mut session, json!({ "psg": 0, "to": 13 })), no_psg);
     assert_eq!(
         session.refusal(
@@ -4548,15 +4585,14 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         ),
         no_psg
     );
-    let crtc_registers = "a register of the 6845 is a number from 0 to 31, as its address \
-                          register of five bits names them, of which 0 to 17 are the chip's";
+    let crtc_registers = "a 6845 register is a number from 0 to 31, of which the chip has 0 to 17";
     assert_eq!(
         refused(&mut session, json!({ "crtc": 32 })),
-        format!("until[1]: crtc 32 is no register; {crtc_registers}; {forms}")
+        format!("until[1]: crtc 32 is not a register; {crtc_registers}; {forms}")
     );
-    let no_6845 = "a spectrum48 has no 6845, whose registers crtc watches: its border's colour \
-                   is the lowest three bits of its ULA's port, which {\"out\": \"&FE\", \
-                   \"mask\": \"&01\"} watches, and a cpc464, a cpc664 or a cpc6128 has a 6845";
+    let no_6845 = "a spectrum48 has no 6845 for crtc to watch; its border's colour is the lowest 3 \
+                   bits of its ULA's port, which {\"out\": \"&FE\", \"mask\": \"&01\"} watches; a \
+                   cpc464, a cpc664 or a cpc6128 has a 6845";
     assert_eq!(
         refused(&mut session, json!({ "crtc": 12, "to": 13 })),
         no_6845
@@ -4566,33 +4602,38 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
     for (condition, problem) in [
         (
             json!({ "execute": 1, "value": 1 }),
-            "{\"execute\":1,\"value\":1} has value, which execute does not take".to_owned(),
+            "{\"execute\":1,\"value\":1} has value, which execute conditions do not \
+             take"
+                .to_owned(),
         ),
         (
             json!({ "in": "&FE", "mask": "&01", "value": 1 }),
-            "{\"in\":\"&FE\",\"mask\":\"&01\",\"value\":1} has value, which in does not take"
+            "{\"in\":\"&FE\",\"mask\":\"&01\",\"value\":1} has value, which in conditions do not \
+             take"
                 .to_owned(),
         ),
         (
             json!({ "read": 1, "changes": true }),
-            "{\"read\":1,\"changes\":true} has changes, which read does not take".to_owned(),
+            "{\"read\":1,\"changes\":true} has changes, which read conditions do not \
+             take"
+                .to_owned(),
         ),
         (
             json!({ "out": "&FE", "mask": "&01", "changes": true }),
-            "{\"out\":\"&FE\",\"mask\":\"&01\",\"changes\":true} has changes, which out does \
-             not take"
+            "{\"out\":\"&FE\",\"mask\":\"&01\",\"changes\":true} has changes, which out \
+             conditions do not take"
                 .to_owned(),
         ),
         (
             json!({ "write": 1, "value_to": 3 }),
-            "{\"write\":1,\"value_to\":3} has value_to and no value, and a range of bytes runs \
-             from value to value_to"
+            "{\"write\":1,\"value_to\":3} has value_to without value; give value too, or leave \
+             value_to out"
                 .to_owned(),
         ),
         (
             json!({ "write": 1, "value": 9, "value_to": 3 }),
-            "{\"write\":1,\"value\":9,\"value_to\":3} runs back from value &09 to &03, and a \
-             range runs upward"
+            "{\"write\":1,\"value\":9,\"value_to\":3} runs from value &09 down to &03; a \
+             range must run upward"
                 .to_owned(),
         ),
         (
@@ -4601,19 +4642,19 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
         ),
         (
             json!({ "write": 1, "value": "&100" }),
-            format!("value \"&100\" is no byte; {bytes}"),
+            format!("value \"&100\" is not a byte; {bytes}"),
         ),
         (
             json!({ "write": 1, "value": "&0FF" }),
-            format!("value \"&0FF\" is no byte; {bytes}"),
+            format!("value \"&0FF\" is not a byte; {bytes}"),
         ),
         (
             json!({ "write": 1, "value": 5, "value_to": -1 }),
-            format!("value_to -1 is no byte; {bytes}"),
+            format!("value_to -1 is not a byte; {bytes}"),
         ),
         (
             json!({ "psg": 1, "changes": 1 }),
-            "changes 1 is neither true nor false".to_owned(),
+            "changes is 1; give true or false".to_owned(),
         ),
     ] {
         assert_eq!(
@@ -4627,23 +4668,21 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             "run",
             json!({ "handle": handle, "ticks": 10, "gather": many })
         ),
-        "gather has 17 conditions, and takes at most 16"
+        "gather has 17 conditions; give at most 16"
     );
     assert_eq!(
         session.refusal(
             "run",
             json!({ "handle": handle, "ticks": 10, "gather_last": true })
         ),
-        "gather_last says which matches of gather are kept, and gather is not given; give \
-         gather the conditions to gather, or leave gather_last out"
+        "gather_last is given without gather; give gather, or leave gather_last out"
     );
     assert_eq!(
         session.refusal(
             "call",
             json!({ "handle": handle, "address": 0, "count_by": "pc" })
         ),
-        "count_by says what count counts an access by, and count is not given; give count the \
-         conditions to count, or leave count_by out"
+        "count_by is given without count; give count, or leave count_by out"
     );
     assert_eq!(
         session.refusal(
@@ -4651,7 +4690,7 @@ fn what_until_and_gather_take_is_said_when_they_are_given_otherwise() {
             json!({ "handle": handle, "address": 0, "count": [{ "write": 3, "to": 2 }] })
         ),
         format!(
-            "count[0]: {{\"write\":3,\"to\":2}} runs back from &0003 to &0002, and a range runs \
+            "count[0]: {{\"write\":3,\"to\":2}} runs from &0003 down to &0002; a range must run \
              upward; {forms}"
         )
     );
@@ -5312,60 +5351,58 @@ fn screen_says_what_would_have_worked() {
     };
     assert_eq!(
         refused(&mut session, json!({ "handle": spectrum })),
-        "screen reads a CPC's memory as its video hardware does, and a Spectrum's picture is read \
-         by monitor"
+        "screen draws a CPC's memory only; use monitor for a Spectrum's picture"
     );
     assert_eq!(
         refused(&mut session, json!({})),
-        "R1 is 0, which gives a width of 0, and a screen reads from 1 to 128; give width"
+        "R1 is 0, which gives a width of 0, outside 1 to 128; give width"
     );
     assert_eq!(
         refused(&mut session, json!({ "width": 80 })),
-        "R6 is 0, which with rasters of 1 gives a height of 0, and a screen reads from 1 to 512; \
+        "R6 is 0, which with rasters of 1 gives a height of 0, outside 1 to 512; \
          give height"
     );
     assert_eq!(
         refused(&mut session, json!({ "reading": "linear", "rasters": 8 })),
-        "rasters is read by the video reading alone: a flat buffer or one in columns has rows of \
-         one line; give it with the video reading, or leave it out"
+        "rasters applies to the video reading only, since linear and columns have rows of one \
+         line; give it with the video reading, or leave it out"
     );
     assert_eq!(
         refused(
             &mut session,
             json!({ "base": "&C800", "width": 2, "height": 2 })
         ),
-        "&C800 is no display start: the video reading reads the base 64K, and there A13 to A11 \
-         carry the raster line, so a base is &0000 to &07FF, &4000 to &47FF, &8000 to &87FF or \
-         &C000 to &C7FF; linear and columns read the rest"
+        "&C800 is not a display start; for the video reading a base is &0000 to &07FF, &4000 to \
+         &47FF, &8000 to &87FF or &C000 to &C7FF, since A13 to A11 carry the raster line; linear \
+         and columns read the rest of the RAM"
     );
     assert_eq!(
         refused(
             &mut session,
             json!({ "reading": "columns", "base": "&10000", "width": 2, "height": 2 })
         ),
-        "&10000 is past the RAM, which ends at &FFFF"
+        "&10000 is past &FFFF, the end of the RAM"
     );
     assert_eq!(
         refused(&mut session, json!({ "base": "&200000" })),
-        "\"&200000\" is no address in the RAM; an address in the RAM is a number from 0 to \
+        "\"&200000\" is not an address in the RAM; an address in the RAM is a number from 0 to \
          131071, or hexadecimal from &0000 to &1FFFF, written with &, #, $ or 0x before it"
     );
     assert_eq!(
         refused(&mut session, json!({ "width": 129 })),
-        "width is 129, and a screen reads from 1 to 128"
+        "width is 129; give 1 to 128"
     );
     assert_eq!(
         refused(&mut session, json!({ "height": 0 })),
-        "height is 0, and a screen reads from 1 to 512"
+        "height is 0; give 1 to 512"
     );
     assert_eq!(
         refused(&mut session, json!({ "mode": 4 })),
-        "mode is 4, and the Gate Array's modes are 0 to 3"
+        "mode is 4; give 0 to 3"
     );
     assert_eq!(
         refused(&mut session, json!({ "palette": [1, 2, 32] })),
-        "palette is [1, 2, 32], and a palette is sixteen hardware colour codes, one for each pen, \
-         each from 0 to 31"
+        "palette is [1, 2, 32]; give 16 hardware colour codes, one per pen, each 0 to 31"
     );
 }
 
@@ -5468,8 +5505,8 @@ fn disassemble_says_what_would_have_worked() {
                 json!({ "handle": handle, "address": 0, "instructions": instructions })
             ),
             format!(
-                "instructions is {instructions}, and a listing takes from 1 to 256; disassemble \
-                 again from where it ends to go further"
+                "instructions is {instructions}; give 1 to 256, and disassemble again from where \
+                 the listing ends to go further"
             )
         );
     }
@@ -5479,9 +5516,8 @@ fn disassemble_says_what_would_have_worked() {
             "disassemble",
             json!({ "handle": handle, "address": "&8000" })
         ),
-        "&8000 begins a chain of DD and FD prefixes that runs on to &8FFF, longer than the 4096 \
-         bytes a listing reads; the last of them rules the instruction they prefix, so \
-         disassemble from &8FFF"
+        "&8000 starts a chain of DD and FD prefixes running to &8FFF, longer than the 4096 bytes a \
+         listing reads; the last prefix decides the instruction, so disassemble from &8FFF"
     );
     // With its last three bytes an instruction, the chain and the
     // instruction it prefixes come to the 4096 bytes a listing reads.
@@ -6250,8 +6286,8 @@ fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
     assert_eq!(
         session.refusal("run", run("taken.jsonl")),
         format!(
-            "{} is taken, and a file is written only where none is: give a path that names \
-             nothing yet",
+            "{} already exists, and files are never overwritten; give a path that names nothing \
+             yet",
             directory.join("taken.jsonl").display()
         )
     );
@@ -6269,8 +6305,7 @@ fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
             "run",
             json!({ "handle": handle, "ticks": 400, "path": "counted.jsonl" })
         ),
-        "path names the file gather and count write what they find to, and neither is given; \
-         give gather or count the conditions to watch, or leave path out"
+        "path is given without gather or count; give gather or count, or leave path out"
     );
     session.refusal(
         "call",
@@ -6377,11 +6412,11 @@ fn a_request_whose_file_cannot_be_written_stands_and_says_where() {
     let ran = refused(&mut session, "run", json!({ "ticks": 4000 }));
     assert!(
         ran.ends_with(
-            "; what was begun there is taken away again. The request is not taken back: it ran \
-             4000 ticks, and the machine stands where it ended, at tick 4000 with its program \
-             counter at &03E8, and its journal holds the request; make it again, from a state kept \
-             before it or from the journal's requests before it, to write the file, at a path the file \
-             system can take it at"
+            "; the partial file has been removed. The run still happened: it ran 4000 \
+             ticks, and the machine is at tick 4000 with its program counter at &03E8, the \
+             request in its journal. To get the file, make the request again, from a state kept \
+             before it or from the journal's earlier requests, with a path the file system can \
+             take"
         ),
         "{ran}"
     );
@@ -6392,8 +6427,8 @@ fn a_request_whose_file_cannot_be_written_stands_and_says_where() {
     );
     assert!(
         called.contains(
-            "The request is not taken back: it ran 4010 ticks, and the machine stands where it \
-             ended, at tick 8010 with its program counter at &03E8"
+            "The run still happened: it ran 4010 ticks, and the machine is at tick 8010 with \
+             its program counter at &03E8"
         ),
         "{called}"
     );
@@ -6477,8 +6512,8 @@ fn a_key_neither_named_nor_numbered_is_refused_with_the_keys_there_are() {
     );
     assert!(
         refused.starts_with(
-            "no key of a cpc6128 is \"FIRE\"; a key is given by its name, or by its number from \
-             0 to 79 as the firmware numbers it"
+            "a cpc6128 has no key \"FIRE\"; give a key's name, or its number from 0 to 79 \
+             as the firmware numbers it"
         ),
         "{refused}"
     );
@@ -6487,19 +6522,14 @@ fn a_key_neither_named_nor_numbered_is_refused_with_the_keys_there_are() {
         "{refused}"
     );
     let refused = session.refusal("run", json!({ "handle": cpc, "ticks": 100, "keys": [80] }));
-    assert!(
-        refused.starts_with("no key of a cpc6128 is 80;"),
-        "{refused}"
-    );
+    assert!(refused.starts_with("a cpc6128 has no key 80;"), "{refused}");
     let spectrum = session.open("spectrum48");
     let refused = session.refusal(
         "run",
         json!({ "handle": spectrum, "ticks": 100, "keys": [56] }),
     );
     assert!(
-        refused.starts_with(
-            "no key of a spectrum48 is 56; a key is given by its name: CAPS, Z, X, C, V, A"
-        ),
+        refused.starts_with("a spectrum48 has no key 56; give a key's name: CAPS, Z, X, C, V, A"),
         "{refused}"
     );
     for handle in [cpc, spectrum] {
@@ -6627,32 +6657,31 @@ fn text_a_keyboard_cannot_type_is_refused_before_a_key_goes_down() {
         (
             &cpc,
             "PRINT £5".to_owned(),
-            "'£' is no ASCII character, and text is typed from ASCII; a key it has is held \
-             through run's keys",
+            "'£' is not ASCII, and type takes ASCII only; if the machine has a key for it, hold \
+             that key with run's keys",
         ),
         (
             &spectrum,
             "p2\t2".to_owned(),
-            "no key of a spectrum48 types '\\t', alone or with a shift; any key is held through \
-             run's keys",
+            "no key of a spectrum48 types '\\t', with or without a shift; press the machine's keys \
+             directly with run's keys",
         ),
         (
             &cpc,
             String::new(),
-            "text holds 0 characters, and from 1 to 250 are typed at a cpc6128 at once, 1500 \
-             frames' worth; give a character or more",
+            "text has 0 characters; give 1 to 250, 1500 frames' worth on a cpc6128",
         ),
         (
             &cpc,
             "a".repeat(251),
-            "text holds 251 characters, and from 1 to 250 are typed at a cpc6128 at once, 1500 \
-             frames' worth; type the rest in another request",
+            "text has 251 characters; give 1 to 250, 1500 frames' worth on a cpc6128, and type \
+             the rest in another request",
         ),
         (
             &spectrum,
             "a".repeat(167),
-            "text holds 167 characters, and from 1 to 166 are typed at a spectrum48 at once, 1500 \
-             frames' worth; type the rest in another request",
+            "text has 167 characters; give 1 to 166, 1500 frames' worth on a spectrum48, and \
+             type the rest in another request",
         ),
     ] {
         assert_eq!(
@@ -6773,19 +6802,19 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
     };
     assert_eq!(
         refusal(&mut session, &spectrum, &not_a_disc, "A"),
-        "a spectrum48 has no disc drive; a cpc664 or a cpc6128 takes a disc, and a Spectrum a tape"
+        "a spectrum48 has no disc drive; use a cpc664 or a cpc6128 for discs, and tape_insert for \
+         a Spectrum's tapes"
     );
     assert_eq!(
         refusal(&mut session, &cpc464, &not_a_disc, "A"),
-        "a cpc464 is built here as the emulator's command line builds one given no disc, without \
-         a disc interface, and nothing here fits one afterwards; a cpc664 or a cpc6128 takes a \
-         disc"
+        "a cpc464 is built without a disc interface, as the emulator's command line builds one \
+         given no disc; use a cpc664 or a cpc6128 for discs"
     );
     assert_eq!(
         refusal(&mut session, &cpc6128, &not_a_disc, "B"),
         format!(
             "{}: the image does not begin like a disc image; a disc is a DSK image, of the \
-             original layout or the extended one",
+             original or the extended layout",
             not_a_disc.display()
         )
     );
@@ -6793,7 +6822,7 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
         refusal(&mut session, &cpc6128, &roms.0, "A"),
         format!(
             "{} is not a file of at most 16777216 bytes; a disc is a DSK image, of the original \
-             layout or the extended one",
+             or the extended layout",
             roms.0.display()
         )
     );
@@ -6801,8 +6830,8 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
     assert!(
         refused.starts_with(&format!("cannot read {}: ", missing.display()))
             && refused.ends_with(&format!(
-                "; a disc is named by its path on the file system the server runs on, and a \
-                 relative path is taken from the server's working directory, {}",
+                "; give a disc by its path on the server's file system, and a relative path \
+                 starts from the server's working directory, {}",
                 std::env::current_dir().unwrap().display()
             )),
         "{refused}"
@@ -6931,9 +6960,8 @@ fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
     let spectrum = session.open("spectrum48");
     assert_eq!(
         session.refusal("tape_insert", json!({ "handle": cpc, "path": not_a_tape })),
-        "a cpc6128 is given no tape here: the emulator has never loaded a tape through a CPC's \
-         firmware, so nothing here could hold one to what the machine did; a spectrum48 takes a \
-         tape, and a cpc664 or a cpc6128 a disc"
+        "a cpc6128 takes no tape here, since no test checks tape loading through a CPC's firmware; \
+         use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs"
     );
     let refused = session.refusal(
         "tape_insert",
@@ -6941,9 +6969,8 @@ fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
     );
     assert!(
         refused.starts_with(&format!("{} ", not_a_tape.display()))
-            && refused.ends_with(
-                "; a tape is a .tap, of bare blocks at the ROM's own timings, or a .tzx"
-            ),
+            && refused
+                .ends_with("; a tape is a .tap of bare blocks at the ROM's own timings, or a .tzx"),
         "{refused}"
     );
 }
@@ -7043,8 +7070,8 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
     assert_eq!(
         session.refusal("snapshot_save", json!({ "handle": handle, "path": taken })),
         format!(
-            "{} is taken, and a file is written only where none is: give a path that names \
-             nothing yet",
+            "{} already exists, and files are never overwritten; give a path that names nothing \
+             yet",
             taken.display()
         )
     );
@@ -7057,9 +7084,8 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
     assert!(
         refused.starts_with(&format!("cannot write {}: ", nowhere.display()))
             && refused.ends_with(&format!(
-                "; a file is written at a path on the file system the server runs on, in a \
-                 directory that is there, and a relative path is taken from the server's working \
-                 directory, {}",
+                "; give a path on the server's file system, in a directory that exists, and a \
+                 relative path starts from the server's working directory, {}",
                 std::env::current_dir().unwrap().display()
             )),
         "{refused}"
@@ -7072,9 +7098,9 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
             json!({ "handle": handle, "path": unsettled })
         ),
         format!(
-            "{handle} stands inside an instruction, as a run or a step leaves it in a chain of \
-             prefixes, and a snapshot keeps no instruction half run; step it on to the \
-             instruction's end"
+            "{handle} is inside an instruction, where a run or a step can leave it in a chain of \
+             prefixes, and a snapshot cannot hold a half-run instruction; step to the \
+             instruction's end first"
         )
     );
     assert!(!unsettled.exists());
@@ -7087,8 +7113,8 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
         ),
         format!(
             "{twin} has its stack below the RAM, where the program counter cannot be pushed; a \
-             Spectrum's snapshot keeps the program counter in the two bytes below the stack \
-             pointer, so cpu.sp stands from &4002 to &FFFF"
+             Spectrum snapshot stores the program counter in the 2 bytes below the stack \
+             pointer, so cpu.sp must be &4002 to &FFFF"
         )
     );
     assert!(!unsettled.exists());
@@ -7312,7 +7338,7 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
             json!({ "handle": spectrum, "state": "state-1" })
         ),
         format!(
-            "no state is called state-1; no state is held of {spectrum}, and state_keep keeps \
+            "no state is named state-1; there are no states kept from {spectrum}; state_keep keeps \
              one"
         )
     );
@@ -7334,8 +7360,7 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
     assert_eq!(
         session.refusal("state_restore", json!({ "handle": cpc, "state": first })),
         format!(
-            "{first} was kept from {spectrum}, and a state is restored into the machine it was \
-             kept from and dropped from it alone"
+            "{first} was kept from {spectrum}; restore or drop it through that machine's handle"
         )
     );
     session.answer("state_drop", json!({ "handle": spectrum, "state": first }));
@@ -7344,7 +7369,7 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
             "state_restore",
             json!({ "handle": spectrum, "state": first })
         ),
-        format!("no state is called {first}; the states kept from {spectrum} are {second}")
+        format!("no state is named {first}; states kept from {spectrum}: {second}")
     );
     let mut names = BTreeSet::from([first.clone(), second.clone(), cpcs.clone()]);
     for _ in 1..64 {
@@ -7353,8 +7378,8 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
     let refused = session.refusal("state_keep", json!({ "handle": spectrum }));
     assert!(
         refused.starts_with(&format!(
-            "{spectrum} has 64 states kept, the most one machine keeps; state_drop lets one of \
-             them go: {second}, "
+            "{spectrum} already has 64 states, the most a machine keeps; drop one with \
+             state_drop: {second}, "
         )),
         "{refused}"
     );
@@ -7367,8 +7392,8 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
             json!({ "handle": reopened, "state": second })
         ),
         format!(
-            "no state is called {second}; no state is held of {reopened}, and state_keep keeps \
-             one"
+            "no state is named {second}; there are no states kept from {reopened}; state_keep \
+             keeps one"
         )
     );
     assert!(names.insert(keep(&mut session, &reopened)));
@@ -7429,8 +7454,7 @@ fn the_journal_is_answered_a_page_at_a_time() {
     assert_eq!(
         session.refusal("journal", json!({ "handle": handle, "from": count + 1 })),
         format!(
-            "from is {}, and the journal of {handle} holds {count} entries, so it is answered \
-             from 0 to {count}",
+            "from is {}; give 0 to {count}, the number of entries in the journal of {handle}",
             count + 1
         )
     );
@@ -7749,8 +7773,8 @@ fn a_relative_path_is_taken_from_the_working_directory_and_answered_absolute() {
             "cannot read {}: ",
             directory.join("missing.sna").display()
         )) && refused.ends_with(&format!(
-            "; a snapshot is named by its path on the file system the server runs on, and a \
-             relative path is taken from the server's working directory, {}",
+            "; give a snapshot by its path on the server's file system, and a relative path \
+             starts from the server's working directory, {}",
             directory.display()
         )),
         "{refused}"
@@ -9089,10 +9113,14 @@ fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
 // whose bytes is &03, its "head load delay and dma flag" (Kevin Thacker's
 // "Disassembly of AMSDOS ROM", https://cpctech.cpcwiki.de/docs/amsdos.asm,
 // at &C5EF, &C60D and &C5D4), the flag the emulator's specify() keeps as
-// fdc.non_dma. A snapshot keeps no controller, so a machine read from one
-// finds it as at power-on and catalogues no disc there, where the machine it
-// was saved from catalogues the same disc as blank, as the test above reads
-// it, and so does one read from it with fdc.non_dma written back.
+// fdc.non_dma. The same parameters give &01, the "head unload delay", and
+// &0C, the "step rate in 1ms units", which AMSDOS also waits out for each
+// track a seek crosses, then &0F, its "head settle time in 1ms units",
+// before it asks how the seek went (&C7C7): 27ms for one track, where the
+// power-on step rate takes 32ms. A snapshot keeps no controller, so a
+// machine read from one finds it as at power-on. SAVE writes &A00 bytes
+// after AMSDOS's header of 128, three blocks of a data disc, the last of
+// them crossing onto its second track.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn a_cpc_read_from_its_snapshot_finds_its_disc_controller_as_at_power_on() {
@@ -9101,23 +9129,46 @@ fn a_cpc_read_from_its_snapshot_finds_its_disc_controller_as_at_power_on() {
     let mut session = Session::reading(&firmware());
     let live = session.open("cpc6128");
     session.run(&live, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
-    assert_eq!(session.inspect(&live, "fdc.non_dma"), true);
+    let specified = json!({
+        "fdc.non_dma": true,
+        "fdc.step_time": 12000,
+        "fdc.head_load_time": 4000,
+        "fdc.head_unload_time": 32000,
+    });
+    for (path, value) in specified.as_object().unwrap() {
+        assert_eq!(&session.inspect(&live, path), value, "{path}");
+    }
     let snapshot = scratch.0.join("started.sna");
     session.answer("snapshot_save", json!({ "handle": live, "path": snapshot }));
     let read = session.open_from("cpc6128", &snapshot);
     assert_eq!(session.inspect(&read, "fdc.non_dma"), false);
-    let mended = session.open_from("cpc6128", &snapshot);
-    session.set(&mended, json!({ "fdc.non_dma": true }));
+    assert_eq!(session.inspect(&read, "fdc.step_time"), 32000);
+    let reading = session.open_from("cpc6128", &snapshot);
+    session.set(&reading, json!({ "fdc.non_dma": true }));
+    let seeking = session.open_from("cpc6128", &snapshot);
+    session.set(
+        &seeking,
+        json!({ "fdc.non_dma": true, "fdc.step_time": 12000 }),
+    );
     let font = cpc_font(&mut session, &live, "cpc6128");
-    let mut catalogues = Vec::new();
-    for handle in [&live, &read, &mended] {
+    let mut catalogued = Vec::new();
+    let mut saved = Vec::new();
+    for handle in [&live, &read, &reading, &seeking] {
         session.answer("disc_insert", json!({ "handle": handle, "path": disc }));
-        session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
-        session.run(handle, json!({ "frames": 250 }));
-        let text = cpc_text(&mut session, handle, &scratch, &font);
-        catalogues.push(text.iter().any(|line| line.replace(' ', "") == "178Kfree"));
+        let catalogues = |session: &mut Session, free: &str| {
+            session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
+            session.run(handle, json!({ "frames": 250 }));
+            let text = cpc_text(session, handle, &scratch, &font);
+            text.iter().any(|line| line.replace(' ', "") == free)
+        };
+        catalogued.push(catalogues(&mut session, "178Kfree"));
+        let save = "SAVE\"THREE\",B,&4000,&A00\n";
+        session.answer("type", json!({ "handle": handle, "text": save }));
+        session.run(handle, json!({ "frames": 600 }));
+        saved.push(catalogues(&mut session, "175Kfree"));
     }
-    assert_eq!(catalogues, [true, false, true]);
+    assert_eq!(catalogued, [true, false, true, true]);
+    assert_eq!(saved, [true, false, false, true]);
 }
 
 // A run by frames ends just past the retrace, which comes inside the handler

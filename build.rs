@@ -52,8 +52,8 @@ fn c_files_in(directory: &Path) -> Vec<PathBuf> {
 struct Answered;
 
 impl ParseCallbacks for Answered {
-    // A comment's lines are the header's, and a description is one sentence
-    // run on.
+    // A comment's lines are the header's, and a description runs them on as
+    // one line.
     fn process_comment(&self, comment: &str) -> Option<String> {
         Some(comment.split_whitespace().collect::<Vec<_>>().join(" "))
     }

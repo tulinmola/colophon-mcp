@@ -13,8 +13,8 @@
    safe. */
 const char *mcp_z80_check(const z80_t *written) {
   if (written->program_length != 0 || written->program_index != 0) {
-    return "cpu.program_length and cpu.program_index count the steps of an instruction under "
-           "way, and a machine is written only between instructions, where both are 0";
+    return "cpu.program_length and cpu.program_index count the steps of an instruction in "
+           "progress; a machine is written only between instructions, so write both as 0";
   }
   return NULL;
 }
@@ -25,8 +25,8 @@ const char *mcp_z80_check(const z80_t *written) {
    framebuffer it was connected to. */
 const char *mcp_monitor_check(const monitor_t *standing, const monitor_t *written) {
   if (written->width != standing->width || written->height != standing->height) {
-    return "monitor.width and monitor.height are the size of the framebuffer the monitor draws "
-           "into, and stay so";
+    return "monitor.width and monitor.height are the size of the monitor's framebuffer and cannot "
+           "change; write them as they read";
   }
   return NULL;
 }

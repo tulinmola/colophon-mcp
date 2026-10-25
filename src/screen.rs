@@ -10,11 +10,11 @@ use crate::picture::Picture;
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Reading {
-    /// As the CPC's video hardware reads memory: the base is a display start, a character row's lines lie 2K apart, and a row's bytes wrap inside their 2K, unless the 6845's start, read from R12 and R13 when no base is given, carries them on into the next 16K.
+    /// As the CPC's video hardware reads memory: a character row's lines are 2K apart, and a row's bytes wrap within their 2K unless `base` is omitted and R12's bits 3 and 2 carry them into the next 16K.
     Video,
-    /// A flat buffer: width bytes, then the next width, wrapping at the end of the machine's RAM.
+    /// A flat buffer: `width` bytes per line, wrapping at the end of the RAM.
     Linear,
-    /// Each column of the picture down before the next, wrapping as linear does.
+    /// Column by column, left to right: each column is `height` bytes, top to bottom. Wraps as `linear` does.
     Columns,
 }
 
@@ -73,9 +73,7 @@ fn bounded(name: &str, value: u32, most: u32, because: &str) -> Result<u32, Stri
     if (1..=most).contains(&value) {
         return Ok(value);
     }
-    Err(format!(
-        "{because}, and a screen reads from 1 to {most}; give {name}"
-    ))
+    Err(format!("{because}, outside 1 to {most}; give {name}"))
 }
 
 // The first character of a video base, as the 6845 would count it: the base
@@ -94,8 +92,8 @@ pub fn settle(asked: &Asked, cpc: &cpc_t) -> Result<Screen, String> {
     let video = asked.reading == Reading::Video;
     if !video && asked.rasters.is_some() {
         return Err(
-            "rasters is read by the video reading alone: a flat buffer or one in columns has \
-             rows of one line; give it with the video reading, or leave it out"
+            "rasters applies to the video reading only, since linear and columns have rows of one \
+             line; give it with the video reading, or leave it out"
                 .to_owned(),
         );
     }
@@ -122,14 +120,14 @@ pub fn settle(asked: &Asked, cpc: &cpc_t) -> Result<Screen, String> {
     let (base, start) = match asked.base {
         Some(base) if video && (base >= VIDEO_SPACE || base & RASTER_BITS != 0) => {
             return Err(format!(
-                "&{base:04X} is no display start: the video reading reads the base 64K, and \
-                 there A13 to A11 carry the raster line, so a base is &0000 to &07FF, &4000 to \
-                 &47FF, &8000 to &87FF or &C000 to &C7FF; linear and columns read the rest"
+                "&{base:04X} is not a display start; for the video reading a base is &0000 to \
+                 &07FF, &4000 to &47FF, &8000 to &87FF or &C000 to &C7FF, since A13 to A11 carry \
+                 the raster line; linear and columns read the rest of the RAM"
             ));
         }
         Some(base) if base >= cpc.ram_size => {
             return Err(format!(
-                "&{base:04X} is past the RAM, which ends at &{:04X}",
+                "&{base:04X} is past &{:04X}, the end of the RAM",
                 cpc.ram_size - 1
             ));
         }

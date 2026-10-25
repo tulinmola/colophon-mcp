@@ -125,9 +125,9 @@ pub fn named(name: &str) -> Option<&'static Machine> {
 // A file read for a machine or written from one, named by what it holds.
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct FileRead {
-    /// The file's path, absolute.
+    /// The file's absolute path.
     pub path: PathBuf,
-    /// The SHA-256 of what it held, in hexadecimal.
+    /// The SHA-256 of the file's contents when the server read or wrote it, in hexadecimal.
     pub sha256: String,
 }
 
@@ -144,19 +144,19 @@ impl FileRead {
     }
 }
 
-pub const DISCS: &str = "a disc is a DSK image, of the original layout or the extended one";
-pub const TAPES: &str = "a tape is a .tap, of bare blocks at the ROM's own timings, or a .tzx";
+pub const DISCS: &str = "a disc is a DSK image, of the original or the extended layout";
+pub const TAPES: &str = "a tape is a .tap of bare blocks at the ROM's own timings, or a .tzx";
 
 // Where a relative path is taken from, said beside a file that could not be
 // reached by it.
 fn working_directory_clause() -> String {
     match std::env::current_dir() {
         Ok(directory) => format!(
-            "a relative path is taken from the server's working directory, {}",
+            "a relative path starts from the server's working directory, {}",
             directory.display()
         ),
         Err(error) => format!(
-            "the server's working directory cannot be read ({error}), so a path is given absolute"
+            "the server's working directory cannot be read ({error}), so give an absolute path"
         ),
     }
 }
@@ -168,8 +168,8 @@ pub fn absolute(path: &Path) -> Result<PathBuf, String> {
     // Quoted, since the path refused may be empty.
     std::path::absolute(path).map_err(|error| {
         format!(
-            "cannot make {path:?} absolute: {error}; a file is named by its path on the file \
-             system the server runs on, and {}",
+            "cannot make {path:?} absolute: {error}; give a path on the server's file system, and \
+             {}",
             working_directory_clause()
         )
     })
@@ -181,8 +181,8 @@ pub fn absolute(path: &Path) -> Result<PathBuf, String> {
 fn read_whole(path: &Path, largest: u64, what: &str, takes: &str) -> Result<Vec<u8>, String> {
     let unreadable = |error: io::Error| {
         format!(
-            "cannot read {}: {error}; {what} is named by its path on the file system the server \
-             runs on, and {}",
+            "cannot read {}: {error}; give {what} by its path on the server's file system, and \
+             {}",
             path.display(),
             working_directory_clause()
         )
@@ -242,14 +242,14 @@ impl NewFile {
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::AlreadyExists {
                     format!(
-                        "{} is taken, and a file is written only where none is: give a path \
-                         that names nothing yet",
+                        "{} already exists, and files are never overwritten; give a path that \
+                         names nothing yet",
                         path.display()
                     )
                 } else {
                     format!(
-                        "cannot write {}: {error}; a file is written at a path on the file \
-                         system the server runs on, in a directory that is there, and {}",
+                        "cannot write {}: {error}; give a path on the server's file system, in a \
+                         directory that exists, and {}",
                         path.display(),
                         working_directory_clause()
                     )
@@ -275,8 +275,8 @@ impl NewFile {
             let (hashing, _) = self.file.into_parts();
             drop(hashing);
             let begun = match fs::remove_file(&self.path) {
-                Ok(()) => "what was begun there is taken away again",
-                Err(_) => "what was begun there is left, unfinished, and holds that path",
+                Ok(()) => "the partial file has been removed",
+                Err(_) => "the partial file could not be removed and is still at that path",
             };
             return Err(format!(
                 "cannot write {}: {error}; {begun}",
@@ -308,12 +308,8 @@ impl Write for NewFile {
 pub fn write_new(path: &Path, contents: &[u8]) -> Result<FileRead, String> {
     let mut file = NewFile::create(path)?;
     let written = file.write_all(contents);
-    file.finish(written).map_err(|problem| {
-        format!(
-            "{problem}, and the file is written again when asked, at a path the file system can \
-             take it at"
-        )
-    })
+    file.finish(written)
+        .map_err(|problem| format!("{problem}; ask again with a path the file system can take"))
 }
 
 // What a machine is built from, read and checked, so that building it
@@ -350,18 +346,18 @@ enum HardwareState {
 // A request that stood a machine up or changed it.
 #[derive(Clone, Serialize, JsonSchema)]
 pub struct Entry {
-    /// The machine's tick as the request began.
+    /// The machine's tick when the request began.
     pub tick: u64,
-    /// The tool asked.
+    /// The tool called.
     pub tool: &'static str,
-    /// The arguments it was given, save the handle.
+    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute.
     #[schemars(schema_with = "crate::server::values_schema")]
     pub arguments: Value,
-    /// The snapshot, the disc or the tape it read, named by what it held.
+    /// The snapshot, disc or tape the request read, with the SHA-256 of what it held.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = crate::server::absent_not_null)]
     pub file: Option<FileRead>,
-    /// The file a run or a call wrote what it gathered or counted to, named by what it holds.
+    /// The file a run or call wrote its gathered or counted lists to, with the SHA-256 of what it held.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = crate::server::absent_not_null)]
     pub written: Option<FileRead>,
@@ -427,23 +423,23 @@ fn read(
     // waiting for good.
     if path.exists() && !path.is_file() {
         return Err(format!(
-            "{} is not a file; the emulator's `make roms` fetches the firmware into its roms \
-             directory as files",
+            "{} is not a file; run the emulator's `make roms`, which fetches the firmware into its \
+             roms directory as files",
             path.display()
         ));
     }
     let contents = fs::read(&path).map_err(|error| {
         format!(
-            "cannot read {}: {error}; the emulator's `make roms` fetches the firmware into its \
-             roms directory; --roms names the directory it is read from, and {}",
+            "cannot read {}: {error}; run the emulator's `make roms` to fetch the firmware into \
+             its roms directory, and start the server with --roms naming that directory; {}",
             path.display(),
             working_directory_clause()
         )
     })?;
     if contents.len() != size {
         return Err(format!(
-            "{} holds {} bytes, expected {size}; the emulator's `make roms` fetches the \
-             firmware at its size",
+            "{} has {} bytes, not {size}; the emulator's `make roms` fetches the firmware at its \
+             right size",
             path.display(),
             contents.len()
         ));
@@ -581,14 +577,13 @@ impl Machine {
                 ..
             } => Ok(()),
             Board::Cpc { .. } => Err(format!(
-                "a {} is built here as the emulator's command line builds one given no disc, \
-                 without a disc interface, and nothing here fits one afterwards; a cpc664 or a \
-                 cpc6128 takes a disc",
+                "a {} is built without a disc interface, as the emulator's command line builds one \
+                 given no disc; use a cpc664 or a cpc6128 for discs",
                 self.name
             )),
             Board::Spectrum { .. } => Err(format!(
-                "a {} has no disc drive; a cpc664 or a cpc6128 takes a disc, and a Spectrum a \
-                 tape",
+                "a {} has no disc drive; use a cpc664 or a cpc6128 for discs, and tape_insert for \
+                 a Spectrum's tapes",
                 self.name
             )),
         }
@@ -599,9 +594,8 @@ impl Machine {
         match self.board {
             Board::Spectrum { .. } => Ok(()),
             Board::Cpc { .. } => Err(format!(
-                "a {} is given no tape here: the emulator has never loaded a tape through a CPC's \
-                 firmware, so nothing here could hold one to what the machine did; a spectrum48 \
-                 takes a tape, and a cpc664 or a cpc6128 a disc",
+                "a {} takes no tape here, since no test checks tape loading through a CPC's \
+                 firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs",
                 self.name
             )),
         }
@@ -616,17 +610,17 @@ impl Machine {
         match self.board {
             Board::Spectrum { .. } if conditions.iter().any(|condition| condition.kind == PSG) => {
                 Err(format!(
-                    "a {} has no PSG, whose registers psg watches: its speaker is bit 4 of its \
-                     ULA's port, which {{\"out\": \"&FE\", \"mask\": \"&01\"}} watches, and a \
-                     cpc464, a cpc664 or a cpc6128 has a PSG",
+                    "a {} has no PSG for psg to watch; its speaker is bit 4 of its ULA's port, \
+                     which {{\"out\": \"&FE\", \"mask\": \"&01\"}} watches; a cpc464, a cpc664 or \
+                     a cpc6128 has a PSG",
                     self.name
                 ))
             }
             Board::Spectrum { .. } if conditions.iter().any(|condition| condition.kind == CRTC) => {
                 Err(format!(
-                    "a {} has no 6845, whose registers crtc watches: its border's colour is the \
-                     lowest three bits of its ULA's port, which {{\"out\": \"&FE\", \"mask\": \
-                     \"&01\"}} watches, and a cpc464, a cpc664 or a cpc6128 has a 6845",
+                    "a {} has no 6845 for crtc to watch; its border's colour is the lowest 3 bits \
+                     of its ULA's port, which {{\"out\": \"&FE\", \"mask\": \"&01\"}} watches; a \
+                     cpc464, a cpc664 or a cpc6128 has a 6845",
                     self.name
                 ))
             }
@@ -646,9 +640,9 @@ impl Machine {
     fn snapshots(&self) -> &'static str {
         match self.board {
             Board::Cpc { .. } => {
-                "a CPC opens an SNA snapshot of version 1, 2 or 3 holding no more RAM than it \
-                 has, in the dump that follows its header: 128K on a cpc6128, 64K on a cpc664 \
-                 or a cpc464, which have no PAL and take only RAM configuration 0"
+                "a CPC opens an SNA snapshot of version 1, 2 or 3 whose memory dump, after its \
+                 header, holds no more RAM than the machine has: 128K on a cpc6128, 64K on a \
+                 cpc664 or a cpc464, which have no PAL and take only RAM configuration 0"
             }
             Board::Spectrum { .. } => "a spectrum48 opens a 48K .sna snapshot of 49179 bytes",
         }
@@ -760,8 +754,8 @@ const ROOM_PAST_FULL: u32 = 9;
 // the machine.
 fn gone(name: &str) -> String {
     format!(
-        "{name} was dropped as it was asked for; machine_list names the states kept from each \
-         machine"
+        "{name} was dropped while this request waited; machine_list lists the states kept from \
+         each machine"
     )
 }
 
@@ -921,9 +915,9 @@ impl Built {
         };
         if !complete {
             return Err(
-                "stands inside an instruction, as a run or a step leaves it in a chain of \
-                 prefixes, and a snapshot keeps no instruction half run; step it on to the \
-                 instruction's end"
+                "is inside an instruction, where a run or a step can leave it in a chain of \
+                 prefixes, and a snapshot cannot hold a half-run instruction; step to the \
+                 instruction's end first"
                     .to_owned(),
             );
         }
@@ -931,8 +925,8 @@ impl Built {
             Hardware::Cpc(cpc) => cpc.snapshot_save(),
             Hardware::Spectrum(spectrum) => spectrum.snapshot_save().map_err(|problem| {
                 format!(
-                    "{problem}; a Spectrum's snapshot keeps the program counter in the two bytes \
-                     below the stack pointer, so cpu.sp stands from &4002 to &FFFF"
+                    "{problem}; a Spectrum snapshot stores the program counter in the 2 bytes \
+                     below the stack pointer, so cpu.sp must be &4002 to &FFFF"
                 )
             }),
         }
@@ -1282,8 +1276,8 @@ impl Built {
     pub fn peek_ram(&self, ram: u32, length: u16) -> Result<Vec<u8>, String> {
         let Hardware::Cpc(cpc) = &self.hardware else {
             return Err(
-                "ram reads a CPC's RAM by its own addresses, past its banking and its ROMs; a \
-                 Spectrum's RAM stands at &4000 to &FFFF, where address reads it"
+                "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to \
+                 &FFFF, so read it with address"
                     .to_owned(),
             );
         };
@@ -1295,11 +1289,11 @@ impl Built {
             .map(<[u8]>::to_vec)
             .ok_or_else(|| {
                 if start > last {
-                    format!("&{ram:04X} is past &{last:04X}, where the machine's RAM ends")
+                    format!("&{ram:04X} is past &{last:04X}, the end of the RAM")
                 } else {
                     format!(
-                        "{length} bytes from &{ram:04X} run past &{last:04X}, where the \
-                         machine's RAM ends; {} fit from there",
+                        "{length} bytes from &{ram:04X} run past &{last:04X}, the end of the RAM; \
+                         give at most {} from there",
                         memory.len() - start
                     )
                 }
@@ -1367,9 +1361,7 @@ impl Built {
     pub fn screen(&self, asked: &Asked) -> Result<(Screen, Picture), String> {
         let Hardware::Cpc(cpc) = &self.hardware else {
             return Err(
-                "screen reads a CPC's memory as its video hardware does, and a Spectrum's \
-                 picture is read by monitor"
-                    .to_owned(),
+                "screen draws a CPC's memory only; use monitor for a Spectrum's picture".to_owned(),
             );
         };
         let screen = screen::settle(asked, cpc.machine())?;
@@ -1418,14 +1410,13 @@ impl Built {
                 Some(at) => {
                     let last = at.wrapping_sub(1);
                     format!(
-                        "&{address:04X} begins a chain of DD and FD prefixes that runs on to \
-                         &{last:04X}, longer than the {most_bytes} bytes a listing reads; the \
-                         last of them rules the instruction they prefix, so disassemble from \
-                         &{last:04X}"
+                        "&{address:04X} starts a chain of DD and FD prefixes running to \
+                         &{last:04X}, longer than the {most_bytes} bytes a listing reads; the last \
+                         prefix decides the instruction, so disassemble from &{last:04X}"
                     )
                 }
                 None => "memory holds nothing but DD and FD prefixes, which the processor runs as \
-                         one instruction without end; no listing reads one"
+                         one endless instruction; there is nothing to list"
                     .to_owned(),
             });
         }
@@ -1693,8 +1684,8 @@ mod tests {
         assert_eq!(
             problem,
             format!(
-                "{} holds 32768 bytes, expected 16384; the emulator's `make roms` fetches the \
-                 firmware at its size",
+                "{} has 32768 bytes, not 16384; the emulator's `make roms` fetches the firmware at \
+                 its right size",
                 roms.0.join("spectrum48.rom").display()
             )
         );

@@ -111,9 +111,8 @@ const char *mcp_spectrum_call(spectrum_t *spectrum, uint16_t address) {
   uint16_t high = (uint16_t)(cpu->sp - 1);
   uint16_t low = (uint16_t)(cpu->sp - 2);
   if (!reads_back(spectrum, high) || !reads_back(spectrum, low)) {
-    return "the return address would be pushed into the ROM or past the RAM, where it lands "
-           "nowhere, and the routine's return would not read it back; give cpu.sp in values, "
-           "pointing into the RAM";
+    return "the return address would be pushed into the ROM or past the RAM, where it is lost; "
+           "give cpu.sp in values so that the 2 bytes below it are RAM";
   }
   spectrum_poke(spectrum, high, (uint8_t)(cpu->pc >> 8));
   spectrum_poke(spectrum, low, (uint8_t)cpu->pc);
@@ -131,7 +130,7 @@ const char *mcp_spectrum_check(const spectrum_t *standing, const spectrum_t *wri
   /* spectrum.c's peek, poke and fetch, and the snapshot's copies: RAM is
      reached as far as ram_size says. */
   if (written->ram_size != standing->ram_size) {
-    return "ram_size is the size of the RAM the machine was built with, and stays so";
+    return "ram_size is the size of the machine's RAM and cannot change; write it as it reads";
   }
   /* The processor is handed the bus as the last tick left it, with only its
      INT recomputed, and z80.c holds a machine cycle for as long as WAIT is
@@ -139,7 +138,7 @@ const char *mcp_spectrum_check(const spectrum_t *standing, const spectrum_t *wri
      there would hold the processor for good. Nothing on a Spectrum drives
      WAIT. */
   if ((written->pins & Z80_WAIT) != 0) {
-    return "pins carries WAIT, which nothing on a Spectrum drives and which would hold its "
+    return "pins has WAIT set, which nothing on a Spectrum drives and which would stop its "
            "processor for good; write pins with bit 31, WAIT, clear";
   }
   return mcp_monitor_check(&standing->monitor, &written->monitor);

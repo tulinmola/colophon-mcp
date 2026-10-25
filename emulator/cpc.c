@@ -188,9 +188,9 @@ const char *mcp_cpc_call(cpc_t *cpc, uint16_t address) {
   uint16_t high = (uint16_t)(cpu->sp - 1);
   uint16_t low = (uint16_t)(cpu->sp - 2);
   if (!reads_back(cpc, high) || !reads_back(cpc, low)) {
-    return "the return address would be pushed under a ROM, which answers the processor's "
-           "reads there, and the routine's return would not read it back; give cpu.sp in "
-           "values, pointing into RAM that no ROM enabled covers";
+    return "the return address would be pushed under an enabled ROM, where the routine's return "
+           "could not read it back; give cpu.sp in values so that the 2 bytes below it are RAM "
+           "that no enabled ROM covers";
   }
   cpc_poke(cpc, high, (uint8_t)(cpu->pc >> 8));
   cpc_poke(cpc, low, (uint8_t)cpu->pc);
@@ -211,22 +211,22 @@ const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
   /* io_write fits the PAL that pages the second 64K by it:
      `bool pal_fitted = cpc->ram_size >= 0x20000;`. */
   if (written->ram_size != standing->ram_size) {
-    return "ram_size is the size of the RAM the machine was built with, and stays so";
+    return "ram_size is the size of the machine's RAM and cannot change; write it as it reads";
   }
   /* cpc_remap: `banking[cpc->mmr & 0x07]` pages in banks 4 to 7, past the
      end of 64K. */
   if (written->ram_size < 0x20000 && (written->mmr & 0x07) != 0) {
-    return "mmr selects a RAM configuration, and a machine of 64K has configuration 0 alone: "
-           "&C0, or any value whose lowest three bits are 0";
+    return "mmr selects a RAM configuration, and a 64K machine has only configuration 0; write "
+           "&C0, or any value whose lowest 3 bits are 0";
   }
   /* gate_array_write's INKR: `gate_array->inks[gate_array->pen] = data`. */
   if (written->gate_array.pen > 16) {
-    return "gate_array.pen selects one of the seventeen inks, 0 to 16";
+    return "gate_array.pen selects one of the 17 inks; write 0 to 16";
   }
   /* psg_access: `psg->registers[psg->selected]`, as held() above reads it
      too. */
   if (written->psg.selected > 15) {
-    return "psg.selected selects one of the sixteen registers, 0 to 15";
+    return "psg.selected selects one of the 16 registers; write 0 to 15";
   }
   problem = mcp_monitor_check(&standing->monitor, &written->monitor);
   if (problem != NULL) {
@@ -236,28 +236,28 @@ const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
      stopping only when the count meets the length. */
   if (fdc->phase == UPD765_PHASE_COMMAND && !(fdc->command_received < fdc->command_length &&
                                               fdc->command_length <= UPD765_COMMAND_BYTES)) {
-    return "fdc.command_received and fdc.command_length count a command's bytes in, and in the "
-           "command phase the count is short of the length, which is at most 9";
+    return "fdc.command_received and fdc.command_length count a command's bytes in; in the command "
+           "phase write command_received below command_length, and command_length at most 9";
   }
   /* Its result phase: `fdc->result[fdc->result_sent++]`. */
   if (fdc->phase == UPD765_PHASE_RESULT &&
       !(fdc->result_sent < UPD765_RESULT_BYTES && fdc->result_length <= UPD765_RESULT_BYTES)) {
-    return "fdc.result_sent and fdc.result_length count a result's bytes out, and in the result "
-           "phase fewer than 7 have been sent, of at most 7";
+    return "fdc.result_sent and fdc.result_length count a result's bytes out; in the result phase "
+           "write result_sent below 7, and result_length at most 7";
   }
   /* A format's identities:
      `fdc->identities[fdc->sectors_done][fdc->identity_bytes++]`. */
   if ((fdc->stage == UPD765_STAGE_FORMAT_TO_IDENTITY ||
        fdc->stage == UPD765_STAGE_FORMAT_IDENTITY) &&
       !(fdc->sectors_done < FLOPPY_MAX_SECTORS && fdc->identity_bytes < FLOPPY_IDENTITY_BYTES)) {
-    return "fdc.sectors_done and fdc.identity_bytes place a format's identity bytes, and while "
-           "it takes them there are fewer than 29 sectors done and 4 bytes taken";
+    return "fdc.sectors_done and fdc.identity_bytes place a format's identity bytes; while it "
+           "takes them, write sectors_done below 29 and identity_bytes below 4";
   }
   /* The execution phase runs on the drive a command chose: `drive_t *drive =
      fdc->drive`, then drive_ready(drive). */
   if (fdc->phase == UPD765_PHASE_EXECUTION && fdc->drive == NULL) {
-    return "fdc.phase is UPD765_PHASE_EXECUTION only once a command has chosen a drive, which "
-           "this controller has not";
+    return "fdc.phase can be UPD765_PHASE_EXECUTION only once a command has chosen a drive, and "
+           "none is chosen; write another phase";
   }
   return NULL;
 }

@@ -41,7 +41,7 @@ bool mcp_watch_stopping(const mcp_watch_t *watch);
 /* Why a routine is not called: a machine is stopped inside an instruction
    only by a chain of prefixes longer than a run finishes. */
 #define MCP_INSIDE_AN_INSTRUCTION                                                                  \
-  "the processor stands inside a chain of prefixes, and a routine is called only between "         \
-  "instructions; step or run on to the end of the chain first"
+  "the processor is inside a chain of prefixes, and a routine can be called only between "         \
+  "instructions; step or run to the end of the chain first"
 
 #endif

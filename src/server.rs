@@ -154,19 +154,18 @@ impl Threads {
         match self.held.iter().find(|(_, held)| held.state == state) {
             Some((held, _)) if held == handle => Ok(()),
             Some((held, _)) => Err(format!(
-                "{state} was kept from {held}, and a state is restored into the machine it was \
-                 kept from and dropped from it alone"
+                "{state} was kept from {held}; restore or drop it through that machine's handle"
             )),
             None => {
                 let states = self.states_of(handle);
                 Err(if states.is_empty() {
                     format!(
-                        "no state is called {state}; no state is held of {handle}, and \
+                        "no state is named {state}; there are no states kept from {handle}; \
                          state_keep keeps one"
                     )
                 } else {
                     format!(
-                        "no state is called {state}; the states kept from {handle} are {}",
+                        "no state is named {state}; states kept from {handle}: {}",
                         states.join(", ")
                     )
                 })
@@ -182,12 +181,11 @@ impl Threads {
             .collect();
         if handles.is_empty() {
             format!(
-                "no machine has the handle {handle}; no machine is standing, and machine_open \
-                 stands one up"
+                "no machine has the handle {handle}; no machine is open, and machine_open opens one"
             )
         } else {
             format!(
-                "no machine has the handle {handle}; the machines standing have the handles {}",
+                "no machine has the handle {handle}; open handles: {}",
                 handles.join(", ")
             )
         }
@@ -388,7 +386,7 @@ fn address(value: &Value) -> Result<u16, String> {
     }
     hexadecimal_number(value, 4)
         .and_then(|number| u16::try_from(number).ok())
-        .ok_or_else(|| format!("{value} is no address; {ADDRESS_FORMS}"))
+        .ok_or_else(|| format!("{value} is not an address; {ADDRESS_FORMS}"))
 }
 
 const RAM_ADDRESS_FORMS: &str = "an address in the RAM is a number from 0 to 131071, or \
@@ -411,7 +409,7 @@ fn ram_address(value: &Value) -> Result<u32, String> {
         .or_else(|| hexadecimal_number(value, 5))
         .and_then(|number| u32::try_from(number).ok())
         .filter(|address| *address <= 0x1FFFF)
-        .ok_or_else(|| format!("{value} is no address in the RAM; {RAM_ADDRESS_FORMS}"))
+        .ok_or_else(|| format!("{value} is not an address in the RAM; {RAM_ADDRESS_FORMS}"))
 }
 
 const BYTE_FORMS: &str = "a byte is a number from 0 to 255, or hexadecimal from &00 to &FF, \
@@ -445,33 +443,30 @@ fn byte(value: &Value) -> Result<u8, String> {
     }
     hexadecimal_number(value, 2)
         .and_then(|number| u8::try_from(number).ok())
-        .ok_or_else(|| format!("{value} is no byte; {BYTE_FORMS}"))
+        .ok_or_else(|| format!("{value} is not a byte; {BYTE_FORMS}"))
 }
 
-const CONDITION_FORMS: &str = "a condition is {\"execute\": address}, {\"read\": address} or \
-                               {\"write\": address}, each with \"to\" and the last address if it \
-                               is a range, and an execute or a read with \"memory\": \"ram\" or \
-                               \"rom\" if only the RAM's bytes or only a ROM's are to match; \
-                               {\"in\": port, \"mask\": bits} or {\"out\": port, \"mask\": bits}, \
-                               the mask being the bits of the port's address that its device \
-                               decodes; or on a CPC {\"psg\": register} or {\"crtc\": register}, \
-                               with \"to\" and the last register if it is a range; any but an \
-                               execute or an in may take \"value\", a byte, with \"value_to\" and \
-                               the last byte if it is a range, and a write, a psg or a crtc \
-                               \"changes\": true; and any of them in until or gather may take \
-                               \"capture\" too";
+const CONDITION_FORMS: &str = "a condition is one of {\"execute\": address}, {\"read\": address}, \
+                               {\"write\": address}, {\"in\": port, \"mask\": bits}, {\"out\": \
+                               port, \"mask\": bits}, or on a CPC {\"psg\": register} or \
+                               {\"crtc\": register}; port and mask are addresses, mask's set bits \
+                               being those the port's device decodes; all but in and out may add \
+                               \"to\", the last address or register of a range; execute and read \
+                               may add \"memory\": \"ram\" or \"rom\"; all but execute and in may \
+                               add \"value\", a byte, and with it \"value_to\", the last byte of a \
+                               range; write, psg and crtc may add \"changes\": true; in until and \
+                               gather, any may add \"capture\"";
 
-const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, one of the two \
-                             or both: each path names one of the processor's values as inspect \
-                             reads it, under cpu, as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and \
-                             each span is {\"address\": address, \"length\": bytes}, from 1 to 64 \
-                             bytes, 1 if length is not given, none of them past &FFFF";
+const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, with at least \
+                             one of the two: a path names one of the processor's values under \
+                             cpu, such as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and a span is \
+                             {\"address\": address, \"length\": bytes}, 1 to 64 bytes, 1 if \
+                             length is not given, none past &FFFF";
 
-const PSG_REGISTER_FORMS: &str = "a register of the PSG is a number from 0 to 15";
+const PSG_REGISTER_FORMS: &str = "a PSG register is a number from 0 to 15";
 
-const CRTC_REGISTER_FORMS: &str = "a register of the 6845 is a number from 0 to 31, as its \
-                                   address register of five bits names them, of which 0 to 17 \
-                                   are the chip's";
+const CRTC_REGISTER_FORMS: &str = "a 6845 register is a number from 0 to 31, of which the chip has \
+                                   0 to 17";
 
 // "The PSG has 16 internal registers" ("AY-3-8912 PSG", Kevin Thacker's
 // cpctech,
@@ -490,7 +485,7 @@ fn register(value: &Value, most: u16, forms: &str) -> Result<u16, String> {
         .as_u64()
         .and_then(|number| u16::try_from(number).ok())
         .filter(|number| *number <= most)
-        .ok_or_else(|| format!("{value} is no register; {forms}"))
+        .ok_or_else(|| format!("{value} is not a register; {forms}"))
 }
 
 fn psg_register(value: &Value) -> Result<u16, String> {
@@ -529,7 +524,7 @@ fn captured_value(given: &Value) -> Result<(String, Vec<Segment>), String> {
     let processor: z80_t = unsafe { std::mem::zeroed() };
     match processor.get(&segments) {
         Ok(Value::Object(_) | Value::Array(_)) => Err(format!(
-            "{path} holds more than one value, and each is captured by a path of its own"
+            "{path} holds more than one value; capture each with a path of its own"
         )),
         Ok(_) => Ok((path.to_owned(), segments)),
         Err(problem) => Err(format!("{path}: {problem}")),
@@ -544,7 +539,9 @@ fn captured_span(given: &Value) -> Result<Span, String> {
         .keys()
         .find(|key| *key != "address" && *key != "length")
     {
-        return Err(format!("{given} has {unknown}, which a span does not take"));
+        return Err(format!(
+            "{given} has {unknown}; a span takes only address and length"
+        ));
     }
     let first = fields
         .get("address")
@@ -554,7 +551,9 @@ fn captured_span(given: &Value) -> Result<Span, String> {
         .get("length")
         .map_or(Some(1), Value::as_i64)
         .filter(|length| (1..=i64::from(CAPTURED_BYTES)).contains(length))
-        .ok_or_else(|| format!("{given} has a length that is not from 1 to {CAPTURED_BYTES}"))?;
+        .ok_or_else(|| {
+            format!("{given} has a length that is not an integer from 1 to {CAPTURED_BYTES}")
+        })?;
     Ok(Span {
         address: first,
         length: span(first, length)?,
@@ -570,7 +569,7 @@ fn capturing(given: &Value) -> Result<Capturing, String> {
         .find(|key| *key != "values" && *key != "memory")
     {
         return Err(format!(
-            "{given} has {unknown}, which capture does not take"
+            "{given} has {unknown}; capture takes only values and memory"
         ));
     }
     let list = |name: &str| {
@@ -582,7 +581,7 @@ fn capturing(given: &Value) -> Result<Capturing, String> {
         })?;
         if given.len() > MOST_CAPTURED {
             return Err(format!(
-                "{name} names {} things to capture, and takes at most {MOST_CAPTURED}",
+                "{name} names {} things to capture; give at most {MOST_CAPTURED}",
                 given.len()
             ));
         }
@@ -597,9 +596,43 @@ fn capturing(given: &Value) -> Result<Capturing, String> {
         .map(captured_span)
         .collect::<Result<Vec<_>, _>>()?;
     if values.is_empty() && memory.is_empty() {
-        return Err(format!("{given} names nothing to capture"));
+        return Err(format!("{given} captures nothing; give values or memory"));
     }
     Ok(Capturing { values, memory })
+}
+
+// A capture, kept once in a tool's $defs and named from each condition that
+// takes one.
+struct CaptureForms;
+
+impl JsonSchema for CaptureForms {
+    fn schema_name() -> Cow<'static, str> {
+        "Capture".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let span = json!({
+            "type": "object",
+            "properties": {
+                "address": generator.subschema_for::<AddressForms>(),
+                "length": { "type": "integer", "minimum": 1, "maximum": CAPTURED_BYTES },
+            },
+            "required": ["address"],
+            "additionalProperties": false,
+        });
+        let named =
+            |list: &str| json!({ "properties": { list: { "minItems": 1 } }, "required": [list] });
+        Schema::try_from(json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": "array", "maxItems": MOST_CAPTURED, "items": { "type": "string" } },
+                "memory": { "type": "array", "maxItems": MOST_CAPTURED, "items": span },
+            },
+            "additionalProperties": false,
+            "anyOf": [named("values"), named("memory")],
+        }))
+        .expect("an object is a schema")
+    }
 }
 
 // A condition, kept once in a tool's $defs, as until, gather and count all
@@ -619,26 +652,7 @@ impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
         let address = generator.subschema_for::<AddressForms>().to_value();
         let byte = generator.subschema_for::<ByteForms>().to_value();
         let register = |most: u16| json!({ "type": "integer", "minimum": 0, "maximum": most });
-        let span = json!({
-            "type": "object",
-            "properties": {
-                "address": address,
-                "length": { "type": "integer", "minimum": 1, "maximum": CAPTURED_BYTES },
-            },
-            "required": ["address"],
-            "additionalProperties": false,
-        });
-        let named =
-            |list: &str| json!({ "properties": { list: { "minItems": 1 } }, "required": [list] });
-        let capture = json!({
-            "type": "object",
-            "properties": {
-                "values": { "type": "array", "maxItems": MOST_CAPTURED, "items": { "type": "string" } },
-                "memory": { "type": "array", "maxItems": MOST_CAPTURED, "items": span },
-            },
-            "additionalProperties": false,
-            "anyOf": [named("values"), named("memory")],
-        });
+        let capture = CAPTURING.then(|| generator.subschema_for::<CaptureForms>().to_value());
         let condition = |kind: &str, other: &str, schema: &Value, required: &[&str]| {
             let mut branch = json!({
                 "type": "object",
@@ -646,7 +660,7 @@ impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
                 "required": required,
                 "additionalProperties": false,
             });
-            if CAPTURING {
+            if let Some(capture) = &capture {
                 branch["properties"]["capture"] = capture.clone();
             }
             branch
@@ -750,9 +764,9 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
     let &[&(name, kind)] = named.as_slice() else {
         let names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
         return Err(match names.split_last() {
-            None => format!("{value} names no kind"),
+            None => format!("{value} has no kind"),
             Some((last, rest)) => format!(
-                "{value} names {} and {last}, and a condition names one",
+                "{value} has more than one kind, {} and {last}; give one",
                 rest.join(", ")
             ),
         });
@@ -774,7 +788,9 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
             && !(takes_value(kind) && (*key == "value" || *key == "value_to"))
             && !(takes_changes(kind) && *key == "changes")
     }) {
-        return Err(format!("{value} has {unknown}, which {name} does not take"));
+        return Err(format!(
+            "{value} has {unknown}, which {name} conditions do not take"
+        ));
     }
     let first_value = fields
         .get("value")
@@ -788,15 +804,14 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         (None, None) => (0, 0xFF),
         (None, Some(_)) => {
             return Err(format!(
-                "{value} has value_to and no value, and a range of bytes runs from value to \
-                 value_to"
+                "{value} has value_to without value; give value too, or leave value_to out"
             ));
         }
         (Some(first), last) => (first, last.unwrap_or(first)),
     };
     if last_value < first_value {
         return Err(format!(
-            "{value} runs back from value {} to {}, and a range runs upward",
+            "{value} runs from value {} down to {}; a range must run upward",
             Hexadecimal::byte(first_value),
             Hexadecimal::byte(last_value)
         ));
@@ -806,7 +821,7 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         .map(|given| {
             given
                 .as_bool()
-                .ok_or_else(|| format!("changes {given} is neither true nor false"))
+                .ok_or_else(|| format!("changes is {given}; give true or false"))
         })
         .transpose()?
         .unwrap_or(false);
@@ -815,9 +830,7 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         .map(|given| {
             if list == COUNT {
                 return Err(
-                    "count counts each place by its first match and captures nothing; capture \
-                     in until or gather"
-                        .to_owned(),
+                    "count conditions take no capture; capture in until or gather".to_owned(),
                 );
             }
             capturing(given).map_err(|problem| format!("capture: {problem}; {CAPTURE_FORMS}"))
@@ -830,7 +843,7 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
                 .iter()
                 .find(|(name, _)| given.as_str() == Some(name))
                 .map(|(_, memory)| *memory)
-                .ok_or_else(|| format!("memory {given} is neither \"ram\" nor \"rom\""))
+                .ok_or_else(|| format!("memory is {given}; give \"ram\" or \"rom\""))
         })
         .transpose()?
         .unwrap_or(ANY_MEMORY);
@@ -852,7 +865,7 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
                 number => number.to_string(),
             };
             return Err(format!(
-                "{value} runs back from {} to {}, and a range runs upward",
+                "{value} runs from {} down to {}; a range must run upward",
                 shown(first),
                 shown(last)
             ));
@@ -886,12 +899,13 @@ fn conditions(
     };
     let listed = listed.as_array().ok_or_else(|| {
         format!(
-            "{field} is a list of conditions, as [{{\"execute\": \"&0038\"}}]; {CONDITION_FORMS}"
+            "{field} must be a list of conditions, such as [{{\"execute\": \"&0038\"}}]; \
+             {CONDITION_FORMS}"
         )
     })?;
     if listed.len() > MOST_CONDITIONS {
         return Err(format!(
-            "{field} has {} conditions, and takes at most {MOST_CONDITIONS}",
+            "{field} has {} conditions; give at most {MOST_CONDITIONS}",
             listed.len()
         ));
     }
@@ -954,8 +968,8 @@ fn watched_for(
     let named = watched.values.len() + watched.spans.len();
     if named > MOST_CAPTURED {
         return Err(format!(
-            "the captures of until and gather name {named} values and spans, each counted once, \
-             and take at most {MOST_CAPTURED} together"
+            "the captures of until and gather name {named} distinct values and spans; give at most \
+             {MOST_CAPTURED} together"
         ));
     }
     let bytes: u32 = watched
@@ -965,8 +979,8 @@ fn watched_for(
         .sum();
     if bytes > CAPTURED_BYTES {
         return Err(format!(
-            "the captures of until and gather read {bytes} bytes of memory, each span counted \
-             once, and take at most {CAPTURED_BYTES} together"
+            "the captures of until and gather read {bytes} bytes, each distinct span counted once; \
+             give at most {CAPTURED_BYTES} together"
         ));
     }
     let bits = |chosen: &mut dyn Iterator<Item = bool>| {
@@ -1009,23 +1023,18 @@ fn kept_as_asked(
 ) -> Result<(), String> {
     if gather.is_none() && count.is_none() && path.is_some() {
         return Err(
-            "path names the file gather and count write what they find to, and neither is \
-             given; give gather or count the conditions to watch, or leave path out"
+            "path is given without gather or count; give gather or count, or leave path out"
                 .to_owned(),
         );
     }
     if gather.is_none() && gather_last.is_some() {
         return Err(
-            "gather_last says which matches of gather are kept, and gather is not given; give \
-             gather the conditions to gather, or leave gather_last out"
-                .to_owned(),
+            "gather_last is given without gather; give gather, or leave gather_last out".to_owned(),
         );
     }
     if count.is_none() && count_by.is_some() {
         return Err(
-            "count_by says what count counts an access by, and count is not given; give count \
-             the conditions to count, or leave count_by out"
-                .to_owned(),
+            "count_by is given without count; give count, or leave count_by out".to_owned(),
         );
     }
     Ok(())
@@ -1239,8 +1248,8 @@ fn bytes(text: &str) -> Result<Vec<u8>, String> {
     });
     pairs.collect::<Option<Vec<u8>>>().ok_or_else(|| {
         format!(
-            "{text} is not bytes: bytes are written as pairs of hexadecimal digits, as 3E05C9 or \
-             3E 05 C9"
+            "{text} is not bytes; write bytes as pairs of hexadecimal digits, such as 3E05C9 or 3E \
+             05 C9"
         )
     })
 }
@@ -1251,7 +1260,7 @@ struct OpenRequest {
     /// The machine, by the name the emulator's command line gives it.
     #[schemars(schema_with = "machine_names")]
     machine: String,
-    /// A snapshot to load into the machine once it is built: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
+    /// A snapshot to load once the machine is built: a path on the server's file system. A relative path starts from the server's working directory.
     #[schemars(transform = absent_not_null)]
     snapshot: Option<PathBuf>,
 }
@@ -1263,17 +1272,17 @@ struct NoArguments {}
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CloseRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RunRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// How many times the monitor is to retrace, from 1 to 1500.
+    /// How many monitor retraces to run, 1 to 1500.
     #[schemars(range(min = 1, max = MOST_FRAMES))]
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1283,39 +1292,65 @@ struct RunRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
-    /// Conditions that stop the run at their first match. {"execute": address} stops before the instruction there begins; {"read": address} stops at the end of an instruction that reads the byte there as data, and {"write": address} at the end of one that writes it; each takes "to" and a last address for a range. {"in": port, "mask": bits} and {"out": port, "mask": bits} stop at the end of an instruction that reads or writes a port whose address agrees with the port on the bits of the mask, which are the bits its device decodes: {"out": "&7F00", "mask": "&C000"} is a CPC's Gate Array, and {"out": "&FE", "mask": "&01"} a Spectrum's ULA. {"execute": address} and {"read": address} also take "memory": "ram" or "rom", to match only an instruction or a byte the RAM holds, or only one a ROM holds: on a CPC, &0000 to &3FFF is the lower ROM's and &C000 to &FFFF an upper ROM's while the Gate Array enables each, and the RAM's while it does not; on a Spectrum, &0000 to &3FFF is the ROM's. On a CPC, {"psg": register} stops at the end of an instruction that writes one of the PSG's registers, numbered 0 to 15, and takes "to" and a last register for a range. The processor reaches the PSG through the PPI, and the emulator runs the PSG at each access to the PPI, by port C as the access leaves it, so while port C gives the PSG the function WRITE, each access to the PPI writes the selected register, an IN from the PPI and the PPI's bit set/reset written to its control port among them. {"crtc": register} stops at the end of an instruction that writes one of the 6845's registers, numbered as its address register names them, 0 to 31, of which 0 to 17 are the chip's, R16 and R17 keeping nothing written, and takes "to" and a last register for a range. The 6845 takes its direction from the port's address and not from the processor, so each access to a port whose address has A14 and A9 low and A8 high, &BDxx, writes the selected register, an IN among them, which the emulator gives the top half of its port's address, A for an IN A,(n); and each access to &BCxx, an IN among them, selects a register, which in and out on {"in": "&BC00", "mask": "&4300"} and {"out": "&BC00", "mask": "&4300"} match. Any but execute and in may take "value", a byte, and "value_to" and a last byte for a range, to match only an access whose byte is there, the byte read, written, or given to the register: {"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"} is the Gate Array told its mode, its ROMs and its interrupt counter. A port read's byte is not tested, on either machine, since a CPC holds the read over several ticks and the processor takes the byte the last of them leaves. write, psg and crtc may take "changes": true, to match only a write that leaves the byte or the register holding other than it held, as it holds it, so that a register keeps and compares only the bits it has; with value, {"write": "&C7EC", "value": 6, "changes": true} matches the write that makes the byte there 6, while a register's value is the byte given it, of which it may keep only some bits. An instruction's own bytes are never read as data. A run that begins where an execute condition matches runs that instruction first. Any of these, and of gather's, may take "capture": {"values": paths, "memory": spans}, one of the two or both, and each of its matches then carries in captured what the machine held: each of the processor's values a path names, as inspect reads it, under cpu, a register by itself as the emulator's z80_t holds it, as "cpu.a", "cpu.h" or "cpu.ixh"; and each span, {"address": address, "length": bytes}, from 1 to 64 bytes, 1 if length is not given and none past &FFFF, as peek reads it. An instruction about to begin captures the machine it finds. An access captures the machine as the instruction that made it, or the response to an interrupt that made it, leaves it at its end, every access of one instruction alike: before the response to an interrupt taken there, which until's stop runs through, though the processor has taken the interrupt already, clearing IFF1, and for INT IFF2 as well, and the emulator's machinery for the processor, such as cpu.q, cpu.accepting and cpu.step, stands as the response begins, or for an NMI set has written in, two of the processor's ticks into it. A match of several conditions captures what each names. A request's captures name at most 16 values and spans together and read at most 64 bytes, each counted once. At most 16.
+    /// Conditions that stop the run at the first match; at most 16. The kinds:
+    /// - `{"execute": address}` stops before an instruction that starts at that address. It matches only where an instruction starts: an address the processor passes only as part of a longer instruction does not match. A run that starts at that address runs that instruction first.
+    /// - `{"read": address}` and `{"write": address}` stop at the end of an instruction that reads the byte there as data, or writes it. An instruction's own bytes are never data.
+    /// - `{"in": port, "mask": bits}` and `{"out": port, "mask": bits}` stop at the end of an instruction that reads or writes a port whose address matches `port` on the bits set in `mask`, the bits the device decodes: `{"out": "&7F00", "mask": "&C000"}` is a CPC's Gate Array, `{"out": "&FE", "mask": "&01"}` a Spectrum's ULA.
+    /// - `{"psg": register}`, CPC only, 0 to 15, stops at the end of an instruction that writes that PSG register. The emulator writes the selected register at every access to the PPI while port C gives the PSG the function WRITE.
+    /// - `{"crtc": register}`, CPC only, 0 to 31 (the 6845 has 0 to 17), stops at the end of an instruction that writes that 6845 register. Every access to a port with A14 and A9 low and A8 high, such as &BDxx, writes the selected register, an IN included, which gives it the top half of the port's address.
+    ///
+    /// The options:
+    /// - `"to"`: a last address or register, for a range (execute, read, write, psg, crtc).
+    /// - `"memory": "ram"` or `"rom"` (execute, read): match only bytes the RAM holds, or only bytes a ROM holds. On a CPC the lower ROM covers &0000 to &3FFF and an upper ROM &C000 to &FFFF, each while the Gate Array enables it; on a Spectrum the ROM covers &0000 to &3FFF.
+    /// - `"value"`, with `"value_to"` for a range (all but execute and in): match only when the byte read, written or given to the register is in that range. `{"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"}` matches the writes that set the Gate Array's mode, ROMs and interrupt counter.
+    /// - `"changes": true` (write, psg, crtc): match only a write that changes the byte, or the bits the register keeps. `{"write": "&C7EC", "value": 6, "changes": true}` is the write that makes that byte 6.
+    /// - `"capture": {"values": paths, "memory": spans}` (until and gather): each match then has a `captured` field with what the machine held. A path names one of the processor's values under `cpu`, as `inspect` names it: HL is `cpu.h` and `cpu.l`, IX is `cpu.ixh` and `cpu.ixl`, and the alternate set is held in pairs, as `cpu.hl_`. A span is `{"address": address, "length": bytes}`, 1 to 64 bytes (1 if `length` is omitted), none past &FFFF. An execute captures before its instruction runs. An access captures at the end of the instruction that made it, before any interrupt response there (IFF1 is already clear then); an access made by an interrupt response captures at the response's end. A request's captures may name at most 16 distinct values and spans together, reading at most 64 bytes.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the run goes, written as until's are, capture and all, the instruction the run begins on among them, which until never stops before. The run stops at the end of the instruction that makes the 128th match, the 32nd where one of these captures, or with path, capturing or not, the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too; the next run gathers on from there. Not so with gather_last. At most 16.
+    /// Conditions, written like `until`'s, whose matches are listed as the run goes; a match at the instruction the run starts on is included. At most 16.
+    /// - On a CPC a match says which memory held its byte or instruction where the address alone does not: `"rom": "lower"` or `"upper 7"`, or `"ram"`, the RAM's own address. `"pc_rom"` and `"pc_ram"` say the same for the instruction that made an access.
+    /// - The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches. The limit is 32 when one of gather's conditions captures, and 1048576 with `path`, capturing or not. The next run continues from there.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last matches rather than the first, as many as it fills at, 128, 32 where one of its conditions captures, or with path, capturing or not, 1048576: true runs on past them and lists those gathered last, in the order they happened, so that a run stopped by until, or at its end, says what led there. false if not given, and refused without gather.
+    /// `true` keeps the last matches instead of the first, as many as the limit, in order, and runs on past the limit, so a run stopped by `until`, or at its end, shows what led there. Default `false`; refused without `gather`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the run goes, by the place each matched: an instruction begun at an address, a byte read or written there, a port read or written, by the whole of its address, whatever bits its condition's mask decodes, a register of the PSG or the 6845 written, or with count_by "pc", an access by the instruction that made it. A place in memory is a byte of it, so that on a CPC the lower ROM's &0038, with rom saying so, and the RAM's are two places, and a byte the processor reaches at two addresses, as a 6128's RAM configurations can page one, is one place, told by the address of its first match; counted by pc, an access is counted by the byte of memory its instruction began at. Written as until's are, save that they take no capture, they count every instruction begun in a range with {"execute": "&4000", "to": "&BFFF"}. The run stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too; the next run counts afresh from there. With path, a count never fills, and counts every place the run's frames or ticks reach. At most 16.
+    /// Conditions, written like `until`'s but without `capture`, whose matches are counted by place; at most 16. Each place is listed once with its count and its first match, and an instruction also with the bytes it first ran with. Each of these is a place of its own:
+    /// - an instruction started at a byte of memory,
+    /// - a byte of memory read,
+    /// - a byte of memory written,
+    /// - a port read, by its whole address,
+    /// - a port written, by its whole address,
+    /// - a register of the PSG or the 6845 written.
+    ///
+    /// On a CPC a place in memory is a byte of RAM or ROM, not an address: a ROM's byte and the RAM's byte at the same address are 2 places, and a byte of RAM a 6128 pages in at 2 addresses is 1 place, listed at the address the processor first reached it at. `{"execute": "&4000", "to": "&BFFF"}` counts every instruction run in that range. The run stops at the end of the instruction that adds the 256th place; the next run counts afresh. With `path`, the number of places never stops the run.
     #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
-    /// What count counts an access by: "address", the byte's address, the port's, or the number of the PSG's or the 6845's register, or "pc", where the instruction that made the access begins, so that a count of the writes over a screen says which instructions wrote it and how many times each did. An instruction begun is counted by its address either way, and by pc, an access made by the response to an interrupt, which no instruction made, is not counted. "address" if not given, and refused without count.
+    /// `"address"` (the default) counts an access by its place; `"pc"` counts it by the byte of memory where the instruction that made it starts, so a count of writes to the screen shows which instructions wrote it and how often. Instructions run are counted by address either way. With `"pc"`, accesses made by an interrupt response are not counted. Refused without `count`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
-    /// Keys held down from the run's start to its end, on top of whatever the keyboard holds, which it holds again afterwards. Each is named as colophon-player names it, as the key is printed: on a CPC "SPACE", "Q", "RETURN", "COPY", "f5", "↑", or "(FIRE 2)" for joystick 0's main button, whose others are "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)" and "(SPARE)", joystick 1 being wired to keys that carry digits and letters; on a Spectrum "CAPS", "SYM", "ENTER", "SPACE", "Q". A CPC's key may also be given by its number, 0 to 79, as the firmware numbers it, its line of the matrix times eight and its bit. An unknown key is refused with the names there are. A program that reads its keyboard only now and then can miss a key held for less than the time between its readings.
+    /// Keys held down from the start of the run to its end, on top of what the keyboard already holds; afterwards the keyboard goes back to what it held. Names are colophon-player's, as printed on the keys; for example:
+    /// - CPC: "SPACE", "Q", "RETURN", "SHIFT", "CTRL", "COPY", "f5", "↑", and for joystick 0 "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)", "(SPARE)" and "(FIRE 2)", its main button. A CPC key may also be given by its firmware number, 0 to 79: its matrix line times 8 plus its bit.
+    /// - Spectrum: "CAPS", "SYM", "ENTER", "SPACE", "Q".
+    ///
+    /// An unknown key is refused with the list of names. A program that reads the keyboard only now and then can miss a key held for less than the time between its reads.
     #[schemars(schema_with = "keys_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<Value>>,
-    /// A file to write what gather and count find to, in place of the answer's gathered and counted, for a client to read with tools of its own: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory, which the answer and the journal name absolute. A path that names a file already, or a directory that is not there, is refused before the run begins. Each line of the file is a JSON object and ends in a newline: first each match gathered, in the order it happened, then each place counted, in counted's order, each as the answer would list it, after "list": "gather" or "count", the list it belongs to. The file stands at its path from before the run, empty, and holds what it is to hold once the answer names it by its SHA-256, so a client reads it after the answer. One that cannot be written whole after the run is taken away again, and the run, which is not taken back, is refused with where the machine stands, and journaled without the file. Refused without gather or count.
+    /// A new file to receive what `gather` and `count` find, instead of the answer's lists, for the client to read with its own tools: a path on the server's file system, a relative one starting from the server's working directory. Each line is a JSON object, first the matches, then the places, each as the answer would list it, starting with `"list": "gather"` or `"count"`. The file is complete once the answer gives its SHA-256. Refused if the file exists or its directory does not, and without `gather` or `count`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
@@ -1324,50 +1359,50 @@ struct RunRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct CallRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// Where the routine begins.
+    /// Where the routine starts.
     #[schemars(schema_with = "address_schema")]
     address: Value,
-    /// Values to write first, by their paths, as set writes them: {"cpu.a": 1, "cpu.h": 64, "cpu.l": 0}.
+    /// Values to write first, by path, as `set` writes them: `{"cpu.a": 1, "cpu.h": 64, "cpu.l": 0}`.
     #[schemars(schema_with = "values_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     values: Option<Map<String, Value>>,
-    /// How many times the monitor may retrace before the call stops waiting for the routine to return, from 1 to 1500; 1500 if not given.
+    /// The most frames the call waits for the routine to return, 1 to 1500. Default 1500.
     #[schemars(range(min = 1, max = MOST_FRAMES))]
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<i64>,
-    /// Conditions that stop the call at their first match, written as run's until takes them, capture and all. The routine's first instruction is never stopped before. At most 16.
+    /// Like `run`'s `until`. The routine's first instruction is never stopped before. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
-    /// Conditions whose matches are gathered as the call goes, written as run's until takes them, capture and all. The call stops at the end of the instruction that makes the 128th match, the 32nd where one of these captures, or with path, capturing or not, the 1048576th, keeping that instruction's other matches, and those of the response to an interrupt taken at its end, too. Not so with gather_last. At most 16.
+    /// Like `run`'s `gather`. At most 16.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather: Option<Value>,
-    /// Whether gather keeps the last matches rather than the first, as run's gather_last keeps them. false if not given, and refused without gather.
+    /// Like `run`'s `gather_last`. Default `false`; refused without `gather`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     gather_last: Option<bool>,
-    /// Conditions whose matches are counted as the call goes, by the place each matched, as run's count counts them, and which take no capture. The call stops at the end of the instruction that counts at the 256th place, counting the rest of that instruction, and of the response to an interrupt taken at its end, too. With path, a count never fills. At most 16.
+    /// Like `run`'s `count`. At most 16.
     #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
-    /// What count counts an access by, as run's count_by says. "address" if not given, and refused without count.
+    /// Like `run`'s `count_by`. Default `"address"`; refused without `count`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
-    /// A file to write what gather and count find to, in place of the answer's gathered and counted, as run's path takes it. A path that names a file already, or a directory that is not there, is refused before the call begins, and a call refused takes the file made for it away again.
+    /// Like `run`'s `path`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
@@ -1376,10 +1411,10 @@ struct CallRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TypeRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// What to type: "PRINT 2+2\n" on a CPC, "p2+2\n" on a Spectrum, whose ROM reads a letter typed where the cursor shows K as a keyword.
+    /// What to type: `"PRINT 2+2\n"` on a CPC, `"p2+2\n"` on a Spectrum.
     text: String,
 }
 
@@ -1387,30 +1422,28 @@ struct TypeRequest {
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum CountBy {
-    /// The byte's address, the port's, or the PSG's or the 6845's register's number.
     Address,
-    /// Where the instruction that made the access begins.
     Pc,
 }
 
 // A CPC's two drives, as AMSDOS names them.
 #[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
 enum Drive {
-    /// The machine's own drive, of one head.
+    /// The machine's own drive, single-headed.
     A,
-    /// A second drive, of two heads.
+    /// A second drive, double-headed.
     B,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiscRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// The disc image: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
+    /// The disc image: a path on the server's file system. A relative path starts from the server's working directory.
     path: PathBuf,
-    /// The drive the disc goes into; A if not given.
+    /// The drive. Default A.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<Drive>,
@@ -1419,44 +1452,44 @@ struct DiscRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TapeRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// The tape image: its path on the file system the server runs on, a relative one read from the server's working directory, which the answer and the journal name absolute.
+    /// The tape image: a path on the server's file system. A relative path starts from the server's working directory.
     path: PathBuf,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SaveRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// Where to write the snapshot: a path on the file system the server runs on that names no file yet, a relative one from the server's working directory, which the answer names absolute.
+    /// Where to write the snapshot: a path on the server's file system that names no file yet. A relative path starts from the server's working directory.
     path: PathBuf,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct KeepRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StateRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The state, by the name state_keep gave it.
+    /// The state's name, as `state_keep` returned it.
     state: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JournalRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The first entry to answer, counting from 0; 0 if not given.
+    /// The first entry to return, counting from 0. Default 0.
     #[schemars(range(min = 0))]
     #[schemars(transform = absent_not_null)]
     from: Option<i64>,
@@ -1465,10 +1498,10 @@ struct JournalRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct StepRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// How many instructions to run, from 1 to 100000; 1 if not given.
+    /// How many instructions to run, 1 to 100000. Default 1.
     #[schemars(range(min = 1, max = MOST_INSTRUCTIONS))]
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1478,9 +1511,9 @@ struct StepRequest {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InspectRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// What to read, as a C expression names it on the machine's struct: cpu.pc, crtc.registers[12], fdc.units[0]. The whole machine if not given.
+    /// What to read. Default: the whole machine.
     #[schemars(transform = absent_not_null)]
     path: Option<String>,
 }
@@ -1488,10 +1521,10 @@ struct InspectRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SetRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// Each value to write, by its path: {"cpu.pc": "&4000", "gate_array.inks[16]": 20}. A structure takes an object of some of its fields and an array an array of all its elements.
+    /// Each value to write, by path: `{"cpu.pc": "&4000", "gate_array.inks[16]": 20}`. A structure takes an object with some of its fields; an array takes an array of all its elements.
     #[schemars(schema_with = "values_schema")]
     values: Map<String, Value>,
 }
@@ -1499,19 +1532,19 @@ struct SetRequest {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PeekRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The first address to read, as the processor reaches it, through the banking and the ROMs. Give this or ram.
+    /// The first address, as the processor reads it. Give this or `ram`.
     #[schemars(schema_with = "address_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     address: Option<Value>,
-    /// The first address to read in a CPC's RAM, by the RAM's own addresses, as screen's base counts them, whatever is paged in: a 6128's second 64K is &10000 to &1FFFF. Give this or address.
+    /// The first address in a CPC's RAM, by the RAM's own addresses. Give this or `address`.
     #[schemars(schema_with = "ram_address_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     ram: Option<Value>,
-    /// How many bytes to read, from 1 to 4096, none of them past &FFFF, or for ram past the end of the machine's RAM; 1 if not given.
+    /// How many bytes, 1 to 4096, none past &FFFF, or with `ram` past the end of the RAM. Default 1.
     #[schemars(range(min = 1, max = MOST_BYTES))]
     #[schemars(transform = absent_not_null)]
     length: Option<i64>,
@@ -1520,53 +1553,53 @@ struct PeekRequest {
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PokeRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
     /// The first address to write.
     #[schemars(schema_with = "address_schema")]
     address: Value,
-    /// The bytes to write, as pairs of hexadecimal digits: 3E05C9, or 3E 05 C9. From 1 to 4096 of them, none past &FFFF.
+    /// The bytes, as pairs of hexadecimal digits: `3E05C9` or `3E 05 C9`. 1 to 4096 bytes, none past &FFFF.
     bytes: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MonitorRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ScreenRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// Where the bytes of the picture are; video if not given.
+    /// The layout of the bytes. Default `video`.
     #[schemars(transform = absent_not_null)]
     reading: Option<Reading>,
-    /// The address the first byte is read from, in the RAM: for the video reading a display start, at the start of a 16K page or up to 2K into it, and for linear and columns any address in the machine's RAM. The 6845's start address, from R12 and R13, if not given. A base given is an address and cannot carry what R12's bits 3 and 2 tell the 6845, which carry a row on past its 2K into the next 16K, as a screen of 32K does; left out, the base is read with them.
+    /// The RAM address of the first byte. For `video`, a display start at the start of a 16K page or up to 2K into it, in the base 64K; for `linear` and `columns`, any RAM address, a 6128's second 64K being &10000 to &1FFFF. Default: the 6845's start, from R12 and R13. A base given reads as if R12's bits 3 and 2 were clear, so only the default carries a 32K screen on into the next 16K.
     #[schemars(schema_with = "ram_address_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     base: Option<Value>,
-    /// Bytes across, from 1 to 128. Twice the characters the 6845 displays across, R1, if not given. In the video reading a row of characters is this many bytes on from the last, as R1 sets it on the machine, so a width other than the machine's is no crop of its screen.
+    /// Bytes across, 1 to 128. Default: twice R1. In `video` it also spaces the character rows, so a width other than the machine's does not crop its screen.
     #[schemars(range(min = 1, max = MOST_WIDTH))]
     #[schemars(transform = absent_not_null)]
     width: Option<i64>,
-    /// Lines down, from 1 to 512. The rows the 6845 displays, R6, times the lines of a row, rasters, if not given.
+    /// Lines down, 1 to 512. Default: R6 times `rasters`.
     #[schemars(range(min = 1, max = MOST_HEIGHT))]
     #[schemars(transform = absent_not_null)]
     height: Option<i64>,
-    /// Lines in a character row, from 1 to 32, read by the video reading alone. R9 and one if not given.
+    /// Lines per character row, 1 to 32, for `video` only. Default: R9 plus 1.
     #[schemars(range(min = 1, max = MOST_RASTERS))]
     #[schemars(transform = absent_not_null)]
     rasters: Option<i64>,
-    /// How a byte becomes pixels: 0 for two of sixteen pens, 1 for four of four, 2 for eight of two, 3 for two of four. The mode the Gate Array is drawing in if not given.
+    /// How a byte becomes pixels: 0 for 2 pixels of 16 pens, 1 for 4 of 4, 2 for 8 of 2, 3 for 2 of 4. Default: the mode the Gate Array is drawing in, `gate_array.mode`.
     #[schemars(range(min = 0, max = 3))]
     #[schemars(transform = absent_not_null)]
     mode: Option<i64>,
-    /// Sixteen hardware colour codes, 0 to 31, one for each pen in order, as inspect reads the first sixteen of gate_array.inks. The sixteen inks the Gate Array holds if not given.
+    /// 16 hardware colour codes, 0 to 31, pen by pen, as `gate_array.inks` holds them. Default: the Gate Array's inks.
     #[schemars(length(equal = 16), inner(range(min = 0, max = 31)))]
     #[schemars(transform = absent_not_null)]
     palette: Option<Vec<i64>>,
@@ -1575,12 +1608,12 @@ struct ScreenRequest {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DisassembleRequest {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// Where the first instruction begins.
+    /// Where the first instruction starts.
     #[schemars(schema_with = "address_schema")]
     address: Value,
-    /// How many instructions to list, from 1 to 256; 16 if not given.
+    /// How many instructions, 1 to 256. Default 16.
     #[schemars(range(min = 1, max = MOST_INSTRUCTIONS_LISTED))]
     #[schemars(transform = absent_not_null)]
     instructions: Option<i64>,
@@ -1588,11 +1621,11 @@ struct DisassembleRequest {
 
 #[derive(Serialize, JsonSchema)]
 struct Standing {
-    /// The handle the server gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// The states kept from it, in the order they were kept, if any are.
+    /// The states kept from the machine, in the order they were kept. Not given when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     states: Vec<StateHeld>,
 }
@@ -1601,7 +1634,7 @@ struct Standing {
 struct StateHeld {
     /// The state's name.
     state: String,
-    /// The machine's tick as it was kept.
+    /// The machine's tick when the state was kept.
     tick: u64,
 }
 
@@ -1611,25 +1644,25 @@ struct Opened {
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// Every file the machine was built from, firmware first and the snapshot last, each named by what it held.
+    /// Every file the machine was built from, with the SHA-256 of what it held: the firmware first, the snapshot last.
     files: Vec<FileRead>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Listing {
-    /// The machines standing, in the order they were opened.
+    /// The open machines, in the order they were opened.
     machines: Vec<Standing>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Inserted {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The drive the disc went into.
+    /// The drive the disc went into. Not given for a tape.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     drive: Option<Drive>,
-    /// The machine's tick as it went in.
+    /// The machine's tick when the disc or tape went in.
     tick: u64,
     #[serde(flatten)]
     file: FileRead,
@@ -1637,63 +1670,63 @@ struct Inserted {
 
 #[derive(Serialize, JsonSchema)]
 struct Saved {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The machine's tick as it was saved.
+    /// The machine's tick when the snapshot was saved.
     tick: u64,
-    /// Where the snapshot was written, an absolute path.
+    /// The absolute path the snapshot was written to.
     path: PathBuf,
-    /// The SHA-256 of what was written, in hexadecimal.
+    /// The SHA-256 of the file written, in hexadecimal.
     sha256: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Kept {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The state's name, which no other state of this server's is given.
+    /// The state's name. No other state on this server is ever given it.
     state: String,
-    /// The machine's tick as it was kept.
+    /// The machine's tick when the state was kept.
     tick: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Restored {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The state restored.
+    /// The name of the state restored.
     state: String,
-    /// The machine's tick, the state's.
+    /// The machine's tick, as the state holds it.
     tick: u64,
-    /// The program counter, in hexadecimal after &: where the next instruction is fetched.
+    /// The program counter, in hexadecimal after &: the address the next instruction is fetched from.
     pc: Hexadecimal,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Dropped {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
-    /// The state dropped, whose name names nothing now.
+    /// The name of the state dropped. It no longer names a state.
     state: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Journal {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// The build the machine ran on, as the server names itself.
+    /// The build the machine ran on, as the server's `serverInfo.version` names it.
     build: String,
-    /// Every file the machine was built from, firmware first and the snapshot last, each named by what it held.
+    /// Every file the machine was built from, with the SHA-256 of what it held: the firmware first, the snapshot last.
     files: Vec<FileRead>,
-    /// How many entries the journal holds.
+    /// The number of entries in the journal.
     count: usize,
-    /// The first entry answered, counting from 0.
+    /// The index of the first entry given, counting from 0.
     from: usize,
     /// The entries, in the order their requests were made.
     entries: Vec<Entry>,
-    /// Where the next page begins, if the journal runs on past this one.
+    /// The `from` of the next page. Not given on the last page.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     next: Option<usize>,
@@ -1701,96 +1734,104 @@ struct Journal {
 
 #[derive(Serialize, JsonSchema)]
 struct Closed {
-    /// The handle the machine had, which names nothing now.
+    /// The handle the machine had. It no longer names a machine.
     handle: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum Stopped {
-    /// The monitor retraced as many times as was asked.
+    /// The monitor retraced `frames` times.
     Frames,
-    /// The limit came before the frames did.
+    /// The monitor retraced fewer than `frames` times within the limit: twice a standard frame's ticks for each frame asked.
     Limit,
-    /// The ticks asked for were run.
+    /// All the ticks asked for were run.
     Ticks,
-    /// The instructions asked for were run.
+    /// All the instructions asked for were run.
     Instructions,
-    /// The text was typed, each key held and let go.
+    /// The text was typed: each key was pressed and released.
     Typed,
-    /// An instruction did not end in the longest any instruction takes, as a chain of prefixes does not, and the machine stands inside it.
+    /// The run ended inside an instruction, and `settled` is false: the instruction did not end within the longest time any instruction takes. Only a chain of prefixes runs that long.
     Unsettled,
-    /// A condition of until matched.
+    /// One of `until`'s conditions matched. `matched` lists the matches.
     Matched,
-    /// The gathering came to 128 matches, 32 where one of gather's conditions captures, or to 1048576 written to a file, capturing or not, or the count to 256 places, and holds the rest of the instruction that filled it as well, and of the response to an interrupt taken at its end. A gathering of the last matches never fills, nor does a count written to a file.
+    /// `gather` or `count` reached its limit. The run stopped at the end of the instruction that reached it, keeping that instruction's other matches and those of an interrupt response taken at its end. With `gather_last`, `gather` never fills; with `path`, `count` never fills. The limits:
+    /// - `gather`: 128 matches, 32 when one of its conditions captures, or 1048576 with `path`, capturing or not.
+    /// - `count`: 256 places.
     Full,
-    /// The processor halted on HALT with interrupts disabled, where it waits for good: IFF1 shuts out INT, and nothing on either machine raises the NMI that would wake it. A run from here runs as asked, halted throughout, unless set has written in an NMI; call wakes the processor for its routine alone, and set or state_restore takes it past the HALT.
+    /// The processor executed a HALT with interrupts disabled and would wait there forever: IFF1 is clear, so INT is ignored, and neither machine raises an NMI. From here:
+    /// - Another run runs as asked, halted throughout, unless `set` has written in an NMI.
+    /// - `call` wakes the processor for its routine, and halts it again if the routine returns within the call.
+    /// - `set` takes it past the HALT by writing `cpu.halted` as false, and so does `state_restore` of a state kept before the HALT.
     Halted,
-    /// The routine called returned.
+    /// The called routine returned.
     Returned,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Matched {
-    /// The machine's tick: as an instruction is about to begin, or once the tick that put an access on the bus has run.
+    /// The machine's tick: for an `execute` match, just before the instruction begins; for an access, just after the tick that put it on the bus.
     tick: u64,
-    /// An instruction about to begin, by its address, in hexadecimal after &.
+    /// The address of an instruction about to begin, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     execute: Option<Hexadecimal>,
-    /// A byte the program read as data, by its address, in hexadecimal after &.
+    /// The address of a byte the program read as data, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     read: Option<Hexadecimal>,
-    /// A byte the processor wrote, by its address, in hexadecimal after &.
+    /// The address of a byte the processor wrote, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     write: Option<Hexadecimal>,
-    /// A port the processor read, by its address, in hexadecimal after &.
+    /// The address of a port the processor read, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     r#in: Option<Hexadecimal>,
-    /// A port the processor wrote, by its address, in hexadecimal after &.
+    /// The address of a port the processor wrote, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     out: Option<Hexadecimal>,
-    /// One of a CPC's PSG registers written, by its number, from 0 to 15.
+    /// The number of a CPC's PSG register written, 0 to 15.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
-    /// One of a CPC's 6845 registers written, by the number its address register holds, from 0 to 31, of which 0 to 17 are the chip's.
+    /// The number of a CPC's 6845 register written, 0 to 31 (the 6845 has 0 to 17), as its address register holds it.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     crtc: Option<u16>,
-    /// On a CPC, the ROM that held the instruction or answered the read: "lower", or "upper" and its number, a number with no upper ROM fitted selecting ROM 0. Not given where the RAM held the byte.
+    /// On a CPC, the ROM that held the instruction or answered the read: `"lower"`, or `"upper N"` for upper ROM N, such as `"upper 7"`. When the selected upper ROM is not fitted, ROM 0 answers, named `"upper 0"`. Not given when the RAM held the byte, nor for a write, which reaches the RAM beneath an enabled ROM.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     rom: Option<String>,
-    /// On a CPC, where the RAM holds the byte, by the RAM's own addresses as peek's ram counts them, where that is not the address the processor reached it at: a 6128's RAM configurations page in its second 64K's blocks, and its base 64K's &C000 to &FFFF at &4000. Not given where it is, or where a ROM held the byte; a write reaches the RAM beneath an enabled ROM.
+    /// On a CPC, the byte's address in the RAM, as `peek`'s `ram` counts it. Given only when the RAM held the byte at an address other than the one the processor reached it at. That happens only on a 6128, when its RAM configuration pages in 16K blocks of its second 64K, or puts its base 64K's &C000 to &FFFF at &4000.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     ram: Option<Hexadecimal>,
-    /// The byte read or written, in hexadecimal after &; for a port read, the byte the processor took; for a register of the PSG, the byte the PPI's port A gave it, of which a register narrower than eight bits keeps only its low bits, as psg.registers then reads; for a register of the 6845, the byte on the bus, or for an IN the top half of the port's address, of which crtc.registers keeps as many bits as the register has.
+    /// The byte read or written, in hexadecimal after &. Not given for an `execute` match. For these kinds it is:
+    /// - A port read: the byte the processor took.
+    /// - A PSG register: the byte the PPI's port A gave it. `psg.registers` keeps only as many low bits as the register has.
+    /// - A 6845 register: the byte on the bus, or for an IN the top half of the port's address. `crtc.registers` keeps as many bits as the register has.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     value: Option<Hexadecimal>,
-    /// Where the instruction that made the access begins, in hexadecimal after &; not given for an instruction about to begin, whose address is its own, or when the response to an interrupt made the access.
+    /// The address of the instruction that made the access, in hexadecimal after &. Not given for an `execute` match, whose `execute` is that address, nor for an access made by an interrupt response.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc: Option<Hexadecimal>,
-    /// On a CPC, the ROM that held the instruction that made the access, as rom names it; not given where the RAM held it, or where pc is not given.
+    /// On a CPC, the ROM that held the instruction at `pc`, in the same form as `rom`. Not given when the RAM held the instruction, or when `pc` is not given.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc_rom: Option<String>,
-    /// On a CPC, where the RAM holds the instruction that made the access, as ram gives it, where that is not pc; not given where it is, where a ROM held it, or where pc is not given.
+    /// On a CPC, the address in the RAM of the instruction at `pc`, as `ram` gives it. Given only when `pc` is, and the RAM held the instruction at an address other than `pc`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc_ram: Option<Hexadecimal>,
-    /// The monitor's beam across its line, as monitor.beam_x counts it, in samples: a line's picture is monitor.width of them, and the count runs on past it until a sync ends the line.
+    /// The beam's position across its line, as `monitor.beam_x` counts it, in samples. Samples 0 to `monitor.width` minus 1 make the line in the raster, which `monitor`'s picture crops. The count continues past them until a sync ends the line.
     beam_x: u16,
-    /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines, of which monitor.height make a frame.
+    /// The beam's line, as `monitor.beam_y` counts it, 0 to `monitor.height` minus 1 unless `set` has written it higher. In a frame longer than that, the beam stays on the last line until the retrace.
     beam_y: u16,
-    /// What the conditions it matched name in their captures, each once, taken at the moment run's until describes. Not given where none of them captures, nor for an access whose instruction a run ends inside, unsettled, which a run does only where set has written the emulator's machinery for the processor.
+    /// What the `capture` options of the matched conditions name, each once, read at the moment `run`'s `until` describes for `capture`. Not given when none of those conditions captures. Not given for an access made by an instruction that had not ended when the run did (`settled` false). Only an instruction that `set` wrote into the emulator's machinery for the processor can make such an access.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     captured: Option<Captured>,
@@ -1798,18 +1839,18 @@ struct Matched {
 
 #[derive(Serialize, JsonSchema)]
 struct Captured {
-    /// Each of the processor's values named, by its path, as inspect reads it, in the order until's conditions, then gather's, first name them; not given where none is named.
+    /// Each of the processor's values named, by its path, as `inspect` reads it. In the order the conditions first name them, `until`'s before `gather`'s. Not given when none is named.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     #[schemars(schema_with = "values_schema")]
     values: Map<String, Value>,
-    /// Each span of memory named, as peek reads it, in the order until's conditions, then gather's, first name them; not given where none is named.
+    /// Each span of memory named, as `peek` reads it. In the order the conditions first name them, `until`'s before `gather`'s. Not given when none is named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     memory: Vec<CapturedSpan>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct CapturedSpan {
-    /// The span's first address, as the processor reaches it, in hexadecimal after &.
+    /// The span's first address, as the processor reads it, in hexadecimal after &.
     address: Hexadecimal,
     /// The bytes, as pairs of hexadecimal digits.
     bytes: String,
@@ -1941,61 +1982,61 @@ impl Matched {
 // A place counted, told by its first match.
 #[derive(Serialize, JsonSchema)]
 struct Counted {
-    /// The machine's tick at the place's first match: as the instruction was about to begin, or once the tick that put the access on the bus had run.
+    /// The machine's tick at the place's first match: for an `execute` place, just before the instruction began; for an access, just after the tick that put it on the bus.
     tick: u64,
-    /// Where instructions began, in hexadecimal after &.
+    /// The address where the counted instructions began, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     execute: Option<Hexadecimal>,
-    /// A byte the program read as data, by its address, in hexadecimal after &; counted by pc, the address of the place's first match.
+    /// The address of a byte the program read as data, in hexadecimal after &. With `count_by` `"pc"`, the address at the place's first match. Later matches may have read others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     read: Option<Hexadecimal>,
-    /// A byte the processor wrote, by its address, in hexadecimal after &; counted by pc, the address of the place's first match.
+    /// The address of a byte the processor wrote, in hexadecimal after &. With `count_by` `"pc"`, the address at the place's first match. Later matches may have written others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     write: Option<Hexadecimal>,
-    /// A port the processor read, by its address, in hexadecimal after &; counted by pc, the port of the place's first match.
+    /// The address of a port the processor read, in hexadecimal after &. With `count_by` `"pc"`, the port at the place's first match. Later matches may have read others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     r#in: Option<Hexadecimal>,
-    /// A port the processor wrote, by its address, in hexadecimal after &; counted by pc, the port of the place's first match.
+    /// The address of a port the processor wrote, in hexadecimal after &. With `count_by` `"pc"`, the port at the place's first match. Later matches may have written others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     out: Option<Hexadecimal>,
-    /// One of a CPC's PSG registers written, by its number, from 0 to 15; counted by pc, the register of the place's first match.
+    /// The number of a CPC's PSG register written, 0 to 15. With `count_by` `"pc"`, the register at the place's first match. Later matches may have written others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     psg: Option<u16>,
-    /// One of a CPC's 6845 registers written, by the number its address register holds, from 0 to 31; counted by pc, the register of the place's first match.
+    /// The number of a CPC's 6845 register written, 0 to 31 (the 6845 has 0 to 17), as its address register holds it. With `count_by` `"pc"`, the register at the place's first match. Later matches may have written others.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     crtc: Option<u16>,
-    /// On a CPC, the ROM that held the instruction or answered the read, as a match's rom names it, which counted by address is part of the place; not given where the RAM held the byte.
+    /// On a CPC, the ROM that held the instruction or answered the read, in the same form as a match's `rom`. Not given when the RAM held the byte, nor for a write. With `count_by` `"address"`, it is part of the place: the same address in another ROM or in the RAM is another place.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     rom: Option<String>,
-    /// On a CPC, where the RAM holds the byte, as a match's ram gives it, which counted by address is part of the place; not given where that is the address the processor reached it at, or where a ROM held the byte.
+    /// On a CPC, the byte's address in the RAM, as a match's `ram` gives it. Given only when the RAM held the byte at an address other than the one the processor reached it at. With `count_by` `"address"`, it is part of the place.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     ram: Option<Hexadecimal>,
-    /// Where the instruction that made the place's first match begins, in hexadecimal after &, which counted by pc is the place itself; not given for instructions, whose address is their own, or when the response to an interrupt made the access.
+    /// The address of the instruction that made the place's first match, in hexadecimal after &. With `count_by` `"pc"`, it names the place, with `pc_rom` and `pc_ram`. Not given for an `execute` place, whose `execute` is that address, nor for an access made by an interrupt response.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc: Option<Hexadecimal>,
-    /// On a CPC, the ROM that held the instruction at pc, as rom names it, which counted by pc is part of the place; not given where the RAM held it, or where pc is not given.
+    /// On a CPC, the ROM that held the instruction at `pc`, in the same form as `rom`. With `count_by` `"pc"`, it is part of the place. Not given when the RAM held the instruction, or when `pc` is not given.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc_rom: Option<String>,
-    /// On a CPC, where the RAM holds the instruction at pc, as ram gives it, which counted by pc is part of the place; not given where that is pc, where a ROM held it, or where pc is not given.
+    /// On a CPC, the address in the RAM of the instruction at `pc`, as `ram` gives it. Given only when `pc` is, and the RAM held the instruction at an address other than `pc`. With `count_by` `"pc"`, it is part of the place.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     pc_ram: Option<Hexadecimal>,
-    /// The instruction's bytes as the processor first fetched them there, as pairs of hexadecimal digits: its opcodes and its operands, so that code overwritten since still says what ran; of an instruction longer than four bytes, as only a chain of prefixes makes one, its first four. Given for instructions alone.
+    /// The instruction's opcodes and operands as the processor first fetched them at this address, as pairs of hexadecimal digits, so that code overwritten since still shows what ran. At most 4 bytes: a longer instruction, which only a chain of prefixes makes, gives its first 4. Given for an `execute` place only.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     bytes: Option<String>,
-    /// How many times it matched.
+    /// The number of times the place matched.
     count: u32,
 }
 
@@ -2027,25 +2068,32 @@ impl Counted {
 struct Ran {
     #[serde(flatten)]
     run: Run,
-    /// The ticks the machine has run since it was stood up, from power-on or from its snapshot.
+    /// The machine's tick after the run: the ticks it has run since `machine_open` built it, from power-on or from its snapshot.
     tick: u64,
-    /// The program counter, in hexadecimal after &: where the next instruction is fetched.
+    /// The program counter, in hexadecimal after &: the address the next instruction is fetched from.
     pc: Hexadecimal,
     /// Why the run ended.
     stopped: Stopped,
-    /// What matched the conditions of until as the run stopped: the matching accesses of the instruction it stopped after, with those of an interrupt's response taken at its end, and the instruction it then stands before, if that matched.
+    /// The matches of `until`'s conditions when the run stopped. Given when one of them matched. The list holds:
+    /// - The matching accesses of the instruction the run stopped after, and of an interrupt response taken at its end.
+    /// - The instruction at `pc`, which the run stopped before, if it matched.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     matched: Option<Vec<Matched>>,
-    /// What matched the conditions of gather, in the order it happened: the first matches, or with gather_last the last 128, 32 where one of gather's conditions captures.
+    /// The matches of `gather`'s conditions, in the order they happened. Given with `gather`, without `path`. Which matches:
+    /// - Without `gather_last`, the first 128, or 32 when one of `gather`'s conditions captures, with the other matches of the instruction that made the last of them and of an interrupt response taken at its end.
+    /// - With `gather_last`, the last 128, or 32.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched the conditions of count, told by its first match, and how many times it matched: executes first, then reads, writes, port reads, port writes, the PSG's registers written and the 6845's, each by address or register, or by pc, and at one address the RAM's places first, by the RAM's own addresses, then the lower ROM's, then the upper ROMs' by their numbers. A byte of memory the processor reaches at two addresses is one place, told by the address of its first match.
+    /// Each place that matched `count`'s conditions, listed once as its first match, with the number of times it matched. Given with `count`, without `path`. A byte of memory the processor reaches at 2 addresses is 1 place, listed at the address of its first match. The order:
+    /// - By kind: `execute`, `read`, `write`, `in`, `out`, `psg`, `crtc`.
+    /// - Within a kind, by address or register, or by `pc` with `count_by` `"pc"`.
+    /// - At the same address, the RAM's places first, by their addresses in the RAM, then the lower ROM's, then the upper ROMs' by number.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
-    /// The file written at path, which holds what gathered and counted would have listed, in their place.
+    /// The file written at `path`. It holds what `gathered` and `counted` would have listed, and they are not given. Given with `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     written: Option<Filed>,
@@ -2056,11 +2104,11 @@ struct Ran {
 struct Filed {
     #[serde(flatten)]
     file: FileRead,
-    /// How many of its lines are matches of gather, which come first; given with gather.
+    /// The number of the file's lines that are `gather`'s matches, which come first. Given with `gather`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<usize>,
-    /// How many of its lines are places of count, which follow; given with count.
+    /// The number of the file's lines that are `count`'s places, which follow. Given with `count`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<usize>,
@@ -2161,10 +2209,10 @@ impl Ran {
         let written = write_lists(&mut file, watched, watched_for);
         let file = file.finish(written).map_err(|problem| {
             format!(
-                "{problem}. The request is not taken back: it ran {} ticks, and the machine stands \
-                 where it ended, at tick {} with its program counter at {}, and its journal holds \
-                 the request; make it again, from a state kept before it or from the journal's \
-                 requests before it, to write the file, at a path the file system can take it at",
+                "{problem}. The run still happened: it ran {} ticks, and the machine is at tick {} \
+                 with its program counter at {}, the request in its journal. To get the file, \
+                 make the request again, from a state kept before it or from the journal's \
+                 earlier requests, with a path the file system can take",
                 self.run.ticks, self.tick, self.pc
             )
         })?;
@@ -2180,27 +2228,27 @@ impl Ran {
 
 #[derive(Serialize, JsonSchema)]
 struct Inspected {
-    /// The path read; empty for the whole machine.
+    /// The path read. Empty for the whole machine.
     path: String,
-    /// What the machine holds there.
+    /// The value the machine holds there.
     #[schemars(schema_with = "any_value_schema")]
     value: Value,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Written {
-    /// Each path written, and what it now holds.
+    /// Each path written, with the value it now holds.
     #[schemars(schema_with = "values_schema")]
     values: Map<String, Value>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Peeked {
-    /// The first address read, as the processor reaches it, in hexadecimal after &; given when address was.
+    /// The first address read, as the processor reads it, in hexadecimal after &. Given with `address`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     address: Option<Hexadecimal>,
-    /// The first address read in the RAM, in hexadecimal after &; given when ram was.
+    /// The first address read in the RAM, in hexadecimal after &. Given with `ram`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     ram: Option<Hexadecimal>,
@@ -2212,73 +2260,76 @@ struct Peeked {
 struct Poked {
     /// The first address written, in hexadecimal after &.
     address: Hexadecimal,
-    /// How many bytes were written.
+    /// The number of bytes written.
     length: u16,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Monitored {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// The machine's tick as the picture was taken.
+    /// The machine's tick when the picture was taken.
     tick: u64,
     /// The picture's width in pixels.
     width: u32,
     /// The picture's height in pixels.
     height: u32,
-    /// The monitor's beam across its line, as monitor.beam_x counts it, in samples of the whole raster, of which the picture is a window.
+    /// The beam's position across its line, as `monitor.beam_x` counts it, in samples of the whole raster, which the picture crops.
     beam_x: u16,
-    /// The monitor's beam down its frame, as monitor.beam_y counts it, in lines of the whole raster, of which the picture is a window.
+    /// The beam's line, as `monitor.beam_y` counts it, in lines of the whole raster, which the picture crops.
     beam_y: u16,
-    /// Whether the beam stands outside the picture, at or before its first pixel or past its last, as it does after a run by frames that ran all its frames: false while the beam is partway through it, where the lines above the beam, and its own line to its left, are of the frame it is painting and the rest of the passes before. A line that a frame shorter than the picture never reaches keeps what an earlier pass left there, whatever whole says.
+    /// Whether the picture is a whole frame:
+    /// - `true`: the beam is at or before the picture's first pixel or past its last, as after a run by frames that ran all its frames.
+    /// - `false`: the beam is partway through the picture. The lines above the beam, and the part of its line left of it, are from the frame being painted, and the rest from the frame before.
+    /// - Either way, a line that a frame shorter than the picture never reaches keeps what an earlier frame left there.
     whole: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Drawn {
-    /// The handle machine_open gave the machine.
+    /// The handle `machine_open` returned.
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// The machine's tick as the memory was read.
+    /// The machine's tick when the memory was read.
     tick: u64,
-    /// Where the bytes of the picture were read.
+    /// The layout the bytes were read in.
     reading: Reading,
-    /// The address the first byte was read from, in the RAM, in hexadecimal after &.
+    /// The address in the RAM of the first byte read, in hexadecimal after &.
     base: Hexadecimal,
-    /// Bytes across.
+    /// The width in bytes.
     width: u32,
-    /// Lines down.
+    /// The height in lines.
     height: u32,
-    /// Lines in a character row, given for the video reading alone.
+    /// The number of lines in a character row. Given for `video` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     rasters: Option<u32>,
-    /// The mode the bytes were read in; the Gate Array reads a mode past 3, which only set can write, as 3, and so does this.
+    /// The mode the bytes were read in, 0 to 3. As on the Gate Array, a mode above 3, which only `set` can write, is drawn as 3.
     mode: u8,
-    /// The colour code given each pen, in order, in the five bits a colour code has.
+    /// 16 hardware colour codes, 0 to 31, pen by pen.
     palette: [u8; 16],
-    /// The picture's width in pixels, eight to a byte.
+    /// The picture's width in pixels, 8 per byte.
     picture_width: u32,
-    /// The picture's height in pixels, two to a line.
+    /// The picture's height in pixels, 2 per line.
     picture_height: u32,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Listed {
-    /// Where the instruction begins, in hexadecimal after &.
+    /// The instruction's address, in hexadecimal after &.
     address: Hexadecimal,
-    /// Its bytes, as pairs of hexadecimal digits.
+    /// The instruction's bytes, as pairs of hexadecimal digits.
     bytes: String,
-    /// What it says.
+    /// The instruction in Zilog's mnemonics, with addresses, bytes and displacements in hexadecimal after &, such as "LD HL,&1234".
     text: String,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct Disassembled {
-    /// The instructions, in the order they stand in memory.
+    /// The instructions, in memory order.
     instructions: Vec<Listed>,
 }
 
@@ -2309,7 +2360,7 @@ fn screen_count(name: &str, value: Option<i64>, most: u32) -> Result<Option<u32>
             u32::try_from(value)
                 .ok()
                 .filter(|value| (1..=most).contains(value))
-                .ok_or_else(|| format!("{name} is {value}, and a screen reads from 1 to {most}"))
+                .ok_or_else(|| format!("{name} is {value}; give 1 to {most}"))
         })
         .transpose()
 }
@@ -2321,7 +2372,7 @@ fn asked(request: &ScreenRequest) -> Result<Asked, String> {
             u8::try_from(mode)
                 .ok()
                 .filter(|mode| *mode <= 3)
-                .ok_or_else(|| format!("mode is {mode}, and the Gate Array's modes are 0 to 3"))
+                .ok_or_else(|| format!("mode is {mode}; give 0 to 3"))
         })
         .transpose()?;
     let palette = request
@@ -2336,8 +2387,8 @@ fn asked(request: &ScreenRequest) -> Result<Asked, String> {
                 .and_then(|codes| <[u8; 16]>::try_from(codes).ok())
                 .ok_or_else(|| {
                     format!(
-                        "palette is {palette:?}, and a palette is sixteen hardware colour codes, \
-                         one for each pen, each from 0 to 31"
+                        "palette is {palette:?}; give 16 hardware colour codes, one per pen, each \
+                         0 to 31"
                     )
                 })
         })
@@ -2357,7 +2408,7 @@ fn bytes_asked(length: i64) -> Result<u16, String> {
     u16::try_from(length)
         .ok()
         .filter(|length| (1..=MOST_BYTES).contains(length))
-        .ok_or_else(|| format!("{length} bytes is not from 1 to {MOST_BYTES}"))
+        .ok_or_else(|| format!("give 1 to {MOST_BYTES} bytes, not {length}"))
 }
 
 // A span of memory that ends at &FFFF or before it.
@@ -2366,8 +2417,8 @@ fn span(address: u16, length: i64) -> Result<u16, String> {
     let room = 0x10000 - u32::from(address);
     if u32::from(length) > room {
         return Err(format!(
-            "{length} bytes from &{address:04X} run past &FFFF, where the processor's memory \
-             ends; {} fit from there",
+            "{length} bytes from &{address:04X} run past &FFFF, the end of the processor's memory; \
+             give at most {} from there",
             room.min(u32::from(MOST_BYTES))
         ));
     }
@@ -2392,7 +2443,9 @@ impl Server {
         work: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         tokio::task::spawn_blocking(work).await.map_err(|error| {
-            format!("{files} could not be reached: {error}; the server's error output says why")
+            format!(
+                "{files} could not be reached: {error}; the server's standard error has the details"
+            )
         })?
     }
 
@@ -2406,8 +2459,8 @@ impl Server {
         let (answer, answered) = oneshot::channel();
         let stopped = || {
             format!(
-                "{handle} stopped; the server's error output says why, and machine_close puts it \
-                 away"
+                "the thread running {handle} has ended, and the server's standard error has the \
+                 details; machine_close closes the machine"
             )
         };
         let sent = orders.send(Box::new(move |machine| {
@@ -2428,7 +2481,10 @@ impl Server {
         }
     }
 
-    /// Build a machine, powered on and standing before its first instruction, or standing where a snapshot was taken, and give it a handle. It stands until machine_close puts it away or the server stops, and this server never gives its handle to another machine. The answer names every file the machine was built from by its SHA-256. A snapshot is loaded as the emulator's command line loads one, into the machine named, after its firmware is fitted. A CPC's is an SNA of version 1, 2 or 3, of which only the fields of version 1 are read: none keeps the disc controller, which the machine finds as at power-on, so one taken inside a disc access does not go on with it, and AMSDOS, which sets the controller up with SPECIFY as the machine starts, reads no disc from there, until set writes fdc.non_dma back as SPECIFY left it; and the 6845's counters a version 3 carries are not read, so the machine starts its frame from the top, with the 6845's counters, the Gate Array's interrupt counter and the monitor's beam all at 0. Its first run by frames therefore ends early, at the retrace the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen; until then monitor.beam_y runs up to three lines past the 6845's line, and from then on, on the firmware's screen, 70 or 71 past it, the border above the picture. A Spectrum's is the 48K .sna, which keeps no beam position either. The machine's tick starts at 0 from either.
+    /// Build a machine and return its handle: powered on before its first instruction, or loaded from a snapshot. The handle stays valid until `machine_close` or the server stops, and is never reused. The answer gives the SHA-256 of every file the machine was built from. The machine's tick starts at 0. A snapshot is loaded as the emulator's command line loads it, into the machine named, after the firmware is fitted: on a CPC an SNA of version 1, 2 or 3, of which only the version 1 fields are read; on a Spectrum a 48K .sna. A CPC snapshot's 6845 counters, which only version 3 holds, are not read: the CPC starts its frame from the top, with the Gate Array's interrupt counter and the beam at 0, so its first run by frames ends early, at the retrace that the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen. Until then `monitor.beam_y` is 1 or 2 lines past the 6845's line; after it, on the firmware's screen, 70 or 71 lines past. A Spectrum snapshot holds no beam position. A CPC snapshot does not hold the disc controller, so the controller starts as at power-on: a disc access the snapshot was taken inside does not go on, and the SPECIFY that AMSDOS sends at boot is missing. To set the controller as SPECIFY would have, write these with `set` (times in microseconds):
+    /// - `fdc.non_dma`: `true`. Without it AMSDOS reads nothing.
+    /// - `fdc.step_time`: `12000`. Without it AMSDOS fails every seek to another track.
+    /// - `fdc.head_load_time`: `4000` and `fdc.head_unload_time`: `32000`, the rest of what SPECIFY sets.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -2442,7 +2498,7 @@ impl Server {
         let machine = machines::named(&request.machine).ok_or_else(|| {
             let names: Vec<&str> = MACHINES.iter().map(|machine| machine.name).collect();
             format!(
-                "no machine is called {}; the machines are {}",
+                "no machine is named {}; the machines are {}",
                 request.machine,
                 names.join(", ")
             )
@@ -2489,15 +2545,15 @@ impl Server {
             })
             .map_err(|error| {
                 format!(
-                    "cannot start a thread for the machine: {error}; machine_close frees the \
-                     thread of a machine standing"
+                    "cannot start a thread for the machine: {error}; closing an open machine with \
+                     machine_close frees its thread"
                 )
             })?;
         let problem = match ready.await {
             Ok(Ok(())) => None,
             Ok(Err(problem)) => Some(problem),
             Err(_) => Some(format!(
-                "{} could not be built; the server's error output says why",
+                "{} could not be built; the server's standard error has the details",
                 machine.name
             )),
         };
@@ -2527,7 +2583,7 @@ impl Server {
         Ok(Json(answer))
     }
 
-    /// The machines standing, each by its handle and its name, in the order they were opened, and the states kept from each, by name and tick, in the order they were kept.
+    /// List the open machines, by handle and name in the order they were opened, with the states kept from each, by name and tick in the order they were kept.
     #[tool(input_schema = no_arguments(), annotations(read_only_hint = true, open_world_hint = false))]
     fn machine_list(&self, Parameters(_): Parameters<NoArguments>) -> Json<Listing> {
         let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2540,7 +2596,7 @@ impl Server {
         })
     }
 
-    /// Put a machine away, once whatever it was asked to do before is done, and every state kept from it with it. Its handle names nothing afterwards, nor do the states' names.
+    /// Close a machine once its earlier requests have finished, and drop every state kept from it. Its handle and its states' names become invalid.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2573,7 +2629,13 @@ impl Server {
         }))
     }
 
-    /// Run a machine by its frames or by its ticks; give one of the two. Nothing but this tool, step, call and type moves a machine, and state_restore puts one back where it stood; the same requests of the same machine give the same answers. A frame is the monitor's, and ends as its retrace sends the beam to the top-left corner, so a run by frames ends with a whole picture on the monitor. A CPC's frame is whatever its 6845 is programmed to make and may never come, so a run by frames is limited to twice a standard frame for each frame asked, a standard frame being 79872 ticks on a CPC, at 4 MHz, and 69888 on a Spectrum, at 3.5 MHz. A run by ticks runs that many, as the emulator's command line runs its frames. Either then goes on to the end of the instruction standing there, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a run ends between instructions, a few ticks past what was asked, unless it ends inside a chain of prefixes. A run stops sooner at the end of a HALT that leaves interrupts disabled, where the processor waits for good, since neither machine raises the NMI that would wake it, and says so; one that begins there runs as asked, unless set has written in an NMI, which wakes it. One request runs at most 1500 frames, or the ticks of 1500 standard frames; run again to go further. A request is not taken back: one a client stops waiting for runs to its end all the same, and the machine's tick in the next answer says how far. until stops a run sooner, where a condition matches, gather lists what matches its conditions on the way, and count counts how many times each place matches its conditions, by its address or by the instruction that made it, and tells each by its first match; each match gathered says its tick, what it was and where, the byte, the instruction that made it and where the monitor's beam stood, and on a CPC which ROM held the instruction or the byte, or where in its RAM, when the address alone does not say. A condition of until or gather may capture the machine at each match, values of the processor and spans of memory, so that a routine's arguments, or what an instruction left, come with the match rather than from a stop and a read after it. With path, what gather and count find is written to a new file instead, a line for each match and each place, so that one run lists what a program does over many frames, a trace of each instruction it runs or its writes to the PSG, up to 1048576 matches, and counts, over every frame it runs, every byte it reads or writes. keys holds keys down through the run, as a player holds a direction and fire for as long as a stretch of the game wants them.
+    /// Run a machine by `frames` or by `ticks`; give exactly one. Only `run`, `step`, `call` and `type` advance a machine, and the same requests on the same machine give the same answers.
+    /// - A frame ends when the monitor's retrace sends the beam to the top-left corner, so a run by frames ends on a whole picture. A CPC's 6845 may never end a frame, so such a run stops after twice a standard frame's ticks for each frame asked.
+    /// - A standard frame is 79872 ticks on a CPC (4 MHz) and 69888 on a Spectrum (3.5 MHz).
+    /// - A run ends between instructions, a few ticks past the target, or at the first fetch of an interrupt handler if an interrupt is taken there. A run that ends inside a long chain of DD and FD prefixes answers `"settled": false`.
+    /// - A run stops early, answering `"stopped": "halted"`, at a HALT with interrupts disabled, where the processor would wait forever. Unless `set` has written in an NMI, a run that starts on such a HALT runs as asked, halted throughout.
+    /// - At most 1500 frames, or the ticks of 1500 standard frames, per request; run again to go further.
+    /// - A run cannot be cancelled: if the client stops waiting, it still runs to its end.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2618,8 +2680,8 @@ impl Server {
                     .filter(|frames| (1..=MOST_FRAMES).contains(frames))
                     .ok_or_else(|| {
                         format!(
-                            "frames is {frames}, and a run takes from 1 to {MOST_FRAMES} frames; \
-                             run again to go further"
+                            "frames is {frames}; give 1 to {MOST_FRAMES}, and run again to go \
+                             further"
                         )
                     })?;
                 let limit = 2 * u64::from(frames) * machine.standard_frame();
@@ -2650,8 +2712,8 @@ impl Server {
                     .filter(|ticks| (1..=most_ticks).contains(ticks))
                     .ok_or_else(|| {
                         format!(
-                            "ticks is {ticks}, and a run on a {} takes from 1 to {most_ticks} \
-                             ticks, the ticks of {MOST_FRAMES} standard frames; run again to go \
+                            "ticks is {ticks}; a {} runs from 1 to {most_ticks} ticks a request, \
+                             the ticks of {MOST_FRAMES} standard frames, so run again to go \
                              further",
                             machine.name
                         )
@@ -2675,8 +2737,8 @@ impl Server {
             }
             _ => {
                 return Err(
-                    "a run takes frames or ticks, one of the two: {\"frames\": 50} runs to the \
-                     50th retrace, {\"ticks\": 3993600} runs that many ticks"
+                    "give frames or ticks, exactly one: {\"frames\": 50} runs to the 50th \
+                     retrace, {\"ticks\": 3993600} runs that many ticks"
                         .to_owned(),
                 );
             }
@@ -2684,7 +2746,13 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Call a routine of the machine's as its own CALL would: the program counter is pushed where the stack pointer stands, and the processor jumps to the address. The call ends when the processor is back at the address pushed with the stack pointer where it stood, which is where the routine's own return leaves it, so a routine that returns leaves the machine standing where it was, with its registers and memory as the routine left them, for inspect and peek to read. The values given are written first, as set writes them, so they can hand the routine its arguments, and they may move the stack pointer. Interrupts stay as they stand, so their handlers run within the call only if IFF1 is set: a run by frames leaves either machine's firmware inside the handler of the frame's interrupt, with IFF1 clear, and a routine called there runs with no interrupt at all, unless it enables them itself. A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call. A routine that has not returned when the call stops, at its frames, at a condition of until or with its gathering or its count full, is left running and awake; a later run carries it on and past its return, and stops there only if until asks for the address the call was made from. A routine that halts on HALT with interrupts disabled stops the call there, halted, as it stops a run: one that waits on HALT for the next frame, called with IFF1 clear, as inside an interrupt's handler or after DI, waits for good. Refused, with the machine as it stood, inside a chain of prefixes, or where the address pushed would not read back. The answer is a run's.
+    /// Call a routine the way the machine's own CALL would: push the program counter and jump to `address`. The call ends when the routine returns: the processor is back at the pushed address with the stack pointer where it was, and registers and memory are as the routine left them. The answer has the same form as `run`'s.
+    /// - `values` are written first, as `set` writes them, to pass arguments; they may move the stack pointer.
+    /// - Interrupts stay as they are. A run by frames leaves either machine's firmware inside its frame interrupt handler with IFF1 clear, so a routine called there runs without interrupts unless it enables them.
+    /// - A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call.
+    /// - A routine that has not returned when the call stops (its frames run out, `until` matches, or a gather or count is full) is left running. A later run stops at its return only if `until` asks for the address the program counter held when it was called.
+    /// - A routine that halts with interrupts disabled stops the call, answering `"stopped": "halted"`.
+    /// - Refused, with the machine unchanged, inside a chain of prefixes, and where the pushed address would not read back: under a CPC's enabled ROM, or in a Spectrum's ROM.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2702,8 +2770,8 @@ impl Server {
             .filter(|frames| (1..=MOST_FRAMES).contains(frames))
             .ok_or_else(|| {
                 format!(
-                    "frames is {frames}, and a call waits from 1 to {MOST_FRAMES} frames; run \
-                     again to carry the routine further"
+                    "frames is {frames}; give 1 to {MOST_FRAMES}, and run again to carry \
+                     the routine further"
                 )
             })?;
         let watched_for = watched_for(
@@ -2765,7 +2833,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Step a machine by its instructions. Each instruction is run to its end, and through the response to an interrupt taken at its end, to the first fetch of its handler, so a step can land in an interrupt's handler. A processor halted on HALT idles on fetches that run nothing, and each of those is an instruction here. A chain of prefixes is no instruction until it ends, so a step caught in one long enough stops there, unsettled. One request runs at most 100000 instructions, and is not taken back, as a run's is not. The answer is a run's.
+    /// Run a machine by a number of instructions. Each instruction runs to its end and through the response to any interrupt taken there, up to the handler's first fetch, so a step can land in an interrupt handler. A processor halted on HALT idles on fetches that run nothing, and each counts as an instruction. The answer has the same form as `run`'s.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2782,8 +2850,8 @@ impl Server {
             .filter(|instructions| (1..=MOST_INSTRUCTIONS).contains(instructions))
             .ok_or_else(|| {
                 format!(
-                    "instructions is {instructions}, and a step takes from 1 to \
-                     {MOST_INSTRUCTIONS} instructions; step again to go further"
+                    "instructions is {instructions}; give 1 to {MOST_INSTRUCTIONS}, and step again \
+                     to go further"
                 )
             })?;
         let (_, orders) = self.thread(&request.handle)?;
@@ -2798,7 +2866,14 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Type text at a machine as the emulator's command line types it with --type: each character's key held down, with the shift it needs, for 3 standard frames, then let go for 3 on a CPC and 6 on a Spectrum, long enough for each machine's firmware to see a key go down and come up, and to take the same key twice. Type at a machine once its firmware has started, as it takes no key before: the command line waits 78 frames for a CPC's and 128 for a Spectrum's, whose ROM takes none before frame 85. Keys are pressed, not characters handed over, so what arrives is what the firmware makes of them: on a Spectrum a letter typed where the cursor shows K is a keyword, so "p" at the start of a line is PRINT, and "j" then two of "\"" is LOAD "". Keys the keyboard holds already, as set writes them, stay held through the typing, where the command line lets every key go. A newline is RETURN on a CPC and ENTER on a Spectrum; on a CPC a tab is TAB, an escape, \u001b, ESC, and a backspace, \b, DEL. Keys that type no character, such as COPY, the function keys and the joysticks, and a character outside ASCII, such as a CPC's £, SHIFT with ^, are held by run's keys. A text is ASCII, and one holding a character no key types, alone or with a shift, is refused before a key goes down. A program reading the keyboard only now and then loses the keys pressed between, so type at it a character at a time, with runs between that stop where it reads the keyboard. At most 250 characters on a CPC and 166 on a Spectrum, 1500 frames' worth. Each key goes down and comes up between instructions, a few ticks at most from where the command line puts it, counting from where the typing began, and the typing ends at the end of the instruction standing as its frames' ticks run out, so the answer is a run's that took those ticks and a few more. A stretch that ends inside a chain of prefixes ends the typing there, unsettled, as it ends a run; a HALT that leaves interrupts disabled does not, and the typing takes its ticks whatever the program does.
+    /// Type text at a machine the way the emulator's command line does with --type: each character's key is held down, with the shift it needs, for 3 standard frames, then released for 3 on a CPC or 6 on a Spectrum. The answer has the same form as `run`'s.
+    /// - Type only once the firmware has started: the command line waits 78 frames on a CPC and 128 on a Spectrum.
+    /// - Keys are pressed, not characters handed over, so the firmware decides what they mean. On a Spectrum a letter typed at the K cursor is a keyword: "p" at the start of a line is PRINT, and "j" is LOAD.
+    /// - A newline is RETURN on a CPC and ENTER on a Spectrum. On a CPC a tab is TAB, \u001b is ESC and \b is DEL. Keys that type no character, such as COPY, the function keys and the joysticks, are held with `run`'s `keys`.
+    /// - ASCII only: at most 250 characters on a CPC and 166 on a Spectrum. A text with a character no key types is refused before any key goes down.
+    /// - Keys that `set` wrote into the keyboard stay held while typing.
+    /// - A HALT with interrupts disabled does not end the typing.
+    /// - A program that reads the keyboard only now and then loses keys pressed in between: type one character at a time, with runs between that stop where it reads the keyboard.
     #[tool(
         name = "type",
         annotations(
@@ -2817,13 +2892,13 @@ impl Server {
         let characters = request.text.chars().count();
         if !(1..=most).contains(&characters) {
             let rest = if characters == 0 {
-                "give a character or more"
+                ""
             } else {
-                "type the rest in another request"
+                ", and type the rest in another request"
             };
             return Err(format!(
-                "text holds {characters} characters, and from 1 to {most} are typed at a {} at \
-                 once, {MOST_FRAMES} frames' worth; {rest}",
+                "text has {characters} characters; give 1 to {most}, {MOST_FRAMES} frames' worth \
+                 on a {}{rest}",
                 machine.name
             ));
         }
@@ -2840,7 +2915,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Put a disc in a CPC's drive: a DSK image, of the original layout or the extended one, read whole from its path on the file system the server runs on and copied into the machine, with room for every track to be formatted again, as the emulator's command line gives a disc with --disc. What the machine writes lands in its copy and never in the file, and is gone once another disc takes the copy's place, save what a state kept while it stood in the drive brings back as it stood then; nothing here writes a disc out. The disc takes the place of whatever disc the drive held, as a game's second side does when the game asks for it. A cpc664 and a cpc6128 take discs; a cpc464 is built here as the command line builds one given no disc, without the disc interface, and nothing here fits one afterwards, so its discs go to a cpc664 or a cpc6128; a Spectrum has no drive. An image the emulator cannot read is refused, with what is wrong with it, and the drive keeps the disc it had. The answer names the file by its SHA-256, with the machine's tick as the disc went in.
+    /// Put a disc in a CPC's drive: a DSK image, original or extended layout, read whole and copied into the machine, as the emulator's command line does with --disc. The machine writes to its copy, never to the file, and what it wrote is lost when another disc replaces it, except in states kept while it was in the drive. The new disc replaces whatever the drive held, as when a game asks for its second side. Only a cpc664 or a cpc6128 takes discs: a cpc464 is built without the disc interface. An image the emulator cannot read is refused with the reason, and the drive keeps its disc. The answer gives the file's SHA-256 and the machine's tick at insertion.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2883,7 +2958,7 @@ impl Server {
         }))
     }
 
-    /// Put a tape in a Spectrum's deck and press PLAY: a .tap, bare blocks at the ROM's own timings, or a .tzx, read whole from its path on the file system the server runs on and copied into the machine, as the emulator's command line gives a tape with --tape. A Spectrum has no motor line, so the tape plays from its start as the machine runs, whatever the machine does: put it in just before the program asks for it, as LOAD "" does, since a header's pilot tone lasts 5 seconds and the ROM listens for only part of it. A tape stops where a block marks it to stop, as a multiload's does between its parts, and nothing here presses PLAY again, so such a tape loads its first part and waits, as it does on the command line. Blocks the emulator's reader cannot play, a waveform recorded sample by sample, data built from a table of symbols, blocks visited out of order, or a block whose ID it does not know, are refused as the tape goes in, and the deck keeps the tape it had. The tape takes the place of whatever tape the deck held. A CPC is given no tape here: the emulator has never loaded one through a CPC's firmware, so nothing could hold such a loading to what the machine did. The answer names the file by its SHA-256, with the machine's tick as the tape went in.
+    /// Put a .tap or .tzx tape in a Spectrum's deck and press PLAY; the file is read whole and copied into the machine, as the emulator's command line does with --tape. A Spectrum has no motor control, so the tape plays from now on whatever the machine does: insert it just before the program asks for it, as LOAD "" does. A tape that stops itself, as a multiload does between parts, waits there; no tool presses PLAY again. A tape is refused, and the deck keeps the tape it had, if it holds a block the emulator cannot play: a waveform recorded sample by sample, data built from a symbol table, a jump, loop, call or menu (which visit blocks out of order), or a block with an unknown ID. A CPC takes no tape. The answer gives the file's SHA-256 and the machine's tick at insertion.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -2921,7 +2996,10 @@ impl Server {
         }))
     }
 
-    /// Write a machine to a new file as a snapshot, in the format the emulator's command line writes with --save and machine_open reads: an SNA of version 1 for a CPC, the 48K .sna for a Spectrum. The file is written only where none is, at its path on the file system the server runs on, from the server's working directory if relative, so that nothing is ever written over: a path that names a file already is refused. A snapshot keeps less than the machine. Neither keeps whether the processor is halted, so a machine saved on HALT, waiting for an interrupt, runs on past the HALT as soon as it is read. A CPC's keeps no counters of the 6845's, so the machine read from it starts its frame from the top, and neither the discs nor the disc controller, which the machine read from it finds as at power-on, so one saved inside a disc access does not go on with it, and AMSDOS, which sets the controller up with SPECIFY as the machine starts, reads no disc from there until set writes fdc.non_dma back as SPECIFY left it. A Spectrum's keeps no beam position and no tape, and keeps the program counter in the two bytes below the stack pointer, in the file and not in the machine, so a machine read from it has lost what those two bytes held; a Spectrum whose stack pointer is below &4002, 0 among them, is refused. Refused inside an instruction, as a run or a step ending in a chain of prefixes leaves the machine. The machine is left as it stands. The file holds the machine's RAM whole, to be read as an image of it: a CPC's after its header of 256 bytes, all 64K or 128K of it by the RAM's own addresses, as peek's ram counts them, and a Spectrum's after its header of 27, &4000 to &FFFF, save the two bytes below the stack pointer, which hold the program counter. The answer names the file by its SHA-256, with the machine's tick.
+    /// Write a machine to a new file as a snapshot, as the emulator's command line does with --save and `machine_open` reads: an SNA of version 1 for a CPC, a 48K .sna for a Spectrum. Refused if the file exists, inside a chain of prefixes, or on a Spectrum with a stack pointer below &4002. The file holds the whole RAM: a CPC's after its 256-byte header, by the RAM's own addresses as `peek`'s `ram` counts them; a Spectrum's &4000 to &FFFF after its 27-byte header. The answer gives the file's SHA-256 and the machine's tick. A snapshot holds less than the machine:
+    /// - Neither format records a HALT, so a machine saved on HALT runs past it once loaded.
+    /// - A CPC snapshot holds no disc, no disc controller and no 6845 counters; see `machine_open`.
+    /// - A Spectrum snapshot holds no beam position and no tape, and stores the program counter in the 2 bytes below the stack pointer, in the file only, so a machine loaded from it has lost what those bytes held.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -2952,7 +3030,7 @@ impl Server {
         }))
     }
 
-    /// Keep a machine exactly as it stands, to be put back as it was with state_restore: everything it holds, inside an instruction if a run left it in a chain of prefixes, its picture, each disc as it has been written, the tape where it has played to, its tick and its journal. Nothing the machine does afterwards changes the state, and nothing of the machine is left out of it, where a snapshot keeps only what its format has room for. The answer names the state. A state is held in the server's memory, beside its machine, until state_drop lets it go or machine_close puts the machine away; the server stopping takes every state with it, and no state is written to a file, since it holds the machine's own pointers. At most 64 are held of one machine. A state is no record of how the machine came to stand there: its journal is, and a finding names the journal, which names the files and the build that make the machine again.
+    /// Keep a machine exactly as it is, to return to with `state_restore`: everything it holds (mid-instruction if a run left it in a chain of prefixes), its picture, each disc as written, the tape's position, its tick and its journal. A state lives in the server's memory until `state_drop`, `machine_close` or the server stops, and is never written to a file, since it holds the machine's own pointers. At most 64 states per machine. The answer gives the state's name.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -2977,8 +3055,8 @@ impl Server {
                 let states = threads.states_of(&handle);
                 (states.len() >= MOST_STATES).then(|| {
                     format!(
-                        "{handle} has {MOST_STATES} states kept, the most one machine keeps; \
-                         state_drop lets one of them go: {}",
+                        "{handle} already has {MOST_STATES} states, the most a machine \
+                         keeps; drop one with state_drop: {}",
                         states.join(", ")
                     )
                 })
@@ -3006,7 +3084,7 @@ impl Server {
         }))
     }
 
-    /// Put a machine back exactly as a state kept from it stood: everything it held, its picture, the discs it held then as they were, though another disc has taken a drive since or the program has written to them, a drive empty then emptied again, and its tape where it had played to. Its tick and its journal are the state's, and what is done from there is journaled after them. A state is restored into the machine it was kept from and no other. Restoring one lets no other state go: each is a branch to come back to, and this one stays, to restore again.
+    /// Put a machine back exactly as a state kept from it was: everything it held, its picture, its discs as they were (even if another disc has been inserted or the program has written to them since), and its tape's position. Its tick and journal become the state's. A state can be restored only into the machine it was kept from. Restoring drops no state, this one included, so it can be restored again.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3036,7 +3114,7 @@ impl Server {
         }))
     }
 
-    /// Let a state kept from a machine go, freeing the memory it held. Its name names nothing afterwards.
+    /// Drop a state kept from a machine, freeing its memory. Its name becomes invalid.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3067,7 +3145,10 @@ impl Server {
         }))
     }
 
-    /// What has been done to a machine, on the branch it stands on: the build that runs it, the files it was built from, each named by its SHA-256, and every request that stood it up or changed it, in the order made, the first of them the machine_open that stood it up, each with the machine's tick as it began and the arguments it was given, save that an address, a port or a byte a condition tests is written in hexadecimal after &, a register of the PSG or the 6845 as a number, a range of one address, register or byte as that one, a test of every byte and changes that is false left out, and a path absolute, while the values set and call write are kept as given, and a snapshot, a disc or a tape read named by its SHA-256 as well, and a file a run or a call wrote named by what it holds. Reads change nothing and are not entered, nor are states kept or let go; restoring a state makes the journal the state's. The same requests made in this order, on the same build and with the same files, make a machine that stands as this one stands, and write files that hold what these hold, each at a path that names nothing yet, which is how a finding is made again. Entries are answered from the one asked for, 0 if none is, as many as fit in 8192 characters, and at least one while any remain, however long; next says where the following page begins.
+    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal, paths absolute, and each file read or written named by its SHA-256.
+    /// - Reads are not recorded, nor are states kept or dropped. Restoring a state makes the journal the state's.
+    /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
+    /// - Entries are returned from `from` on, as many as fit in 8192 characters, and at least one while any remain; `next` gives where the next page starts.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn journal(
         &self,
@@ -3083,8 +3164,8 @@ impl Server {
                 .filter(|from| *from <= count)
                 .ok_or_else(|| {
                     format!(
-                        "from is {from}, and the journal of {handle} holds {count} entries, so it \
-                         is answered from 0 to {count}"
+                        "from is {from}; give 0 to {count}, the number of entries in the journal \
+                         of {handle}"
                     )
                 })?;
             let mut characters = 0;
@@ -3115,7 +3196,7 @@ impl Server {
         }))
     }
 
-    /// Read what a machine holds, by its path: the whole machine, or the part a path names, as a C expression names it on the emulator's struct for the machine (cpc_t or spectrum_t, in its headers): cpu.pc, crtc.registers[12], gate_array.inks, fdc.units[0].head. Fields keep the names their headers give them, numbers are numbers, and a C enum's value is the name of its enumerator. Pointers are not followed; peek reads memory. Some fields are the chips' registers and counters, and some are the emulator's own machinery for stepping them a tick at a time, which no silicon holds as such: the headers say which.
+    /// Read what a machine holds by path, written as a C expression on the emulator's struct for the machine, `cpc_t` or `spectrum_t`: `cpu.pc`, `crtc.registers[12]`, `gate_array.inks`, `fdc.units[0].head`. Without a path, the whole machine. Fields keep their header names, numbers are JSON numbers, and an enum is given by its enumerator's name. Pointers are not followed; `peek` reads memory. Some fields are the emulator's own machinery for stepping the chips tick by tick rather than chip registers; the headers say which.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
         &self,
@@ -3129,7 +3210,7 @@ impl Server {
         Ok(Json(Inspected { path, value }))
     }
 
-    /// Write what a machine holds, by the paths inspect reads. A field of unsigned integers takes a number, or hexadecimal after &, #, $ or 0x, as an address does; a signed field takes a number. Every value is written, or none: a value of the wrong kind, or one the emulator could not run from, such as a pen past the seventeen the Gate Array has, is refused, and the machine is left as it stood. A CPC's memory map is worked out again afterwards, as it is when its own processor writes the registers behind it, and a Spectrum's ULA stood at the tick of the frame its frame_tick names, from which its beam is reckoned. The answer gives each path as it now reads. Writing the emulator's machinery, rather than the chips' registers, can leave a machine in a state no silicon could reach.
+    /// Write what a machine holds, by `inspect`'s paths; every value is written, or none. An unsigned field takes a number, or hexadecimal written with &, #, $ or 0x; a signed field takes a number. A value of the wrong kind, or one the emulator could not run from, such as a `gate_array.pen` above 16, is refused and the machine left unchanged. Afterwards a CPC's memory map is worked out again, and a Spectrum's ULA is moved to the tick of the frame that `ula.frame_tick` names. The answer gives each path as it now reads. Writing the emulator's machinery rather than chip registers can leave a machine in a state no real hardware reaches, and what conditions see from there is not guaranteed.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3152,7 +3233,7 @@ impl Server {
         Ok(Json(Written { values: written }))
     }
 
-    /// Read a machine's memory. By address, as its processor would, through the banking and the ROMs standing in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. By ram, a CPC's RAM itself, by the RAM's own addresses, as screen's base counts them, whatever is paged in: &0000 is the RAM under that ROM, and a 6128's second 64K is &10000 to &1FFFF. From 1 to 4096 bytes, none past &FFFF, or past the end of the RAM.
+    /// Read a machine's memory. With `address`, as the processor reads it, through the banking and the ROMs in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. With `ram`, a CPC's RAM itself, by its own addresses, whatever is paged in: &0000 is the RAM under that ROM, and a 6128's second 64K is &10000 to &1FFFF.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn peek(
         &self,
@@ -3181,9 +3262,9 @@ impl Server {
             }
             _ => {
                 return Err(
-                    "peek reads from address or from ram, one of the two: {\"address\": \
-                     \"&C000\"} reads as the processor does, through the banking and the ROMs, \
-                     and {\"ram\": \"&1C000\"} reads a CPC's RAM by its own addresses"
+                    "give address or ram, exactly one: {\"address\": \"&C000\"} reads as the \
+                     processor does, through the banking and the ROMs, and {\"ram\": \
+                     \"&1C000\"} reads a CPC's RAM by its own addresses"
                         .to_owned(),
                 );
             }
@@ -3195,7 +3276,9 @@ impl Server {
         }))
     }
 
-    /// Show what a machine's monitor shows, as a PNG beside the answer: its picture as the emulator's command line crops and draws its screenshots, which a picture written there with --screenshot matches pixel for pixel. A CPC's is 768 by 544 pixels, a sample of the raster to each across and every line drawn twice, cut from samples 208 to 975 of the 1024 a line has and lines 34 to 305 of 312; a Spectrum's is 352 by 264, from samples 96 to 447 of 448 and lines 20 to 283 of 312. Each pixel's index in the PNG's palette is what the machine put on the cable: a CPC's hardware colour code, 0 to 31, or a Spectrum's sample, 0 to 15, its bits brightness, green, red and blue from the highest. The beam paints the picture as the machine runs, so it is whole after a run by frames that ran all its frames, which ends as the retrace sends the beam to the top-left corner; after any other run, a step, a call or typing, the lines above the beam, and its own line to its left, are this frame's, and the rest are the frame's before, and the answer's whole says whether the beam is partway through the picture. A machine not yet run shows a picture never painted.
+    /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. A machine that has not run yet shows an unpainted picture. The picture's size and crop:
+    /// - CPC: 768 by 544, samples 208 to 975 of a line's 1024 and lines 34 to 305 of 312, each line drawn twice.
+    /// - Spectrum: 352 by 264, samples 96 to 447 of 448 and lines 20 to 283 of 312.
     #[tool(
         output_schema = schema_for_output::<Monitored>(),
         annotations(read_only_hint = true, open_world_hint = false)
@@ -3225,7 +3308,9 @@ impl Server {
         })
     }
 
-    /// Read a CPC's memory as a picture, as colophon-player's <colophon-cpc-screen> reads it, so that a sprite sheet, a font or a buffer built off the screen shows its shape when read in the layout it was written in: as the video hardware reads the screen, as a flat buffer, or in columns. The bytes are read from the RAM as the video hardware reads them, whatever ROM the processor sees over them: the video reading reads the base 64K, and linear and columns all of the machine's RAM, a 6128's second 64K at &10000 to &1FFFF. Whatever is not given is read from the machine as it stands: the base from R12 and R13, the width from R1, the height from R6 and the rasters, the rasters from R9, and the mode in force and the sixteen inks from the Gate Array, so that a screen asked nothing draws the memory the 6845 is displaying. The PNG beside the answer has eight pixels across to a byte and two down to a line, the scale at which monitor draws a CPC's raster; each pixel's index in its palette is the pen, and the palette is the colours of the pens' colour codes. It is drawn from memory as it stands, in one mode and one palette, so it is not what the monitor showed where a program changes either partway down a frame, or changes the memory as the beam passes; monitor shows that. Refused on a Spectrum, whose picture monitor shows.
+    /// Draw a CPC's memory as a picture, as colophon-player's <colophon-cpc-screen> does, so that a sprite sheet, a font or an off-screen buffer shows its shape. The RAM is read whatever ROM the processor sees over it. The PNG has 8 pixels across for each byte and 2 down for each line, the scale `monitor` uses for a CPC, and each pixel's palette index is its pen. It uses one mode and one palette and memory as it is now, so where a program changes the mode, the inks or memory partway down a frame, use `monitor`. Refused on a Spectrum. Whatever is not given is read from the machine, so a request with no options draws the memory the 6845 displays:
+    /// - from the 6845: `base` from R12 and R13, `width` twice R1, `height` R6 times `rasters`, `rasters` R9 plus 1;
+    /// - from the Gate Array: `mode`, the mode in force, and `palette`, its 16 inks.
     #[tool(
         output_schema = schema_for_output::<Drawn>(),
         annotations(read_only_hint = true, open_world_hint = false)
@@ -3261,7 +3346,7 @@ impl Server {
         })
     }
 
-    /// Read a machine's memory as the instructions its processor would run, from an address on, each with its address, its bytes and what they say: Zilog's mnemonics, numbers in hexadecimal after &, and a relative jump's target worked out. Memory is read as peek reads it, through the banking and the ROMs, and an instruction that runs past &FFFF goes on at &0000, as the program counter does. An instruction is what step runs, so a chain of DD and FD prefixes is one, ruled by its last prefix, even one so long that a step stops inside it. Undocumented instructions are named as colophon-player's disassembly names them: IXH and IXL, SLL, RLC (IX+&05),B and its like, which copy their result into a register, IN (C), OUT (C),0, IM 0/1, and NOP for ED followed by a byte that begins no instruction, save ED FF, which is BRK, after WinAPE, whose mark it is. Nothing here tells code from data: bytes are read as instructions from wherever the listing begins. From 1 to 256 instructions, 16 if not given; a listing reads at most 4096 bytes, so only a chain of prefixes thousands long cuts it short.
+    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. Memory is read as `peek` reads it, wrapping from &FFFF to &0000. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn disassemble(
         &self,
@@ -3274,9 +3359,8 @@ impl Server {
             .filter(|instructions| (1..=MOST_INSTRUCTIONS_LISTED).contains(instructions))
             .ok_or_else(|| {
                 format!(
-                    "instructions is {instructions}, and a listing takes from 1 to \
-                     {MOST_INSTRUCTIONS_LISTED}; disassemble again from where it ends to go \
-                     further"
+                    "instructions is {instructions}; give 1 to {MOST_INSTRUCTIONS_LISTED}, and \
+                     disassemble again from where the listing ends to go further"
                 )
             })?;
         let (_, orders) = self.thread(&request.handle)?;
@@ -3296,7 +3380,7 @@ impl Server {
         }))
     }
 
-    /// Write a machine's memory as its processor would: a write under a CPC's ROMs lands in the RAM beneath them, and one into a Spectrum's ROM lands nowhere. From 1 to 4096 bytes, none past &FFFF.
+    /// Write a machine's memory as its processor would: a write under a CPC's ROMs goes to the RAM beneath them, and a write into a Spectrum's ROM is lost.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3341,7 +3425,7 @@ impl ServerHandler for Server {
                 .collect();
             return Err(ErrorData::invalid_params(
                 format!(
-                    "no tool is called {}; the tools are {}",
+                    "no tool is named {}; the tools are {}",
                     request.name,
                     tools.join(", ")
                 ),

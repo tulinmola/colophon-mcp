@@ -65,6 +65,7 @@ A page describes what the server does today, and what it owes a reader is its li
 - Humour only as a byproduct of honesty. None in code comments, error messages or tool descriptions: comments pay rent in facts, error messages are read on bad days, and a tool description is taken at its word.
 - Counts are words and measures are figures: two machines, eight rows, against 16K, 69888 T-states, `&C000`. A machine's sizes are what it is called, not how much of something there is.
 - Write for 2036. Mood is timeless, jokes are timestamps; the prose meets the same bar as the code.
+- What a client reads from the server is the exception to all of the above but the humour: the descriptions of tools, of their arguments and of their answers' fields, and error messages, are written as a reference manual is, in the plain voice a client expects — the rule first, short sentences, every number in figures, counts too, and lists where a description enumerates. The scribe's register is for the docs, the README and the comments, save the comments that become descriptions, as `mcp_run_t`'s do.
 
 ## Writing style
 
