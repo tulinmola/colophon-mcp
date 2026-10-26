@@ -161,7 +161,7 @@ pub fn settle(asked: &Asked, cpc: &cpc_t) -> Result<Screen, String> {
 
 // The board's wiring of the 6845's address lines, cpc_video_address in the
 // emulator's cpc.c, after Kevin Thacker's "Screen memory addressess"
-// (https://cpctech.cpcwiki.de/docs/scraddr.html): MA9..MA0 land on A10..A1,
+// (https://web.archive.org/web/20260609083341/https://cpctech.cpcwiki.de/docs/scraddr.html): MA9..MA0 land on A10..A1,
 // RA2..RA0 on A13..A11 and MA13..MA12 on A15..A14, and MA11 and MA10 reach
 // nothing. A0 is the byte of the pair a character is fetched as.
 fn video_address(ma: u32, raster: u32) -> u32 {

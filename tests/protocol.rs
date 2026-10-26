@@ -24,10 +24,11 @@ use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 21] = [
+const TOOLS: [&str; 22] = [
     "call",
     "disassemble",
     "disc_insert",
+    "find",
     "inspect",
     "journal",
     "machine_close",
@@ -1043,6 +1044,7 @@ const ADD_A_B: u8 = 0x80;
 const AND_N: u8 = 0xE6;
 const BIT_0_AT_HL: [u8; 2] = [0xCB, 0x46];
 const CALL: u8 = 0xCD;
+const CALL_NZ: u8 = 0xC4;
 const CP_E: u8 = 0xBB;
 const DI: u8 = 0xF3;
 const EI: u8 = 0xFB;
@@ -1237,6 +1239,7 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         assert_eq!(annotations["openWorldHint"], false, "{name}: {annotations}");
         let reads = [
             "disassemble",
+            "find",
             "inspect",
             "journal",
             "machine_list",
@@ -1449,6 +1452,7 @@ fn every_tool_refuses_a_handle_never_given_with_the_handles_there_are() {
         ("monitor", json!({})),
         ("screen", json!({})),
         ("disassemble", json!({ "address": 0 })),
+        ("find", json!({ "bytes": "00" })),
         ("machine_close", json!({})),
     ] {
         let mut arguments = arguments;
@@ -1634,6 +1638,38 @@ fn inspect_reads_the_whole_machine_or_the_part_a_path_names() {
     );
 }
 
+// Each path inspect's description names is read on the machines its item
+// names.
+#[test]
+fn every_path_inspects_description_names_is_read() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let description = listed(&tools(&mut session), "inspect")["description"]
+        .as_str()
+        .expect("a description")
+        .to_owned();
+    let cpc = session.open("cpc6128");
+    let spectrum = session.open("spectrum48");
+    let items: Vec<&str> = description
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .collect();
+    assert_eq!(items.len(), 3, "{description}");
+    for item in items {
+        let handles = match item.split(':').next() {
+            Some("- Both machines") => vec![&cpc, &spectrum],
+            Some("- CPC") => vec![&cpc],
+            Some("- Spectrum") => vec![&spectrum],
+            _ => panic!("{item} names no machine"),
+        };
+        for path in item.split('`').skip(1).step_by(2) {
+            for handle in &handles {
+                session.inspect(handle, path);
+            }
+        }
+    }
+}
+
 // The machine runs on from what set leaves it: at a program counter set, the
 // processor fetches there.
 #[test]
@@ -1723,7 +1759,7 @@ fn set_refuses_what_the_emulator_could_not_run_from() {
 
 // A processor selects a RAM configuration by writing &C0 and its number, and
 // "Ram management" (Kevin Thacker's cpctech),
-// https://cpctech.cpcwiki.de/docs/rampage.html, gives the blocks each puts
+// https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html, gives the blocks each puts
 // where: configuration 0 the first 64K's 0, 1, 2 and 3; 2 the second 64K's,
 // all four; 4 the second's block 0 at &4000, among the first's 0, 2 and 3.
 #[test]
@@ -1807,11 +1843,20 @@ fn memory_ends_at_ffff_and_says_so() {
         assert!(
             refusal.ends_with(
                 "an address is a number from 0 to 65535, or hexadecimal from &0000 to &FFFF, \
-                 written with &, #, $ or 0x before it"
+                 written with &, #, $ or 0x before it; \"cpu.sp\" or \"cpu.pc\" stands for the \
+                 address the register holds"
             ),
             "{refusal}"
         );
     }
+    assert_eq!(
+        session.refusal(
+            "poke",
+            json!({ "handle": handle, "address": "&FFFF", "bytes": "0102" })
+        ),
+        "2 bytes from &FFFF run past &FFFF, the end of the processor's memory; give at most 1 \
+         from there"
+    );
     for bytes in ["ABC", "+F", "GG"] {
         assert_eq!(
             session.refusal(
@@ -1909,8 +1954,223 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
     );
 }
 
+// A read may start at the address SP or PC holds as it is made, and runs on
+// past &FFFF to &0000 as the processor's addresses do; spans of one length
+// at SP, at PC and at an address are three spans.
+#[test]
+fn a_read_may_start_where_sp_or_pc_points_and_wraps_past_ffff() {
+    let roms = Roms::programmed("spectrum48.rom", &[LD_BC, 0x34, 0x12, NOP]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&FFFF"), "AB");
+    session.set(&handle, json!({ "cpu.sp": "&FFFF", "cpu.pc": 3 }));
+    let peek = |session: &mut Session, address: &str, length: u16| {
+        session.answer(
+            "peek",
+            json!({ "handle": handle, "address": address, "length": length }),
+        )
+    };
+    let at_sp = json!({ "address": "&FFFF", "bytes": "AB0134" });
+    let at_pc = json!({ "address": "&0003", "bytes": "00" });
+    assert_eq!(peek(&mut session, "cpu.sp", 3), at_sp);
+    assert_eq!(peek(&mut session, "cpu.pc", 1), at_pc);
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": "cpu.pc", "instructions": 1 }),
+    );
+    assert_eq!(
+        listed["instructions"],
+        json!([{ "address": "&0003", "bytes": "00", "text": "NOP" }])
+    );
+    let span = |address: Value| json!({ "address": address, "length": 3 });
+    let capture =
+        json!({ "memory": [span(json!("cpu.sp")), span(json!("cpu.pc")), span(json!(0))] });
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 1, "gather": [{ "execute": 3, "capture": capture }] }),
+    );
+    assert_eq!(
+        ran["gathered"][0]["captured"],
+        json!({ "memory": [
+            at_sp,
+            { "address": "&0003", "bytes": "000000" },
+            { "address": "&0000", "bytes": "013412" },
+        ] }),
+        "{ran}"
+    );
+}
+
+// CALL, CALL NZ, JP and LD HL each hold an address after the opcode, low
+// byte first: "The first n operand after the op code is the low-order byte"
+// (UM0080, LD dd, nn), and CALL and JP say the same of theirs. &146F's two
+// bytes are found after each, and alone, as a table of addresses holds them.
+const REFERRING: [u8; 14] = [
+    CALL, 0x6F, 0x14, CALL_NZ, 0x6F, 0x14, JP, 0x6F, 0x14, LD_HL, 0x6F, 0x14, 0x6F, 0x14,
+];
+
+#[test]
+fn find_lists_where_bytes_and_text_lie_lowest_first() {
+    let roms = Roms::programmed("spectrum48.rom", &REFERRING);
+    roms.write_at("spectrum48.rom", 0x20, b"READ\xD9READYready");
+    roms.write_at("spectrum48.rom", 0x40, &[0xAA; 3]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&FFFE"), "ABCD");
+    let mut find = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("find", arguments)
+    };
+    let referring =
+        json!({ "addresses": ["&0001", "&0004", "&0007", "&000A", "&000C"], "count": 5 });
+    assert_eq!(find(json!({ "bytes": "6F 14" })), referring);
+    assert_eq!(find(json!({ "bytes": "6F14" })), referring);
+    assert_eq!(
+        find(json!({ "bytes": "CD ?? 14" })),
+        json!({ "addresses": ["&0000"], "count": 1 })
+    );
+    // A match lies wholly within the range: the LD's operand runs past it.
+    assert_eq!(
+        find(json!({ "bytes": "6F 14", "address": 2, "to": "&000A" })),
+        json!({ "addresses": ["&0004", "&0007"], "count": 2 })
+    );
+    // Bit 7 is ignored, and case is not.
+    assert_eq!(
+        find(json!({ "text": "READY" })),
+        json!({ "addresses": ["&0020", "&0025"], "count": 2 })
+    );
+    assert_eq!(
+        find(json!({ "text": "ready" })),
+        json!({ "addresses": ["&002A"], "count": 1 })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "AA AA" })),
+        json!({ "addresses": ["&0040", "&0041"], "count": 2 })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "AB CD" })),
+        json!({ "addresses": ["&FFFE"], "count": 1 })
+    );
+}
+
+// The stand-in's 16K are all 0, so 00 is found at each address to &3FFF.
+#[test]
+fn find_lists_the_first_256_and_says_where_the_rest_begin() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let mut find = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("find", arguments)
+    };
+    let addresses = |from: u16| -> Vec<Value> { (from..from + 256).map(ampersand).collect() };
+    assert_eq!(
+        find(json!({ "bytes": "00", "to": "&3FFF" })),
+        json!({ "addresses": addresses(0), "count": 0x4000, "next": "&0100" })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "00", "address": "&0100", "to": "&3FFF" })),
+        json!({ "addresses": addresses(0x100), "count": 0x3F00, "next": "&0200" })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "00", "address": "&3F00", "to": "&3FFF" })),
+        json!({ "addresses": addresses(0x3F00), "count": 256 })
+    );
+}
+
+// Memory is searched as peek reads it, through a CPC's ROMs: the lower ROM
+// at &0000 while it is enabled, and the RAM beneath it while it is not.
+#[test]
+fn find_searches_memory_as_the_processor_reads_it() {
+    let roms = Roms::programmed("cpc464.rom", &REFERRING[..3]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(&handle, json!("&0010"), "CD6F14");
+    let arguments = json!({ "handle": handle, "bytes": "CD 6F 14", "to": "&3FFF" });
+    assert_eq!(
+        session.answer("find", arguments.clone()),
+        json!({ "addresses": ["&0000"], "count": 1 })
+    );
+    session.set(&handle, json!({ "gate_array.lower_rom_enabled": false }));
+    assert_eq!(
+        session.answer("find", arguments),
+        json!({ "addresses": ["&0010"], "count": 1 })
+    );
+}
+
+#[test]
+fn find_says_what_would_have_worked() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let mut refused = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.refusal("find", arguments)
+    };
+    let one_of_two = "give bytes or text, exactly one: {\"bytes\": \"CD ?? 14\"} finds those \
+                      bytes, ?? matching any byte, and {\"text\": \"READY\"} finds that text, \
+                      bit 7 ignored";
+    assert_eq!(refused(json!({})), one_of_two);
+    assert_eq!(refused(json!({ "bytes": "00", "text": "A" })), one_of_two);
+    for bytes in ["CD ?", "?0", "XYZ"] {
+        assert_eq!(
+            refused(json!({ "bytes": bytes })),
+            format!(
+                "{bytes} is not bytes; write bytes as pairs of hexadecimal digits, with ?? for \
+                 any byte, such as CD ?? 14"
+            )
+        );
+    }
+    assert_eq!(
+        refused(json!({ "bytes": "" })),
+        "bytes holds 0 bytes; give 1 to 256"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00".repeat(257) })),
+        "bytes holds 257 bytes; give 1 to 256"
+    );
+    assert_eq!(
+        refused(json!({ "text": "café" })),
+        "text holds é, which is not ASCII; give ASCII characters only"
+    );
+    assert_eq!(
+        refused(json!({ "text": "" })),
+        "text holds 0 characters; give 1 to 256"
+    );
+    assert_eq!(
+        refused(json!({ "text": "A".repeat(257) })),
+        "text holds 257 characters; give 1 to 256"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "address": "&8000", "to": "&4000" })),
+        "to &4000 is below address &8000; give a to of &8000 or above"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "address": 65536 })),
+        "address 65536 is past &FFFF; an address is a number from 0 to 65535, or hexadecimal \
+         from &0000 to &FFFF, written with &, #, $ or 0x before it"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "to": "cpu.sp" })),
+        "to \"cpu.sp\" is not an address; an address is a number from 0 to 65535, or \
+         hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it"
+    );
+    let found = session.answer(
+        "find",
+        json!({ "handle": handle, "bytes": "?? ".repeat(256), "to": "&00FF" }),
+    );
+    assert_eq!(found["count"], 1, "{found}");
+    let found = session.answer(
+        "find",
+        json!({ "handle": handle, "text": "\u{0}".repeat(256), "to": "&00FF" }),
+    );
+    assert_eq!(found["count"], 1, "{found}");
+}
+
 // A snapshot of version 1, laid out by "Snapshot (.SNA) file format" (Kevin
-// Thacker's cpctech), https://cpctech.cpcwiki.de/docs/snapshot.html, each
+// Thacker's cpctech), https://web.archive.org/web/20260721051400/https://cpctech.cpcwiki.de/docs/snapshot.html, each
 // register a value of its own: the processor's from &11, "IFF0" and "IFF1" —
 // the flip-flops the Z80's own manual calls IFF1 and IFF2 — at &1B and &1C,
 // the Gate Array's pen and palette from &2E, its multi configuration at &40,
@@ -2537,24 +2797,29 @@ fn read_back(session: &mut Session, handle: &str, capture: &Value) -> Value {
     }
     let mut memory = Vec::new();
     for span in capture["memory"].as_array().unwrap() {
-        let length = span["length"].as_u64().unwrap();
-        let bytes = session.peek(handle, span["address"].clone(), length as u16);
-        memory.push(json!({ "address": span["address"], "bytes": bytes }));
+        let mut span = span.clone();
+        span["handle"] = json!(handle);
+        memory.push(session.answer("peek", span));
     }
     json!({ "values": values, "memory": memory })
 }
 
 // A run stopped at each match of passing in turn, every condition capturing A,
-// HL, DE and SP, the bytes the pass counts and the top of its stack, finds the
-// machine where each stop leaves it as each match there captured it, a stop on
-// an access standing at the end of the instruction that made it; interrupts
-// are disabled, so no response comes between. Its twin, gathering over the
-// same ticks, captures the same.
+// HL, DE and SP, the bytes the pass counts, the top of its stack, and the
+// bytes where SP and PC point, finds the machine where each stop leaves it as
+// each match there captured it, a stop on an access standing at the end of
+// the instruction that made it; interrupts are disabled, so no response comes
+// between. Its twin, gathering over the same ticks, captures the same.
 #[test]
 fn a_capture_is_what_a_stop_at_its_match_reads_back() {
     let capture = json!({
         "values": ["cpu.a", "cpu.h", "cpu.l", "cpu.d", "cpu.e", "cpu.sp"],
-        "memory": [{ "address": "&9000", "length": 4 }, { "address": "&7FFE", "length": 2 }],
+        "memory": [
+            { "address": "&9000", "length": 4 },
+            { "address": "&7FFE", "length": 2 },
+            { "address": "cpu.sp", "length": 2 },
+            { "address": "cpu.pc", "length": 3 },
+        ],
     });
     for (file, machine, port, port_address) in [
         (
@@ -2615,13 +2880,14 @@ fn a_capture_is_what_a_stop_at_its_match_reads_back() {
 // SP. The SP is decremented again and loads the low-order byte of qq"
 // (UM0080, PUSH qq). Matched as it is about to begin, it captures the
 // machine it finds, as a run stopped before it does, and each of its two
-// writes the machine it leaves: both bytes written, SP two lower and PC past
-// it, the first write as much as the second.
+// writes the machine it leaves: both bytes written, SP two lower, so that the
+// bytes where it points are the two pushed, and PC past it, the first write
+// as much as the second.
 #[test]
 fn an_access_captures_the_machine_its_instruction_leaves() {
     let capture = json!({
         "values": ["cpu.sp", "cpu.pc"],
-        "memory": [{ "address": "&7FFE", "length": 2 }],
+        "memory": [{ "address": "&7FFE", "length": 2 }, { "address": "cpu.sp", "length": 2 }],
     });
     for (file, machine) in [("cpc6128.rom", "cpc6128"), ("spectrum48.rom", "spectrum48")] {
         let roms = Roms::programmed(file, &WRITING);
@@ -2634,11 +2900,17 @@ fn an_access_captures_the_machine_its_instruction_leaves() {
         let ran = session.run(&handle, json!({ "ticks": 200, "gather": gathering }));
         let found = json!({
             "values": { "cpu.sp": 0x8000, "cpu.pc": 0x0009 },
-            "memory": [{ "address": "&7FFE", "bytes": "0000" }],
+            "memory": [
+                { "address": "&7FFE", "bytes": "0000" },
+                { "address": "&8000", "bytes": "0000" },
+            ],
         });
         let left = json!({
             "values": { "cpu.sp": 0x7FFE, "cpu.pc": 0x000A },
-            "memory": [{ "address": "&7FFE", "bytes": "0090" }],
+            "memory": [
+                { "address": "&7FFE", "bytes": "0090" },
+                { "address": "&7FFE", "bytes": "0090" },
+            ],
         });
         let captured: Vec<&Value> = ran["gathered"]
             .as_array()
@@ -2903,7 +3175,9 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
                          of the two: a path names one of the processor's values under cpu, such \
                          as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and a span is {\"address\": \
                          address, \"length\": bytes}, 1 to 64 bytes, 1 if length is not given, \
-                         none past &FFFF";
+                         none past &FFFF; the address may be \"cpu.sp\" or \"cpu.pc\", where the \
+                         register points at the capture, and the span then wraps past &FFFF to \
+                         &0000";
     let said = |problem: &str| format!("until[0]: capture: {problem}; {capture_forms}; {forms}");
     for (capture, problem) in [
         (
@@ -2976,7 +3250,21 @@ fn what_capture_takes_is_said_when_it_is_given_otherwise() {
         (
             json!({ "memory": [{ "address": 70000 }] }),
             "address 70000 is past &FFFF; an address is a number from 0 to 65535, or hexadecimal \
-             from &0000 to &FFFF, written with &, #, $ or 0x before it"
+             from &0000 to &FFFF, written with &, #, $ or 0x before it; \"cpu.sp\" or \"cpu.pc\" \
+             stands for the address the register holds"
+                .to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": "cpu.hl" }] }),
+            "address \"cpu.hl\" is not an address; an address is a number from 0 to 65535, or \
+             hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it; \"cpu.sp\" or \
+             \"cpu.pc\" stands for the address the register holds"
+                .to_owned(),
+        ),
+        (
+            json!({ "memory": [{ "address": "cpu.sp", "length": 65 }] }),
+            "{\"address\":\"cpu.sp\",\"length\":65} has a length that is not an integer from 1 \
+             to 64"
                 .to_owned(),
         ),
     ] {
@@ -4441,6 +4729,10 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "read": 1, "value": "&20", "value_to": 255, "memory": "ram" }),
         json!({ "out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF" }),
         json!({ "psg": 7, "value": 0, "changes": false }),
+        json!({ "write": 1, "capture": { "memory": [
+            { "address": "cpu.sp", "length": 63 },
+            { "address": "cpu.pc" },
+        ] } }),
     ] {
         if let Err(problem) = fitting(&condition) {
             panic!("{condition}: {problem}");
@@ -4478,6 +4770,39 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         "count": [{ "execute": 1, "capture": { "values": ["cpu.a"] } }],
     });
     assert!(fits(&counting, &schema, &schema, "run").is_err());
+}
+
+// A read that may start where SP or PC points offers them in its schema, and
+// an address that may not, a condition's or find's range among them, offers
+// an address alone.
+#[test]
+fn only_a_read_offers_sp_and_pc_as_an_address() {
+    let roms = Roms::all();
+    let tools = tools(&mut Session::start(&roms));
+    let registers = json!({ "enum": ["cpu.sp", "cpu.pc"] });
+    let offers = |tool: &str, field: &Value| {
+        let schema = input_schema(&tools, tool);
+        let name = field["$ref"]
+            .as_str()
+            .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            .expect("a definition named");
+        schema["$defs"][name]["anyOf"]
+            .as_array()
+            .expect("the forms of an address")
+            .contains(&registers)
+    };
+    let property = |tool: &str, name: &str| input_schema(&tools, tool)["properties"][name].clone();
+    assert!(offers("peek", &property("peek", "address")));
+    assert!(offers("disassemble", &property("disassemble", "address")));
+    let run = input_schema(&tools, "run");
+    let span = &run["$defs"]["Capture"]["properties"]["memory"]["items"]["properties"]["address"];
+    assert!(offers("run", span));
+    assert!(!offers("find", &property("find", "address")));
+    assert!(!offers("find", &property("find", "to")));
+    assert!(!offers("poke", &property("poke", "address")));
+    assert!(!offers("call", &property("call", "address")));
+    let execute = &run["$defs"]["Condition"]["oneOf"][0]["properties"]["execute"];
+    assert!(!offers("run", execute));
 }
 
 #[test]
@@ -5312,7 +5637,7 @@ fn a_video_row_wraps_inside_its_2k_and_may_begin_at_an_odd_byte() {
 }
 
 // RAM configuration 4 pages the second 64K's first bank in at &4000 ("Ram
-// management", cpctech, https://cpctech.cpcwiki.de/docs/rampage.html), and a
+// management", cpctech, https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html), and a
 // screen reads it at &10000, past the processor's reach.
 #[test]
 fn a_screen_reads_a_6128s_second_64k_at_its_own_addresses() {
@@ -5948,7 +6273,7 @@ fn a_run_begun_inside_a_chain_of_prefixes_names_its_memory() {
 // the second 64K at &4000. Configuration 4 puts the second 64K's first block
 // at &4000, 3 the base 64K's last, and 1 the second 64K's last at &C000
 // ("Ram management", Kevin Thacker's cpctech,
-// https://cpctech.cpcwiki.de/docs/rampage.html): &10000, &C000 and &1C000 by
+// https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html): &10000, &C000 and &1C000 by
 // the RAM's own addresses. The upper ROM the latch selects answers a read at
 // &C000: AMSDOS at 7, and at 5, where nothing is fitted, BASIC, ROM 0: "BASIC
 // will be selected if an attempt is made to select a rom which is not
@@ -6707,7 +7032,7 @@ fn text_a_keyboard_cannot_type_is_refused_before_a_key_goes_down() {
 // A blank disc of AMSDOS's DATA format, laid out as "Extended DiSK image
 // definition" (Marco Vieth, Ulrich Doewich and Kevin Thacker, with
 // extensions by John Elliott and Simon Owen,
-// https://cpctech.cpcwiki.de/docs/extdsk.html) lays an image out: a disc
+// https://web.archive.org/web/20260212054051/https://cpctech.cpcwiki.de/docs/extdsk.html) lays an image out: a disc
 // information block of &100 bytes, "EXTENDED CPC DSK File\r\nDisk-Info\r\n",
 // the name of its creator, the number of tracks at &30 and of sides at &31,
 // and a track size table from &34 of each track's "high byte of track
@@ -6726,7 +7051,7 @@ fn text_a_keyboard_cannot_type_is_refused_before_a_key_goes_down() {
 // number of blocks-1" and "2 directory blocks", which leave 178 blocks of
 // 1K free. Every byte is &E5, which AMSDOS's ROM takes as the "user number
 // for deleted files" (its disassembly,
-// https://cpctech.cpcwiki.de/docs/amsdos.asm), so that the directory, in the
+// https://web.archive.org/web/20260721051000/https://cpctech.cpcwiki.de/docs/amsdos.asm), so that the directory, in the
 // disc's first blocks, holds nothing; SOFT 968 prints the format's filler as
 // #E9, which the ROM's own table of the format does not hold.
 fn blank_data_disc() -> Vec<u8> {
@@ -7010,7 +7335,7 @@ fn a_snapshot_saved_is_what_a_machine_read_from_it_saves_again() {
 
 // A snapshot holds the machine's RAM whole: a CPC's "memory dump" from
 // &100, after its header ("Snapshot (.SNA) file format", Kevin Thacker's
-// cpctech, https://cpctech.cpcwiki.de/docs/snapshot.html), 64K or 128K by
+// cpctech, https://web.archive.org/web/20260721051400/https://cpctech.cpcwiki.de/docs/snapshot.html), 64K or 128K by
 // peek's RAM addresses, and a Spectrum's 48K after its 27 bytes ("Emulator
 // file formats", World of Spectrum FAQ,
 // https://worldofspectrum.org/faq/reference/formats.htm), the RAM from
@@ -7651,7 +7976,10 @@ fn the_journal_writes_addresses_after_an_ampersand() {
         json!({ "handle": handle, "address": "0x8001", "bytes": "22" }),
     );
     assert_eq!(poked, json!({ "address": "&8001", "length": 1 }));
-    let capture = json!({ "values": ["cpu.sp", "cpu.ixh"], "memory": [{ "address": "#9000" }] });
+    let capture = json!({
+        "values": ["cpu.sp", "cpu.ixh"],
+        "memory": [{ "address": "#9000" }, { "address": "cpu.sp", "length": 2 }],
+    });
     let ran = json!({
         "ticks": 100,
         "until": [{ "execute": 4096, "to": "#1FFF", "memory": "rom", "capture": capture }],
@@ -7691,7 +8019,10 @@ fn the_journal_writes_addresses_after_an_ampersand() {
                     "memory": "rom",
                     "capture": {
                         "values": ["cpu.sp", "cpu.ixh"],
-                        "memory": [{ "address": "&9000", "length": 1 }],
+                        "memory": [
+                            { "address": "&9000", "length": 1 },
+                            { "address": "cpu.sp", "length": 2 },
+                        ],
                     },
                 }],
                 "gather": [{ "write": "&9000" }, { "out": "&00FE", "mask": "&0001" }],
@@ -8343,6 +8674,53 @@ fn a_count_by_pc_names_the_instructions_that_clear_the_spectrums_screen() {
     assert_eq!(ending, [0x0E84, 0x0E85, 0x0E87], "{called}");
 }
 
+// The Complete Spectrum ROM Disassembly (rom.skool, as SkoolKit's author
+// keeps it, https://github.com/skoolkid/rom/blob/20260409/sources/rom.skool)
+// gives three routines of the 48K ROM and every place that names each:
+// STACK_BC, at &2D2B, called at &2601, jumped to at &2CB5, &34E4 and &3677,
+// and loaded by LD HL at &34B6; e_to_fp, at &2D4F, jumped to at &2D18,
+// called at &2E36 and &2E6A, and entered in the calculator's table at &334F;
+// and COPY_BUFF, at &0ECD, jumped to by JP NZ at &0A53 and called at &0B8E
+// and by CALL NZ at &130C. Each address's two bytes, low first, are found
+// after each opcode and at the table's entry, and nowhere else in the ROM.
+// The ROM ends its keywords and its messages with bit 7 set, RANDOMIZE at
+// &01E4 and NEXT without FOR at &1394 among them, and the 6128's cassette
+// manager each word of its messages, "Press", the first, at &2935
+// (Cassette.asm, in Bread80's unassembly of the firmware,
+// https://github.com/Bread80/CPC6128-Firmware-Source).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn find_finds_what_the_firmwares_listings_say_is_there() {
+    let mut session = Session::reading(&firmware());
+    let spectrum = session.open("spectrum48");
+    let cpc = session.open("cpc6128");
+    let mut find = |handle: &str, sought: Value| {
+        let mut arguments = sought;
+        arguments["handle"] = json!(handle);
+        arguments["to"] = json!("&3FFF");
+        let found = session.answer("find", arguments);
+        assert_eq!(found["count"], found["addresses"].as_array().unwrap().len());
+        found["addresses"].clone()
+    };
+    for (bytes, operands) in [
+        ("2B 2D", vec![0x2602, 0x2CB6, 0x34B7, 0x34E5, 0x3678]),
+        ("4F 2D", vec![0x2D19, 0x2E37, 0x2E6B, 0x334F]),
+        ("CD 0E", vec![0x0A54, 0x0B8F, 0x130D]),
+    ] {
+        let operands: Vec<Value> = operands.into_iter().map(ampersand).collect();
+        assert_eq!(find(&spectrum, json!({ "bytes": bytes })), json!(operands));
+    }
+    assert_eq!(
+        find(&spectrum, json!({ "text": "RANDOMIZE" })),
+        json!(["&01E4"])
+    );
+    assert_eq!(
+        find(&spectrum, json!({ "text": "NEXT without FOR" })),
+        json!(["&1394"])
+    );
+    assert_eq!(find(&cpc, json!({ "text": "Press" })), json!(["&2935"]));
+}
+
 // MC SOUND REGISTER, at &BD34, takes "the sound chip register number" in A
 // and "the data to send" in C (SOFT 968, The Amstrad 6128 Firmware Manual,
 // https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual, entry
@@ -8476,7 +8854,7 @@ fn basic_prints_through_txt_output_a_character_at_a_time() {
 // &C006 of each background ROM (&0346), passing by the foreground ROM, 0;
 // "if no ROM at this address then we'll get ROM 0 (BASIC)". AMSDOS, ROM 7,
 // has &01 at &C000 and its init at &C006, JP &C1BC (Kevin Thacker's AMSDOS
-// disassembly, https://cpctech.cpcwiki.de/docs/amsdos.asm). Counted, &C006
+// disassembly, https://web.archive.org/web/20260721051000/https://cpctech.cpcwiki.de/docs/amsdos.asm). Counted, &C006
 // is a place in each ROM.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
@@ -8821,7 +9199,7 @@ fn cpc_font(session: &mut Session, handle: &str, machine: &str) -> BTreeMap<[u8;
 // 968, section 6). The 6845's start address, R12 and R13, places the first
 // byte: its MA13 and MA12 reach A15 and A14, and MA9 to MA0 reach A10 to A1
 // ("Screen memory addressess", Kevin Thacker's cpctech,
-// https://cpctech.cpcwiki.de/docs/scraddr.html). A pixel of any pen but the
+// https://web.archive.org/web/20260609083341/https://cpctech.cpcwiki.de/docs/scraddr.html). A pixel of any pen but the
 // paper's, 0, is drawn; a cell no matrix matches reads as '?'.
 fn cpc_text(
     session: &mut Session,
@@ -9111,7 +9489,7 @@ fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
 // As it starts, AMSDOS calls its "BIOS: SETUP DISC" with its "default BIOS:
 // SETUP DISC parameters", which sends the "specify command", the last of
 // whose bytes is &03, its "head load delay and dma flag" (Kevin Thacker's
-// "Disassembly of AMSDOS ROM", https://cpctech.cpcwiki.de/docs/amsdos.asm,
+// "Disassembly of AMSDOS ROM", https://web.archive.org/web/20260721051000/https://cpctech.cpcwiki.de/docs/amsdos.asm,
 // at &C5EF, &C60D and &C5D4), the flag the emulator's specify() keeps as
 // fdc.non_dma. The same parameters give &01, the "head unload delay", and
 // &0C, the "step rate in 1ms units", which AMSDOS also waits out for each

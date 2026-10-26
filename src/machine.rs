@@ -17,11 +17,11 @@ use crate::emulator::{
     gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
     mcp_cpc_check, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call,
     mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t,
-    mcp_z80_halted_for_good, spectrum_connect_monitor, spectrum_init, spectrum_insert_tape,
-    spectrum_instruction_complete, spectrum_peek, spectrum_poke, spectrum_snapshot_load,
-    spectrum_snapshot_save, spectrum_snapshot_size, spectrum_t, tape_init, tape_insert, tape_play,
-    tape_t, tzx_machine_TZX_SPECTRUM, tzx_next_pulse, tzx_open, tzx_t, ula_rgb as core_ula_rgb,
-    z80_instruction_complete, z80_t,
+    mcp_z80_halted_for_good, mcp_z80_start, spectrum_connect_monitor, spectrum_init,
+    spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek, spectrum_poke,
+    spectrum_snapshot_load, spectrum_snapshot_save, spectrum_snapshot_size, spectrum_t, tape_init,
+    tape_insert, tape_play, tape_t, tzx_machine_TZX_SPECTRUM, tzx_next_pulse, tzx_open, tzx_t,
+    ula_rgb as core_ula_rgb, z80_instruction_complete, z80_t,
 };
 
 pub use crate::emulator::{
@@ -32,6 +32,8 @@ pub use crate::emulator::{
     mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
     mcp_memory_t as Memory, mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY, mcp_memory_t_MCP_RAM as RAM,
     mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place, mcp_run_t as Run, mcp_span_t as Span,
+    mcp_start_t as Start, mcp_start_t_MCP_START_ADDRESS as START_ADDRESS,
+    mcp_start_t_MCP_START_PC as START_PC, mcp_start_t_MCP_START_SP as START_SP,
 };
 
 pub use crate::emulator::{
@@ -143,9 +145,8 @@ impl<'a> Watch<'a> {
             "spans holding {bytes} bytes together, past the {CAPTURED_BYTES} a capture holds"
         );
         assert!(
-            spans
-                .iter()
-                .all(|span| u32::from(span.address) + u32::from(span.length) <= 0x10000),
+            spans.iter().all(|span| span.start != START_ADDRESS
+                || u32::from(span.address) + u32::from(span.length) <= 0x10000),
             "a span past &FFFF"
         );
         self.watch.captures = captures.as_mut_ptr();
@@ -241,6 +242,11 @@ impl z80_t {
     pub fn halted_for_good(&self) -> bool {
         // SAFETY: the bridge reads two fields of the processor.
         unsafe { mcp_z80_halted_for_good(self) }
+    }
+
+    pub fn start(&self, start: Start, address: u16) -> u16 {
+        // SAFETY: the bridge reads SP or PC of the processor.
+        unsafe { mcp_z80_start(self, start, address) }
     }
 }
 
@@ -426,10 +432,15 @@ impl Cpc {
         }
     }
 
+    // A socket is filled once: a state keeps the machine's pointers, and one
+    // kept before a ROM was replaced would point into the ROM freed.
     pub fn set_upper_rom(&mut self, number: u8, rom: Box<[u8; 0x4000]>) {
+        assert!(
+            !self.upper_roms.contains_key(&number),
+            "upper ROM {number} is fitted already"
+        );
         let rom = Handed::new(rom);
-        // SAFETY: the ROM is held beside the machine; the one it replaces, if
-        // any, is freed only once the machine no longer points at it.
+        // SAFETY: the ROM is held beside the machine and freed after it.
         unsafe { cpc_set_upper_rom(self.machine.as_ptr(), number, rom.as_ptr().cast()) };
         self.upper_roms.insert(number, rom);
     }
@@ -1164,7 +1175,7 @@ mod tests {
     // On a CPC the Gate Array stretches every instruction to whole
     // microseconds: "NOP 1", "LD rp,nnnn 3" and "EX (SP),IX 7" in the
     // measured table of Kevin Thacker's cpctech,
-    // https://cpctech.cpcwiki.de/docs/instrtim.html. An instruction's end is
+    // https://web.archive.org/web/20260721052654/https://cpctech.cpcwiki.de/docs/instrtim.html. An instruction's end is
     // ragged against those microseconds, so the span measured runs from the
     // end of one NOP to the end of another, which end alike.
     #[test]
@@ -1638,7 +1649,7 @@ mod tests {
 
     // An image of one track holding one sector, laid out as "Extended DiSK
     // image definition" (Kevin Thacker's cpctech,
-    // https://cpctech.cpcwiki.de/docs/extdsk.html) lays one out, which the
+    // https://web.archive.org/web/20260212054051/https://cpctech.cpcwiki.de/docs/extdsk.html) lays one out, which the
     // controller's READ ID finds.
     fn one_track_image(filler: u8) -> Vec<u8> {
         let mut image = vec![0; 0x100];
@@ -1772,8 +1783,9 @@ mod tests {
     // for a few places, and answers whether the run saw more than there was
     // room for: matches past it are counted and never kept, or kept round
     // and round where the last are gathered, and places past it counted and
-    // never kept. Each match gathered captures two spans that fill a capture,
-    // the second ending at &FFFF. Every other run gathers the last and counts
+    // never kept. Each match gathered captures spans that fill a capture: one
+    // ending at &FFFF, and one each where SP and PC point, which may run on
+    // past it, wrapping to &0000. Every other run gathers the last and counts
     // by pc. The room is on the heap, where AddressSanitizer sees past its
     // end. A count past a kind's locations would land in the next kind's
     // counts, where it sees nothing amiss, so each kind is given room for
@@ -1815,13 +1827,24 @@ mod tests {
         // SAFETY: bindgen renders a capture as integers, bools, and arrays
         // and structures of them, and all-zero bytes are a value of each.
         let mut captures = vec![unsafe { std::mem::zeroed::<Capture>() }; 4];
-        let half = (CAPTURED_BYTES / 2) as u16;
-        let spans: Vec<Span> = [0x10000 - 2 * u32::from(half), 0x10000 - u32::from(half)]
-            .map(|address| Span {
-                address: address as u16,
-                length: half,
-            })
-            .into();
+        let quarter = (CAPTURED_BYTES / 4) as u16;
+        let spans = [
+            Span {
+                start: START_ADDRESS,
+                address: (0x10000 - 2 * u32::from(quarter)) as u16,
+                length: 2 * quarter,
+            },
+            Span {
+                start: START_SP,
+                address: 0,
+                length: quarter,
+            },
+            Span {
+                start: START_PC,
+                address: 0,
+                length: quarter,
+            },
+        ];
         let mut watch = Watch::new(
             &conditions,
             &mut matches,
@@ -2186,6 +2209,7 @@ mod tests {
     #[test]
     fn a_watch_takes_spans_that_fill_a_capture() {
         let halves = [0x0000, 0x0040].map(|address| Span {
+            start: START_ADDRESS,
             address,
             length: 0x20,
         });
@@ -2196,6 +2220,7 @@ mod tests {
     #[should_panic(expected = "spans holding 65 bytes together, past the 64 a capture holds")]
     fn a_watch_refuses_spans_a_capture_cannot_hold() {
         capturing_spans(&[Span {
+            start: START_ADDRESS,
             address: 0,
             length: 65,
         }]);
@@ -2205,7 +2230,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "spans holding 65600 bytes together, past the 64 a capture holds")]
     fn a_watch_refuses_spans_whose_sum_wraps_in_16_bits() {
-        let spans = [0xFFFF, 0x41].map(|length| Span { address: 0, length });
+        let spans = [0xFFFF, 0x41].map(|length| Span {
+            start: START_ADDRESS,
+            address: 0,
+            length,
+        });
         capturing_spans(&spans);
     }
 
@@ -2213,9 +2242,19 @@ mod tests {
     #[should_panic(expected = "a span past &FFFF")]
     fn a_watch_refuses_a_span_past_ffff() {
         capturing_spans(&[Span {
+            start: START_ADDRESS,
             address: 0xFFF0,
             length: 0x11,
         }]);
+    }
+
+    #[test]
+    fn a_watch_takes_a_span_at_a_register_running_past_ffff() {
+        capturing_spans(&[START_SP, START_PC].map(|start| Span {
+            start,
+            address: 0xFFF0,
+            length: 0x11,
+        }));
     }
 
     #[test]
@@ -2240,6 +2279,14 @@ mod tests {
         let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
         let mut watch = Watch::new(&counting, &mut [], &mut counts, &mut [], 1, 1);
         cpc.run(1, 100, Some(&mut watch));
+    }
+
+    #[test]
+    #[should_panic(expected = "upper ROM 7 is fitted already")]
+    fn a_cpc_refuses_a_second_rom_in_a_socket() {
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        cpc.set_upper_rom(7, rom(&[], HALT));
+        cpc.set_upper_rom(7, rom(&[], HALT));
     }
 
     #[test]

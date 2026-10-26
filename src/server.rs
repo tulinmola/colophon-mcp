@@ -27,8 +27,8 @@ use crate::fields::{self, Fields, Segment, hexadecimal_number};
 use crate::keys::Key;
 use crate::machine::{
     ANY_MEMORY, CAPTURED_BYTES, COUNT, CRTC, Capture, Condition, EXECUTE, FIRST_ROM_LOCATION,
-    GATHER, IN, Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run, Span,
-    UNTIL, WRITE,
+    GATHER, IN, Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run,
+    START_ADDRESS, START_PC, START_SP, Span, Start, UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
@@ -90,6 +90,13 @@ const MOST_INSTRUCTIONS_LISTED: u16 = 256;
 const MOST_STATES: usize = 64;
 // The hexadecimal digits of MOST_BYTES, as many characters as peek answers.
 const MOST_JOURNAL_CHARACTERS: usize = 2 * MOST_BYTES as usize;
+// An address found takes some 8 characters, so these come to about a quarter
+// of what MOST_BYTES does.
+const MOST_FOUND: usize = 256;
+// A search of all 64K for this many bytes, matched at every address, took
+// some 14 milliseconds in a release build where this was written, and some
+// 420 in a debug one.
+const MOST_SOUGHT: usize = 256;
 
 // A machine holds raw pointers, a CPC's into itself, so it is not Send, and
 // the server must be. Each is built on a thread of its own, never leaves it,
@@ -389,6 +396,58 @@ fn address(value: &Value) -> Result<u16, String> {
         .ok_or_else(|| format!("{value} is not an address; {ADDRESS_FORMS}"))
 }
 
+// The processor's registers a read may start where they point, by inspect's
+// paths.
+const REGISTERS: [(&str, Start); 2] = [("cpu.sp", START_SP), ("cpu.pc", START_PC)];
+
+const REGISTER_FORMS: &str = "\"cpu.sp\" or \"cpu.pc\" stands for the address the register holds";
+
+// An address, or a register that holds one, kept once in a tool's $defs and
+// named from wherever it is taken.
+struct AddressOrRegisterForms;
+
+impl JsonSchema for AddressOrRegisterForms {
+    fn schema_name() -> Cow<'static, str> {
+        "AddressOrRegister".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        let mut forms = address_value();
+        let names: Vec<&str> = REGISTERS.iter().map(|(name, _)| *name).collect();
+        forms["anyOf"]
+            .as_array_mut()
+            .expect("the forms of an address")
+            .push(json!({ "enum": names }));
+        Schema::try_from(forms).expect("an object is a schema")
+    }
+}
+
+fn address_or_register_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<AddressOrRegisterForms>()
+}
+
+fn start(value: &Value) -> Result<(Start, u16), String> {
+    match REGISTERS
+        .iter()
+        .find(|(name, _)| value.as_str() == Some(*name))
+    {
+        Some((_, start)) => Ok((*start, 0)),
+        None => address(value)
+            .map(|address| (START_ADDRESS, address))
+            .map_err(|problem| format!("{problem}; {REGISTER_FORMS}")),
+    }
+}
+
+fn start_written(start: Start, address: u16) -> Value {
+    REGISTERS
+        .iter()
+        .find(|(_, register)| *register == start)
+        .map_or_else(
+            || json!(Hexadecimal::address(address)),
+            |(name, _)| json!(name),
+        )
+}
+
 const RAM_ADDRESS_FORMS: &str = "an address in the RAM is a number from 0 to 131071, or \
                                  hexadecimal from &0000 to &1FFFF, written with &, #, $ or 0x \
                                  before it";
@@ -461,7 +520,9 @@ const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, 
                              one of the two: a path names one of the processor's values under \
                              cpu, such as \"cpu.a\", \"cpu.h\" or \"cpu.ixh\", and a span is \
                              {\"address\": address, \"length\": bytes}, 1 to 64 bytes, 1 if \
-                             length is not given, none past &FFFF";
+                             length is not given, none past &FFFF; the address may be \
+                             \"cpu.sp\" or \"cpu.pc\", where the register points at the \
+                             capture, and the span then wraps past &FFFF to &0000";
 
 const PSG_REGISTER_FORMS: &str = "a PSG register is a number from 0 to 15";
 
@@ -504,7 +565,7 @@ struct Capturing {
 }
 
 fn same_span(one: &Span, other: &Span) -> bool {
-    (one.address, one.length) == (other.address, other.length)
+    (one.start, one.address, one.length) == (other.start, other.address, other.length)
 }
 
 // A value of the processor's, by inspect's path, which reaches no structure
@@ -546,7 +607,7 @@ fn captured_span(given: &Value) -> Result<Span, String> {
     let first = fields
         .get("address")
         .ok_or_else(|| format!("{given} has no address"))?;
-    let first = address(first).map_err(|problem| format!("address {problem}"))?;
+    let (start, first) = start(first).map_err(|problem| format!("address {problem}"))?;
     let length = fields
         .get("length")
         .map_or(Some(1), Value::as_i64)
@@ -554,9 +615,14 @@ fn captured_span(given: &Value) -> Result<Span, String> {
         .ok_or_else(|| {
             format!("{given} has a length that is not an integer from 1 to {CAPTURED_BYTES}")
         })?;
+    let length = match start {
+        START_ADDRESS => span(first, length)?,
+        _ => u16::try_from(length).expect("a length of 1 to CAPTURED_BYTES"),
+    };
     Ok(Span {
+        start,
         address: first,
-        length: span(first, length)?,
+        length,
     })
 }
 
@@ -614,7 +680,7 @@ impl JsonSchema for CaptureForms {
         let span = json!({
             "type": "object",
             "properties": {
-                "address": generator.subschema_for::<AddressForms>(),
+                "address": generator.subschema_for::<AddressOrRegisterForms>(),
                 "length": { "type": "integer", "minimum": 1, "maximum": CAPTURED_BYTES },
             },
             "required": ["address"],
@@ -1150,7 +1216,7 @@ fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
                     .memory
                     .iter()
                     .map(|span| {
-                        json!({ "address": Hexadecimal::address(span.address), "length": span.length })
+                        json!({ "address": start_written(span.start, span.address), "length": span.length })
                     })
                     .collect();
                 captured.insert("memory".to_owned(), json!(memory));
@@ -1254,6 +1320,54 @@ fn bytes(text: &str) -> Result<Vec<u8>, String> {
     })
 }
 
+// What a search looks for, a byte at a time: a value, and the mask of the
+// bits a byte must share with it.
+fn sought(pattern: Vec<(u8, u8)>, field: &str, units: &str) -> Result<Vec<(u8, u8)>, String> {
+    if !(1..=MOST_SOUGHT).contains(&pattern.len()) {
+        return Err(format!(
+            "{field} holds {} {units}; give 1 to {MOST_SOUGHT}",
+            pattern.len()
+        ));
+    }
+    Ok(pattern)
+}
+
+fn pattern(text: &str) -> Result<Vec<(u8, u8)>, String> {
+    let digits: Vec<char> = text
+        .chars()
+        .filter(|digit| !digit.is_whitespace())
+        .collect();
+    let pattern = digits.chunks(2).map(|pair| match pair {
+        ['?', '?'] => Some((0, 0)),
+        [high, low] if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() => {
+            u8::from_str_radix(&format!("{high}{low}"), 16)
+                .ok()
+                .map(|byte| (byte, 0xFF))
+        }
+        _ => None,
+    });
+    let pattern = pattern.collect::<Option<Vec<_>>>().ok_or_else(|| {
+        format!(
+            "{text} is not bytes; write bytes as pairs of hexadecimal digits, with ?? for any \
+             byte, such as CD ?? 14"
+        )
+    })?;
+    sought(pattern, "bytes", "bytes")
+}
+
+fn text_pattern(text: &str) -> Result<Vec<(u8, u8)>, String> {
+    if let Some(other) = text.chars().find(|character| !character.is_ascii()) {
+        return Err(format!(
+            "text holds {other}, which is not ASCII; give ASCII characters only"
+        ));
+    }
+    sought(
+        text.bytes().map(|code| (code, 0x7F)).collect(),
+        "text",
+        "characters",
+    )
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OpenRequest {
@@ -1304,7 +1418,7 @@ struct RunRequest {
     /// - `"memory": "ram"` or `"rom"` (execute, read): match only bytes the RAM holds, or only bytes a ROM holds. On a CPC the lower ROM covers &0000 to &3FFF and an upper ROM &C000 to &FFFF, each while the Gate Array enables it; on a Spectrum the ROM covers &0000 to &3FFF.
     /// - `"value"`, with `"value_to"` for a range (all but execute and in): match only when the byte read, written or given to the register is in that range. `{"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"}` matches the writes that set the Gate Array's mode, ROMs and interrupt counter.
     /// - `"changes": true` (write, psg, crtc): match only a write that changes the byte, or the bits the register keeps. `{"write": "&C7EC", "value": 6, "changes": true}` is the write that makes that byte 6.
-    /// - `"capture": {"values": paths, "memory": spans}` (until and gather): each match then has a `captured` field with what the machine held. A path names one of the processor's values under `cpu`, as `inspect` names it: HL is `cpu.h` and `cpu.l`, IX is `cpu.ixh` and `cpu.ixl`, and the alternate set is held in pairs, as `cpu.hl_`. A span is `{"address": address, "length": bytes}`, 1 to 64 bytes (1 if `length` is omitted), none past &FFFF. An execute captures before its instruction runs. An access captures at the end of the instruction that made it, before any interrupt response there (IFF1 is already clear then); an access made by an interrupt response captures at the response's end. A request's captures may name at most 16 distinct values and spans together, reading at most 64 bytes.
+    /// - `"capture": {"values": paths, "memory": spans}` (until and gather): each match then has a `captured` field with what the machine held. A path names one of the processor's values under `cpu`, as `inspect` names it: HL is `cpu.h` and `cpu.l`, IX is `cpu.ixh` and `cpu.ixl`, and the alternate set is held in pairs, as `cpu.hl_`. A span is `{"address": address, "length": bytes}`, 1 to 64 bytes (1 if `length` is omitted), none past &FFFF; with `"address": "cpu.sp"` or `"cpu.pc"` it starts where that register points at the capture, and wraps past &FFFF to &0000. An execute captures before its instruction runs. An access captures at the end of the instruction that made it, before any interrupt response there (IFF1 is already clear then); an access made by an interrupt response captures at the response's end. A request's captures may name at most 16 distinct values and spans together, reading at most 64 bytes.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -1534,8 +1648,8 @@ struct SetRequest {
 struct PeekRequest {
     /// The handle `machine_open` returned.
     handle: String,
-    /// The first address, as the processor reads it. Give this or `ram`.
-    #[schemars(schema_with = "address_schema")]
+    /// The first address, as the processor reads it, or `"cpu.sp"` or `"cpu.pc"` for the address that register holds. Give this or `ram`.
+    #[schemars(schema_with = "address_or_register_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     address: Option<Value>,
@@ -1544,7 +1658,7 @@ struct PeekRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     ram: Option<Value>,
-    /// How many bytes, 1 to 4096, none past &FFFF, or with `ram` past the end of the RAM. Default 1.
+    /// How many bytes, 1 to 4096. From an address, none past &FFFF; from `cpu.sp` or `cpu.pc`, the bytes wrap past &FFFF to &0000. With `ram`, none past the end of the RAM. Default 1.
     #[schemars(range(min = 1, max = MOST_BYTES))]
     #[schemars(transform = absent_not_null)]
     length: Option<i64>,
@@ -1561,6 +1675,29 @@ struct PokeRequest {
     address: Value,
     /// The bytes, as pairs of hexadecimal digits: `3E05C9` or `3E 05 C9`. 1 to 4096 bytes, none past &FFFF.
     bytes: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FindRequest {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The bytes to find, as pairs of hexadecimal digits, with `??` for any byte: `CD ?? 14` or `CD??14`. 1 to 256 bytes. Give this or `text`.
+    #[schemars(transform = absent_not_null)]
+    bytes: Option<String>,
+    /// The text to find: 1 to 256 ASCII characters, each matching a byte whose low 7 bits are its code. Case matters. Give this or `bytes`.
+    #[schemars(transform = absent_not_null)]
+    text: Option<String>,
+    /// The first address searched. Default &0000.
+    #[schemars(schema_with = "address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    address: Option<Value>,
+    /// The last address searched; a match lies wholly between `address` and `to`. Default &FFFF.
+    #[schemars(schema_with = "address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    to: Option<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1610,8 +1747,8 @@ struct ScreenRequest {
 struct DisassembleRequest {
     /// The handle `machine_open` returned.
     handle: String,
-    /// Where the first instruction starts.
-    #[schemars(schema_with = "address_schema")]
+    /// Where the first instruction starts: an address, or `"cpu.pc"` or `"cpu.sp"` for the address that register holds.
+    #[schemars(schema_with = "address_or_register_schema")]
     address: Value,
     /// How many instructions, 1 to 256. Default 16.
     #[schemars(range(min = 1, max = MOST_INSTRUCTIONS_LISTED))]
@@ -1850,7 +1987,7 @@ struct Captured {
 
 #[derive(Serialize, JsonSchema)]
 struct CapturedSpan {
-    /// The span's first address, as the processor reads it, in hexadecimal after &.
+    /// The address of the span's first byte, as the processor reads it, in hexadecimal after &. For a span at `cpu.sp` or `cpu.pc`, the address the register held.
     address: Hexadecimal,
     /// The bytes, as pairs of hexadecimal digits.
     bytes: String,
@@ -1889,7 +2026,7 @@ impl Captured {
             let length = usize::from(span.length);
             if named.spans & (1 << index) != 0 {
                 memory.push(CapturedSpan {
-                    address: Hexadecimal::address(span.address),
+                    address: Hexadecimal::address(capture.cpu.start(span.start, span.address)),
                     bytes: digit_pairs(&capture.memory[offset..offset + length]),
                 });
             }
@@ -2244,7 +2381,7 @@ struct Written {
 
 #[derive(Serialize, JsonSchema)]
 struct Peeked {
-    /// The first address read, as the processor reads it, in hexadecimal after &. Given with `address`.
+    /// The first address read, as the processor reads it, in hexadecimal after &: for `cpu.sp` or `cpu.pc`, the address the register held. Given with `address`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     address: Option<Hexadecimal>,
@@ -2262,6 +2399,18 @@ struct Poked {
     address: Hexadecimal,
     /// The number of bytes written.
     length: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Found {
+    /// The addresses where matches start, in hexadecimal after &, lowest first: at most the first 256.
+    addresses: Vec<Hexadecimal>,
+    /// The number of matches from `address` to `to`, listed or not.
+    count: usize,
+    /// The address of the first match not listed: search again from it, with the same `to`, for the rest. Not given when every match is listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    next: Option<Hexadecimal>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -2418,8 +2567,7 @@ fn span(address: u16, length: i64) -> Result<u16, String> {
     if u32::from(length) > room {
         return Err(format!(
             "{length} bytes from &{address:04X} run past &FFFF, the end of the processor's memory; \
-             give at most {} from there",
-            room.min(u32::from(MOST_BYTES))
+             give at most {room} from there"
         ));
     }
     Ok(length)
@@ -2915,7 +3063,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Put a disc in a CPC's drive: a DSK image, original or extended layout, read whole and copied into the machine, as the emulator's command line does with --disc. The machine writes to its copy, never to the file, and what it wrote is lost when another disc replaces it, except in states kept while it was in the drive. The new disc replaces whatever the drive held, as when a game asks for its second side. Only a cpc664 or a cpc6128 takes discs: a cpc464 is built without the disc interface. An image the emulator cannot read is refused with the reason, and the drive keeps its disc. The answer gives the file's SHA-256 and the machine's tick at insertion.
+    /// Put a disc in a CPC's drive: a DSK image, original or extended layout, read whole and copied into the machine, as the emulator's command line does with --disc. The machine writes to its copy, never to the file, and what it wrote is lost when another disc replaces it, except in states kept while it was in the drive. The new disc replaces whatever the drive held, as when a game asks for its second side. Only a cpc664 or a cpc6128 takes discs: a cpc464 is built without the disc interface. An image the emulator cannot read is refused with the reason, and the drive keeps its disc. On a machine opened from a snapshot, AMSDOS reads no disc until `set` writes the disc controller's fields that `machine_open` lists. The answer gives the file's SHA-256 and the machine's tick at insertion.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3145,7 +3293,7 @@ impl Server {
         }))
     }
 
-    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal, paths absolute, and each file read or written named by its SHA-256.
+    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given), paths absolute, and each file read or written named by its SHA-256.
     /// - Reads are not recorded, nor are states kept or dropped. Restoring a state makes the journal the state's.
     /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
     /// - Entries are returned from `from` on, as many as fit in 8192 characters, and at least one while any remain; `next` gives where the next page starts.
@@ -3196,7 +3344,10 @@ impl Server {
         }))
     }
 
-    /// Read what a machine holds by path, written as a C expression on the emulator's struct for the machine, `cpc_t` or `spectrum_t`: `cpu.pc`, `crtc.registers[12]`, `gate_array.inks`, `fdc.units[0].head`. Without a path, the whole machine. Fields keep their header names, numbers are JSON numbers, and an enum is given by its enumerator's name. Pointers are not followed; `peek` reads memory. Some fields are the emulator's own machinery for stepping the chips tick by tick rather than chip registers; the headers say which.
+    /// Read what a machine holds by path, written as a C expression on the emulator's struct for the machine, `cpc_t` or `spectrum_t`: `cpu.pc`, `crtc.registers[12]`, `gate_array.inks`, `fdc.units[0].head`. Without a path, the whole machine. Fields keep their header names, numbers are JSON numbers, and an enum is given by its enumerator's name. Pointers are not followed; `peek` reads memory. Most fields are the chips' inner workings, the board's links and drives, or the emulator's own machinery for stepping the chips tick by tick. The fields a program works with most, and the monitor's beam, are these:
+    /// - Both machines: the processor's `cpu.a`, `cpu.f`, `cpu.b`, `cpu.c`, `cpu.d`, `cpu.e`, `cpu.h`, `cpu.l`, `cpu.ixh`, `cpu.ixl`, `cpu.iyh`, `cpu.iyl`, `cpu.sp`, `cpu.pc`, `cpu.i`, `cpu.r`, `cpu.im`, `cpu.iff1`, `cpu.iff2` and `cpu.halted`, and its alternate set as pairs, `cpu.af_`, `cpu.bc_`, `cpu.de_` and `cpu.hl_`. The main set, IX and IY are read a byte at a time: HL is `cpu.h` and `cpu.l`. The keyboard's `keyboard.lines`, a set bit meaning a key released. Where the monitor's beam stands, `monitor.beam_x` and `monitor.beam_y`.
+    /// - CPC: the 6845's `crtc.registers` and `crtc.address_register`, and its counters `crtc.c0` (characters), `crtc.c9` (the line within the row) and `crtc.c4` (rows). The Gate Array's `gate_array.pen`, `gate_array.inks` (the border at 16), `gate_array.mode`, `gate_array.lower_rom_enabled`, `gate_array.upper_rom_enabled` and `gate_array.r52`, its interrupt counter. `upper_rom_number`, the upper ROM selected, and `mmr`, a 6128's RAM configuration. `ppi.output` and `ppi.control`, `psg.registers` and `psg.selected`. The disc controller's `fdc.st0`, `fdc.st1`, `fdc.st2`, `fdc.c`, `fdc.h`, `fdc.r` and `fdc.n`, and what SPECIFY sets: `fdc.step_time`, `fdc.head_load_time` and `fdc.head_unload_time`, in microseconds, and `fdc.non_dma`.
+    /// - Spectrum: the ULA's `ula.border`, `ula.speaker` and `ula.microphone`, and `ula.frame_tick`, the T-states since the frame's interrupt.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
         &self,
@@ -3243,10 +3394,14 @@ impl Server {
         let (_, orders) = self.thread(&request.handle)?;
         let (address, ram, bytes) = match (&request.address, &request.ram) {
             (Some(given), None) => {
-                let address = address(given)?;
-                let length = span(address, length)?;
-                let bytes = Server::ask(&request.handle, orders, move |built| {
-                    built.peek(address, length)
+                let (start, address) = start(given)?;
+                let length = match start {
+                    START_ADDRESS => span(address, length)?,
+                    _ => bytes_asked(length)?,
+                };
+                let (address, bytes) = Server::ask(&request.handle, orders, move |built| {
+                    let address = built.start(start, address);
+                    (address, built.peek(address, length))
                 })
                 .await?;
                 (Some(Hexadecimal::address(address)), None, bytes)
@@ -3273,6 +3428,66 @@ impl Server {
             address,
             ram,
             bytes: digit_pairs(&bytes),
+        }))
+    }
+
+    /// Search a machine's memory for bytes or for text, read as `peek` reads it with `address`: through the banking and the ROMs in front of the RAM. Matches may overlap.
+    /// - `bytes`: an address is stored low byte first, so `"6F 14"` finds every absolute reference to &146F: CALL, JP and their conditional forms, LD, and tables of addresses. Data may hold the same bytes. A relative jump (JR, DJNZ) holds a displacement instead, and is not found this way.
+    /// - `text`: a word or a string whose last character has bit 7 set, as both machines' ROMs end many of theirs, is found too.
+    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
+    async fn find(
+        &self,
+        Parameters(request): Parameters<FindRequest>,
+    ) -> Result<Json<Found>, String> {
+        let pattern = match (&request.bytes, &request.text) {
+            (Some(bytes), None) => pattern(bytes)?,
+            (None, Some(text)) => text_pattern(text)?,
+            _ => {
+                return Err(
+                    "give bytes or text, exactly one: {\"bytes\": \"CD ?? 14\"} finds those \
+                     bytes, ?? matching any byte, and {\"text\": \"READY\"} finds that text, bit \
+                     7 ignored"
+                        .to_owned(),
+                );
+            }
+        };
+        let first = request
+            .address
+            .as_ref()
+            .map(address)
+            .transpose()
+            .map_err(|problem| format!("address {problem}"))?
+            .unwrap_or(0);
+        let last = request
+            .to
+            .as_ref()
+            .map(address)
+            .transpose()
+            .map_err(|problem| format!("to {problem}"))?
+            .unwrap_or(0xFFFF);
+        if last < first {
+            return Err(format!(
+                "to {} is below address {}; give a to of {} or above",
+                Hexadecimal::address(last),
+                Hexadecimal::address(first),
+                Hexadecimal::address(first)
+            ));
+        }
+        let (_, orders) = self.thread(&request.handle)?;
+        let found = Server::ask(&request.handle, orders, move |built| {
+            built.find(first, last, &pattern)
+        })
+        .await?;
+        Ok(Json(Found {
+            addresses: found
+                .iter()
+                .take(MOST_FOUND)
+                .map(|address| Hexadecimal::address(*address))
+                .collect(),
+            count: found.len(),
+            next: found
+                .get(MOST_FOUND)
+                .map(|address| Hexadecimal::address(*address)),
         }))
     }
 
@@ -3352,7 +3567,7 @@ impl Server {
         &self,
         Parameters(request): Parameters<DisassembleRequest>,
     ) -> Result<Json<Disassembled>, String> {
-        let address = address(&request.address)?;
+        let (start, address) = start(&request.address)?;
         let instructions = request.instructions.unwrap_or(16);
         let instructions = u16::try_from(instructions)
             .ok()
@@ -3365,6 +3580,7 @@ impl Server {
             })?;
         let (_, orders) = self.thread(&request.handle)?;
         let listed = Server::ask(&request.handle, orders, move |built| {
+            let address = built.start(start, address);
             built.disassemble(address, instructions, usize::from(MOST_BYTES))
         })
         .await??;
@@ -3435,7 +3651,7 @@ impl ServerHandler for Server {
         let call = ToolCallContext::new(self, request, context);
         Ok(match router.call(call).await? {
             CallToolResponse::Complete(mut result) => {
-                result.meta.get_or_insert_default().0.extend(identified().0);
+                result.meta = Some(identified());
                 CallToolResponse::Complete(result)
             }
             response => response,

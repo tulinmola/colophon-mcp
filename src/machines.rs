@@ -19,7 +19,7 @@ use crate::fields::{self, Fields, Segment};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
     COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run,
-    SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Watch, gate_array_rgb, ula_rgb,
+    SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Start, Watch, gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -1374,6 +1374,28 @@ impl Built {
             Hardware::Cpc(cpc) => cpc.peek(address),
             Hardware::Spectrum(spectrum) => spectrum.peek(address),
         }
+    }
+
+    pub fn start(&self, start: Start, address: u16) -> u16 {
+        self.cpu().start(start, address)
+    }
+
+    // Where each match of the pattern starts, lowest first, in memory read as
+    // the processor reads it from first to last, no match running past last.
+    pub fn find(&self, first: u16, last: u16, pattern: &[(u8, u8)]) -> Vec<u16> {
+        assert!(!pattern.is_empty(), "a pattern of a byte at least");
+        let memory: Vec<u8> = (first..=last).map(|address| self.read(address)).collect();
+        memory
+            .windows(pattern.len())
+            .enumerate()
+            .filter(|(_, bytes)| {
+                bytes
+                    .iter()
+                    .zip(pattern)
+                    .all(|(byte, (value, mask))| byte & mask == *value)
+            })
+            .map(|(offset, _)| first + offset as u16)
+            .collect()
     }
 
     // Instructions read as the processor would read them, from an address

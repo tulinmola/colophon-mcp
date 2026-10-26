@@ -119,8 +119,9 @@ static void capture(mcp_watch_t *watch, const z80_t *cpu) {
     uint32_t byte = 0;
     for (uint32_t index = 0; index < watch->span_count; index++) {
       const mcp_span_t *span = &watch->spans[index];
+      uint16_t first = mcp_z80_start(cpu, span->start, span->address);
       for (uint32_t offset = 0; offset < span->length; offset++) {
-        uint16_t address = (uint16_t)(span->address + offset);
+        uint16_t address = (uint16_t)(first + offset);
         kept->memory[byte++] = watch->peek(watch->machine, address);
       }
     }
@@ -263,6 +264,10 @@ void mcp_watch_end(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monito
 }
 
 bool mcp_z80_halted_for_good(const z80_t *cpu) { return cpu->halted && !cpu->iff1; }
+
+uint16_t mcp_z80_start(const z80_t *cpu, mcp_start_t start, uint16_t address) {
+  return start == MCP_START_SP ? cpu->sp : start == MCP_START_PC ? cpu->pc : address;
+}
 
 bool mcp_watch_stopping(const mcp_watch_t *watch) {
   return watch != NULL && (watch->matched || watch->full || watch->returned);

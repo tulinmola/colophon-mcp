@@ -107,9 +107,20 @@ typedef struct {
 /* The most bytes of memory one capture holds, the watch's spans together. */
 #define MCP_CAPTURED_BYTES 64
 
-/* A span of memory captured: the address the processor reaches its first
-   byte at, and how many bytes, the last no further than &FFFF. */
+/* Where a span of memory starts: at its own address, or at the address the
+   processor's SP or PC holds as the capture is taken. */
+typedef enum {
+  MCP_START_ADDRESS,
+  MCP_START_SP,
+  MCP_START_PC,
+} mcp_start_t;
+
+/* A span of memory captured: where it starts, the address the processor
+   reaches its first byte at when it starts at its own, and how many bytes.
+   One at its own address ends at &FFFF or before; one at SP or PC runs on
+   past &FFFF to &0000, as the processor's addresses do. */
 typedef struct {
+  mcp_start_t start;
   uint16_t address;
   uint16_t length;
 } mcp_span_t;
@@ -292,6 +303,10 @@ uint32_t mcp_cpc_locations(const cpc_t *cpc);
  * NMI, the only other way out of HALT but a reset, so only an NMI written in
  * from outside wakes it. */
 bool mcp_z80_halted_for_good(const z80_t *cpu);
+
+/* Where a span starts as the processor stands: at its own address, or at the
+ * one SP or PC holds. */
+uint16_t mcp_z80_start(const z80_t *cpu, mcp_start_t start, uint16_t address);
 
 /* Call the routine at this address: push the program counter, as the
  * processor's CALL does, and jump. NULL if called, or a sentence saying why
