@@ -2474,6 +2474,10 @@ struct Listed {
     bytes: String,
     /// The instruction in Zilog's mnemonics, with addresses, bytes and displacements in hexadecimal after &, such as "LD HL,&1234".
     text: String,
+    /// On a CPC, the name SOFT 968 gives the firmware entry the instruction jumps or calls to, for the entries `disassemble`'s description lists. Not given for any other instruction, nor on a Spectrum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    firmware: Option<&'static str>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -3561,7 +3565,10 @@ impl Server {
         })
     }
 
-    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. Memory is read as `peek` reads it, wrapping from &FFFF to &0000. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts.
+    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. Memory is read as `peek` reads it, wrapping from &FFFF to &0000. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts. On a CPC, an instruction that jumps or calls to an entry of the firmware's jumpblocks has `firmware`, the entry's name in SOFT 968, Amstrad's firmware manual, such as "KM WAIT KEY" for `CALL &BB18`. The name goes with the address, whatever memory holds there now. The entries named, 3 bytes apart:
+    /// - The main jumpblock: &BB00 to &BD5B on a cpc6128, to &BD58 on a cpc664, to &BD37 on a cpc464.
+    /// - The high kernel jumpblock: &B900 to &B921, and &B92A on a cpc664 or a cpc6128.
+    /// - The indirections: &BDCD to &BDF4 on a cpc664 or a cpc6128, to &BDF1 on a cpc464.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn disassemble(
         &self,
@@ -3578,7 +3585,7 @@ impl Server {
                      disassemble again from where the listing ends to go further"
                 )
             })?;
-        let (_, orders) = self.thread(&request.handle)?;
+        let (machine, orders) = self.thread(&request.handle)?;
         let listed = Server::ask(&request.handle, orders, move |built| {
             let address = built.start(start, address);
             built.disassemble(address, instructions, usize::from(MOST_BYTES))
@@ -3587,10 +3594,13 @@ impl Server {
         Ok(Json(Disassembled {
             instructions: listed
                 .into_iter()
-                .map(|(address, bytes, text)| Listed {
+                .map(|(address, bytes, instruction)| Listed {
                     address: Hexadecimal::address(address),
                     bytes: digit_pairs(&bytes),
-                    text,
+                    text: instruction.text,
+                    firmware: instruction
+                        .target
+                        .and_then(|target| machine.firmware_entry(target)),
                 })
                 .collect(),
         }))

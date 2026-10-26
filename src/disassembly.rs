@@ -25,6 +25,9 @@ const BLI: [[&str; 4]; 4] = [
 pub struct Instruction {
     pub length: usize,
     pub text: String,
+    // Where a jump, a call or a restart that names where it goes would go,
+    // whether its condition is met or not.
+    pub target: Option<u16>,
 }
 
 struct Cuts {
@@ -60,6 +63,7 @@ struct Decoding<'a> {
     length: usize,
     index: Option<&'static str>,
     displacement: Option<i8>,
+    target: Option<u16>,
 }
 
 impl Decoding<'_> {
@@ -94,7 +98,15 @@ impl Decoding<'_> {
     fn relative(&mut self) -> String {
         let step = i16::from(self.next().cast_signed());
         let end = self.address.wrapping_add(self.length as u16);
-        word(end.wrapping_add_signed(step))
+        let target = end.wrapping_add_signed(step);
+        self.target = Some(target);
+        word(target)
+    }
+
+    fn absolute(&mut self) -> String {
+        let target = self.word();
+        self.target = Some(target);
+        word(target)
     }
 
     fn operand(&mut self, number: u8) -> String {
@@ -198,9 +210,9 @@ impl Decoding<'_> {
                 2 => format!("JP ({})", self.hl()),
                 _ => format!("LD SP,{}", self.hl()),
             },
-            2 => format!("JP {},{}", CC[usize::from(y)], word(self.word())),
+            2 => format!("JP {},{}", CC[usize::from(y)], self.absolute()),
             3 => match y {
-                0 => format!("JP {}", word(self.word())),
+                0 => format!("JP {}", self.absolute()),
                 2 => format!("OUT ({}),A", byte(self.next())),
                 3 => format!("IN A,({})", byte(self.next())),
                 4 => format!("EX (SP),{}", self.hl()),
@@ -208,11 +220,14 @@ impl Decoding<'_> {
                 6 => "DI".to_owned(),
                 _ => "EI".to_owned(),
             },
-            4 => format!("CALL {},{}", CC[usize::from(y)], word(self.word())),
+            4 => format!("CALL {},{}", CC[usize::from(y)], self.absolute()),
             5 if q == 0 => format!("PUSH {}", self.pair(&RP2, p)),
-            5 => format!("CALL {}", word(self.word())),
+            5 => format!("CALL {}", self.absolute()),
             6 => format!("{}{}", ALU[usize::from(y)], byte(self.next())),
-            _ => format!("RST {}", byte(y * 8)),
+            _ => {
+                self.target = Some(u16::from(y * 8));
+                format!("RST {}", byte(y * 8))
+            }
         }
     }
 
@@ -282,6 +297,7 @@ pub fn instruction(read: &dyn Fn(u16) -> u8, address: u16, most: usize) -> Optio
         length: 0,
         index: None,
         displacement: None,
+        target: None,
     };
     let mut opcode = decoding.next();
     while opcode == 0xDD || opcode == 0xFD {
@@ -309,6 +325,7 @@ pub fn instruction(read: &dyn Fn(u16) -> u8, address: u16, most: usize) -> Optio
     Some(Instruction {
         length: decoding.length,
         text,
+        target: decoding.target,
     })
 }
 
@@ -362,10 +379,12 @@ mod tests {
 
     // Every instruction is as long as what step runs, and every jump goes
     // where the listing says, the emulator's processor being the measure of
-    // both: with every flag clear and B zero, which DJNZ counts down past, a
-    // jump is taken unless its condition wants a flag set. Each runs from
-    // RAM, with interrupts disabled, its operands after it, and the
-    // registers pointing where nothing it writes reaches it.
+    // both; a jump's target is the address its text names, and an
+    // instruction that names none has none. With every flag clear and B
+    // zero, which DJNZ counts down past, a jump is taken unless its condition
+    // wants a flag set. Each runs from RAM, with interrupts disabled, its
+    // operands after it, and the registers pointing where nothing it writes
+    // reaches it.
     #[test]
     fn an_instruction_is_as_long_as_what_step_runs_and_jumps_where_it_says() {
         let rom = Box::new([0xF3; SPECTRUM_ROM_SIZE as usize]);
@@ -384,6 +403,10 @@ mod tests {
             let read = |address: u16| bytes[usize::from(address - 0x8000)];
             let listed = instruction(&read, 0x8000, 4096).expect("an instruction");
             let (mnemonic, operands) = listed.text.split_once(' ').unwrap_or((&listed.text, ""));
+            let target = operands.rsplit('&').next().unwrap_or_default();
+            let target = u16::from_str_radix(target, 16).ok();
+            let target = target.filter(|_| JUMPS.contains(&mnemonic));
+            assert_eq!(listed.target, target, "{form:02X?}: {}", listed.text);
             if UNLISTED_TARGETS.contains(&mnemonic) || operands.starts_with('(') && mnemonic == "JP"
             {
                 continue;
@@ -395,10 +418,8 @@ mod tests {
             let step = spectrum.step(1);
             assert!(step.settled, "{form:02X?}");
             let next = 0x8000 + listed.length as u16;
-            let expected = if JUMPS.contains(&mnemonic) {
+            let expected = if let Some(target) = target {
                 jumped += 1;
-                let target = operands.rsplit('&').next().unwrap_or_default();
-                let target = u16::from_str_radix(target, 16).expect("a target");
                 match operands.split_once(',') {
                     Some((condition, _)) if !MET.contains(&condition) => next,
                     _ => target,

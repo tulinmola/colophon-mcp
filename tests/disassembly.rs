@@ -1,13 +1,16 @@
 // The disassembly tier: the listing held to two disassemblies no test here
 // wrote, The Complete Spectrum ROM Disassembly and SkoolKit's disassembler,
-// which `make test-disassembly` fetches and checks by their hashes.
+// and its names for a CPC's firmware entries to SOFT 968, which `make
+// test-disassembly` fetches and checks by their hashes.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use colophon_mcp::disassembly::instruction;
+use colophon_mcp::firmware::{self, VERSIONS, Version};
 
 fn evidence() -> PathBuf {
     PathBuf::from(
@@ -265,4 +268,186 @@ fn every_opcode_form_reads_as_skoolkit_disassembles_it() {
         forms.len(),
         differences.join("\n")
     );
+}
+
+// SOFT 968, The Amstrad 6128 Firmware Manual, as the text archive.org read
+// from its scan, each run of spaces and line breaks made one space. The
+// reading puts spaces where the print has none and leaves them out where it
+// has them, so an entry is found by its letters with the spaces taken out.
+fn soft_968() -> String {
+    let text = fs::read_to_string(evidence().join("soft968.txt")).expect("SOFT 968");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// "Entry address = Start of jumpblock + 3 * Entry number" (SOFT 968, 15).
+fn number(address: u16) -> u16 {
+    let first = [0xBDCD, 0xBB00, 0xB900]
+        .into_iter()
+        .find(|first| address >= *first)
+        .expect("a jumpblock");
+    (address - first) / 3
+}
+
+// A name in section 14's lists ends where the sentence saying what its entry
+// does begins: at a capital before a small letter, or at what is neither a
+// letter nor a digit, such as the quotation mark KL EVENT's begins with.
+fn ends_a_name(rest: &str) -> bool {
+    let mut characters = rest.chars();
+    match characters.next() {
+        Some(first) if first.is_ascii_uppercase() => {
+            characters.next().is_some_and(char::is_lowercase)
+        }
+        Some(first) => !first.is_alphanumeric(),
+        None => true,
+    }
+}
+
+// Every name a listing gives a CPC's firmware entry stands after the entry's
+// number and address in section 14's lists, and after the * they put on an
+// entry AMSDOS takes over. Where the reading of the scan garbled that line,
+// as it did two of the main jumpblock's, the name heads the entry's
+// description in section 15 instead.
+#[test]
+#[ignore = "needs SOFT 968: make test-disassembly"]
+fn every_firmware_entry_is_named_as_soft_968_names_it() {
+    let text = soft_968().replace(' ', "");
+    let entries: BTreeSet<(u16, &str)> = VERSIONS.into_iter().flat_map(firmware::entries).collect();
+    let mut missing = Vec::new();
+    for &(address, name) in &entries {
+        let (number, name) = (number(address), name.replace(' ', ""));
+        let listing = format!("{number}#{address:04X}");
+        let named = if text.contains(&listing) {
+            [format!("{listing}{name}"), format!("{listing}*{name}")]
+                .iter()
+                .any(|listed| {
+                    text.match_indices(listed.as_str())
+                        .any(|(at, _)| ends_a_name(&text[at + listed.len()..]))
+                })
+        } else {
+            [
+                format!("{number}:{name}#{address:04X}"),
+                format!("{number}{name}#{address:04X}"),
+            ]
+            .iter()
+            .any(|head| text.contains(head.as_str()))
+        };
+        if !named {
+            missing.push(format!("{number} &{address:04X} {name}"));
+        }
+    }
+    assert!(missing.is_empty(), "not in SOFT 968: {missing:?}");
+    assert_eq!(entries.len(), 229, "the entries of the three jumpblocks");
+}
+
+// How many times a name stands in the text as a whole, with no letter or
+// digit before or after it.
+fn times(text: &str, name: &str) -> usize {
+    text.match_indices(name)
+        .filter(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+        .count()
+}
+
+// Every name is spaced as SOFT 968 spaces it most: the reading of the scan
+// drops a space here and adds one there, but never as often as the print has
+// it, so each name stands in the text more often than any spelling a space
+// away from it, one more or one fewer.
+#[test]
+#[ignore = "needs SOFT 968: make test-disassembly"]
+fn every_firmware_entry_is_spaced_as_soft_968_spaces_it_most() {
+    let text = soft_968();
+    let names: BTreeSet<&str> = VERSIONS
+        .into_iter()
+        .flat_map(firmware::entries)
+        .map(|(_, name)| name)
+        .collect();
+    let mut misspelled = Vec::new();
+    for name in names {
+        let characters: Vec<char> = name.chars().collect();
+        let neighbours = (1..characters.len()).filter_map(|at| {
+            let (before, after) = (characters[at - 1], characters[at]);
+            let (head, tail) = name.split_at(at);
+            match (before, after) {
+                (_, ' ') => Some(format!("{head}{}", &tail[1..])),
+                (' ', _) => None,
+                _ => Some(format!("{head} {tail}")),
+            }
+        });
+        let most = neighbours.map(|neighbour| times(&text, &neighbour)).max();
+        if times(&text, name) <= most.unwrap_or(0) {
+            misspelled.push(name);
+        }
+    }
+    assert!(
+        misspelled.is_empty(),
+        "not as SOFT 968 spaces them: {misspelled:?}"
+    );
+}
+
+// Section 15 says of a main jumpblock entry V1.0 lacks "This routine is not
+// available on V1.0 firmware", and of one V1.0 and V1.1 lack "This routine
+// is only available on the CPC6128 (ie. V1.2 firmware)"; an entry it says
+// neither of is in every version. A note is taken to be the entry's whose
+// heading comes last before it, so a heading the scan's reading garbled
+// hands its notes to the entry before, and the versions disagree with SOFT
+// 968 rather than agree by chance.
+#[test]
+#[ignore = "needs SOFT 968: make test-disassembly"]
+fn each_version_has_the_main_jumpblock_entries_soft_968_says_it_has() {
+    let text = soft_968().replace(' ', "");
+    let start = text
+        .rfind("15TheMainFirmwareJumpblock.")
+        .expect("section 15");
+    let end = text
+        .rfind("16TheFirmwareIndirections.")
+        .expect("section 16");
+    let section = &text[start..end];
+    let main: Vec<(u16, &str)> = firmware::entries(Version::V1_2)
+        .filter(|(address, _)| (0xBB00..0xBDCD).contains(address))
+        .collect();
+    let headings: Vec<(usize, u16)> = main
+        .iter()
+        .filter_map(|&(address, name)| {
+            let (number, name) = (number(address), name.replace(' ', ""));
+            [
+                format!("{number}:{name}#{address:04X}"),
+                format!("{number}{name}#{address:04X}"),
+            ]
+            .iter()
+            .find_map(|head| section.find(head.as_str()))
+            .map(|at| (at, number))
+        })
+        .collect();
+    let lower = section.to_ascii_lowercase();
+    let noted = |note: &str| -> BTreeSet<u16> {
+        lower
+            .match_indices(note)
+            .map(|(at, _)| {
+                headings
+                    .iter()
+                    .filter(|(heading, _)| *heading < at)
+                    .max()
+                    .expect("a heading before the note")
+                    .1
+            })
+            .collect()
+    };
+    let not_in_v1_0 = noted("thisroutineisnotavailableonv1.0firmware");
+    let only_in_v1_2 = noted("thisroutineisonlyavailableonthecpc6128");
+    for (address, _) in main {
+        let number = number(address);
+        let in_v1_1 = !only_in_v1_2.contains(&number);
+        let in_v1_0 = in_v1_1 && !not_in_v1_0.contains(&number);
+        assert_eq!(
+            (
+                firmware::entry(Version::V1_0, address).is_some(),
+                firmware::entry(Version::V1_1, address).is_some()
+            ),
+            (in_v1_0, in_v1_1),
+            "entry {number} at &{address:04X}"
+        );
+    }
 }

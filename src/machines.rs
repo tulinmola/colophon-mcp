@@ -16,6 +16,7 @@ use crate::emulator::{
     keyboard_t, z80_t,
 };
 use crate::fields::{self, Fields, Segment};
+use crate::firmware::{self, Version};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
     COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run,
@@ -40,6 +41,7 @@ enum Board {
     // for upper ROM 0. The disc interface brings AMSDOS, as upper ROM 7.
     Cpc {
         firmware: &'static str,
+        version: Version,
         ram_size: usize,
         disc_interface: bool,
     },
@@ -54,6 +56,7 @@ pub const MACHINES: &[Machine] = &[
         name: "cpc6128",
         board: Board::Cpc {
             firmware: "cpc6128.rom",
+            version: Version::V1_2,
             ram_size: 0x20000,
             disc_interface: true,
         },
@@ -62,6 +65,7 @@ pub const MACHINES: &[Machine] = &[
         name: "cpc664",
         board: Board::Cpc {
             firmware: "cpc664.rom",
+            version: Version::V1_1,
             ram_size: 0x10000,
             disc_interface: true,
         },
@@ -70,6 +74,7 @@ pub const MACHINES: &[Machine] = &[
         name: "cpc464",
         board: Board::Cpc {
             firmware: "cpc464.rom",
+            version: Version::V1_0,
             ram_size: 0x10000,
             disc_interface: false,
         },
@@ -464,6 +469,7 @@ impl Machine {
                 firmware,
                 ram_size,
                 disc_interface,
+                ..
             } => {
                 let firmware = read(roms, firmware, 2 * CPC_ROM_SIZE, &mut files)?;
                 let amsdos = if disc_interface {
@@ -567,6 +573,13 @@ impl Machine {
                 Board::Spectrum { .. } => keys::spectrum_keystroke(self.name, character),
             })
             .collect()
+    }
+
+    pub fn firmware_entry(&self, address: u16) -> Option<&'static str> {
+        match self.board {
+            Board::Cpc { version, .. } => firmware::entry(version, address),
+            Board::Spectrum { .. } => None,
+        }
     }
 
     // Whether the machine takes a disc, and what does if it does not.
@@ -1406,7 +1419,7 @@ impl Built {
         address: u16,
         instructions: u16,
         most_bytes: usize,
-    ) -> Result<Vec<(u16, Vec<u8>, String)>, String> {
+    ) -> Result<Vec<(u16, Vec<u8>, disassembly::Instruction)>, String> {
         let read = |address| self.read(address);
         let mut listed = Vec::new();
         let (mut at, mut used) = (address, 0);
@@ -1417,12 +1430,13 @@ impl Built {
             if used + instruction.length > most_bytes {
                 break;
             }
-            let bytes = (0..instruction.length as u16)
+            let length = instruction.length;
+            let bytes = (0..length as u16)
                 .map(|offset| read(at.wrapping_add(offset)))
                 .collect();
-            listed.push((at, bytes, instruction.text));
-            used += instruction.length;
-            at = at.wrapping_add(instruction.length as u16);
+            listed.push((at, bytes, instruction));
+            used += length;
+            at = at.wrapping_add(length as u16);
         }
         if listed.is_empty() {
             let prefixed = (0..=u16::MAX)
@@ -1580,6 +1594,7 @@ mod tests {
                     firmware,
                     ram_size,
                     disc_interface,
+                    ..
                 } => (
                     machine.name.to_owned(),
                     firmware.to_owned(),
@@ -1608,6 +1623,7 @@ mod tests {
                 firmware,
                 ram_size,
                 disc_interface,
+                ..
             } = machine.board
             else {
                 continue;

@@ -5818,6 +5818,86 @@ fn a_chain_of_prefixes_is_listed_as_the_one_instruction_a_step_runs() {
     );
 }
 
+// A jump or a call to an entry of a CPC's firmware jumpblocks is named for
+// the entry, on the machines whose firmware has it, whatever memory holds
+// there: here zeros, as nothing has run. The firmware tier holds which
+// addresses are named to the jumpblocks each firmware sets up, and the
+// disassembly tier the names to SOFT 968.
+#[test]
+fn a_call_or_a_jump_to_a_firmware_entry_is_named_for_it() {
+    let every = |name| [Some(name); 3];
+    let from_the_664 = |name| [None, Some(name), Some(name)];
+    let listing: [(&str, [Option<&str>; 3]); 23] = [
+        ("CD00B9", every("KL U ROM ENABLE")),
+        ("C321B9", every("KL POLL SYNCHRONOUS")),
+        ("CD24B9", [None; 3]),
+        ("CD2AB9", from_the_664("KL SCAN NEEDED")),
+        ("CD00BB", every("KM INITIALISE")),
+        ("C406BB", every("KM WAIT CHAR")),
+        ("DDCD09BB", every("KM READ CHAR")),
+        ("CD18BB", every("KM WAIT KEY")),
+        ("CD19BB", [None; 3]),
+        ("CA5ABB", every("TXT OUTPUT")),
+        ("CD37BD", every("JUMP RESTORE")),
+        ("CD3ABD", from_the_664("KM SET LOCKS")),
+        ("C358BD", from_the_664("MC PRINT TRANSLATION")),
+        ("CD5BBD", [None, None, Some("KL BANK SWITCH")]),
+        ("CD5EBD", [None; 3]),
+        ("CDCDBD", every("TXT DRAW CURSOR")),
+        ("CDF1BD", every("MC WAIT PRINTER")),
+        ("CDF4BD", from_the_664("KM SCAN KEYS")),
+        ("CDF7BD", [None; 3]),
+        ("CD3800", [None; 3]),
+        ("CF", [None; 3]),
+        ("2118BB", [None; 3]),
+        ("1800", [None; 3]),
+    ];
+    let bytes: String = listing.iter().map(|(bytes, _)| *bytes).collect();
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    for (machine, column) in [
+        ("cpc464", Some(0)),
+        ("cpc664", Some(1)),
+        ("cpc6128", Some(2)),
+        ("spectrum48", None),
+    ] {
+        let handle = session.open(machine);
+        session.poke(&handle, json!("&8000"), &bytes);
+        let listed = session.answer(
+            "disassemble",
+            json!({ "handle": handle, "address": "&8000", "instructions": listing.len() }),
+        );
+        let named: Vec<Option<&str>> = listed["instructions"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|instruction| {
+                instruction
+                    .get("firmware")
+                    .map(|name| name.as_str().expect("a name"))
+            })
+            .collect();
+        let expected: Vec<Option<&str>> = listing
+            .iter()
+            .map(|(_, names)| column.and_then(|column| names[column]))
+            .collect();
+        assert_eq!(named, expected, "{machine}");
+        session.poke(&handle, json!("&BAFE"), "1800");
+        let listed = session.answer(
+            "disassemble",
+            json!({ "handle": handle, "address": "&BAFE", "instructions": 1 }),
+        );
+        let expected = column.map(|_| "KM INITIALISE");
+        assert_eq!(
+            listed["instructions"][0]
+                .get("firmware")
+                .map(|name| name.as_str().expect("a name")),
+            expected,
+            "{machine}: JR &BB00"
+        );
+    }
+}
+
 #[test]
 fn disassemble_says_what_would_have_worked() {
     let roms = Roms::all();
@@ -8719,6 +8799,85 @@ fn find_finds_what_the_firmwares_listings_say_is_there() {
         json!(["&1394"])
     );
     assert_eq!(find(&cpc, json!({ "text": "Press" })), json!(["&2935"]));
+}
+
+// The restarts of the firmware's extended jumps and calls (SOFT 968, 18).
+const LOW_JUMP: u8 = 0xCF;
+const FAR_CALL: u8 = 0xDF;
+const FIRM_JUMP: u8 = 0xEF;
+
+// A listing names the jumpblock entries each CPC's firmware sets up, as the
+// machine holds them once started (SOFT 968, 14):
+// - The main jumpblock, from &BB00, holds a LOW JUMP at each entry, or a FAR
+//   CALL where AMSDOS has patched one, until a FIRM JUMP begins the maths
+//   entries. Every one is named but the last, the line editor's, which
+//   SOFT 968 does not list: EDIT, entry 202 at &BD5E, in the 6128's
+//   (JumpRestore.asm, in Bread80's unassembly of the firmware,
+//   https://github.com/Bread80/CPC6128-Firmware-Source).
+// - The indirections, from &BDCD, each hold a JP, and every one is named.
+// - The high kernel jumpblock's entries "are not all jump instructions, some
+//   entries are the start of routines": its first eleven hold a JP, KL POLL
+//   SYNCHRONOUS begins a routine at &B921, and KL SCAN NEEDED is named where
+//   an instruction begins at &B92A as the listing reads on from &B921.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_listing_names_the_jumpblock_entries_each_cpcs_firmware_sets_up() {
+    let mut session = Session::reading(&firmware());
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "frames": 100 }));
+        let jumpblocks = bytes_of(&session.peek(&handle, json!("&B900"), 0x500));
+        let at = |address: u16| jumpblocks[usize::from(address - 0xB900)];
+        let mut entries: BTreeSet<u16> = (0xB900..0xB921)
+            .step_by(3)
+            .filter(|address| at(*address) == JP)
+            .collect();
+        entries.insert(0xB921);
+        let polling = session.answer(
+            "disassemble",
+            json!({ "handle": handle, "address": "&B921", "instructions": 8 }),
+        );
+        if polling["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|instruction| instruction["address"] == "&B92A")
+        {
+            entries.insert(0xB92A);
+        }
+        let main: Vec<u16> = (0xBB00..)
+            .step_by(3)
+            .take_while(|address| matches!(at(*address), LOW_JUMP | FAR_CALL))
+            .collect();
+        let after = main.last().unwrap() + 3;
+        assert_eq!(at(after), FIRM_JUMP, "{machine}: &{after:04X}");
+        entries.extend(&main[..main.len() - 1]);
+        entries.extend(
+            (0xBDCD..0xBE00)
+                .step_by(3)
+                .take_while(|address| at(*address) == JP),
+        );
+        let calls: String = (0xB900..0xBE00)
+            .map(|address: u16| digit_pairs(&[&[CALL][..], &address.to_le_bytes()].concat()))
+            .collect();
+        session.poke(&handle, json!("&4000"), &calls);
+        let mut named = BTreeSet::new();
+        for page in 0..5 {
+            let listed = session.answer(
+                "disassemble",
+                json!({ "handle": handle, "address": 0x4000 + 768 * page, "instructions": 256 }),
+            );
+            for instruction in listed["instructions"].as_array().unwrap() {
+                if instruction.get("firmware").is_some() {
+                    named.insert(
+                        0xB900 + (after_ampersand(&instruction["address"], 4) - 0x4000) / 3,
+                    );
+                }
+            }
+        }
+        let entries: BTreeSet<u64> = entries.into_iter().map(u64::from).collect();
+        assert_eq!(named, entries, "{machine}");
+    }
 }
 
 // MC SOUND REGISTER, at &BD34, takes "the sound chip register number" in A

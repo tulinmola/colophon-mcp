@@ -46,15 +46,22 @@ test-firmware:
 	$(MAKE) -C $(EMULATOR_DIR) roms build/emulator
 	cargo test --test protocol -- --ignored
 
-# The disassembly tier's evidence, which no test here wrote, each file fetched
-# at a version of its own and checked by its hash before it is used: SkoolKit,
-# https://skoolkit.ca, whose disassembler is pure Python and runs from its
-# source, and The Complete Spectrum ROM Disassembly as SkoolKit's author keeps
-# it, https://github.com/skoolkid/rom. The 48K's firmware is the emulator's.
+# The disassembly tier's evidence, which no test here wrote, each file checked
+# by its hash before it is used: SkoolKit, https://skoolkit.ca, whose
+# disassembler is pure Python and runs from its source, and The Complete
+# Spectrum ROM Disassembly as SkoolKit's author keeps it,
+# https://github.com/skoolkid/rom, each fetched at a version of its own; and
+# SOFT 968, The Amstrad 6128 Firmware Manual, as the text archive.org read
+# from its scan,
+# https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual, a reading
+# archive.org may make afresh, and its hash refuses any other. The 48K's
+# firmware is the emulator's.
 SKOOLKIT = https://files.pythonhosted.org/packages/source/s/skoolkit/skoolkit-10.1.tar.gz
 SKOOLKIT_SHA256 = e71f0bac2bd38de1eacbb58650e95d43082351a1e9ecb8edecb11da112d02383
 ROM_SKOOL = https://raw.githubusercontent.com/skoolkid/rom/20260409/sources/rom.skool
 ROM_SKOOL_SHA256 = 07c1eeeeb471016a4e2090110b5717b45f8310a806f61bd60986d22f1a3a2696
+SOFT968 = https://archive.org/download/SOFT968TheAmstrad6128FirmwareManual/SOFT968%20-%20The%20Amstrad%206128%20Firmware%20manual_djvu.txt
+SOFT968_SHA256 = 9d295b2800abe5974617ebb3f51fb5a9866a6a30aaafe6c7e012aeb0e0efce78
 SHA256SUM ?= $(shell command -v sha256sum 2>/dev/null || echo shasum -a 256)
 EVIDENCE = $${CARGO_TARGET_DIR:-target}/disassembly
 
@@ -63,8 +70,9 @@ test-disassembly:
 	mkdir -p "$(EVIDENCE)"
 	curl -sSfL -o "$(EVIDENCE)/skoolkit.tar.gz" $(SKOOLKIT)
 	curl -sSfL -o "$(EVIDENCE)/rom.skool" $(ROM_SKOOL)
-	cd "$(EVIDENCE)" && printf '%s  skoolkit.tar.gz\n%s  rom.skool\n' \
-	  $(SKOOLKIT_SHA256) $(ROM_SKOOL_SHA256) | $(SHA256SUM) -c
+	curl -sSfL -o "$(EVIDENCE)/soft968.txt" "$(SOFT968)"
+	cd "$(EVIDENCE)" && printf '%s  skoolkit.tar.gz\n%s  rom.skool\n%s  soft968.txt\n' \
+	  $(SKOOLKIT_SHA256) $(ROM_SKOOL_SHA256) $(SOFT968_SHA256) | $(SHA256SUM) -c
 	rm -rf "$(EVIDENCE)/skoolkit" && mkdir "$(EVIDENCE)/skoolkit"
 	tar -xzf "$(EVIDENCE)/skoolkit.tar.gz" -C "$(EVIDENCE)/skoolkit" --strip-components 1
 	COLOPHON_MCP_DISASSEMBLY_EVIDENCE="$(EVIDENCE)" cargo test --test disassembly -- --ignored
