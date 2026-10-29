@@ -333,6 +333,12 @@ mcp_run_t mcp_spectrum_step(spectrum_t *spectrum, uint32_t instructions);
 const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written);
 const char *mcp_spectrum_check(const spectrum_t *standing, const spectrum_t *written);
 
+/* Whether the core can read and write a disc written from outside: NULL if it
+ * can, or a sentence naming the first field it would trust past what that
+ * field may hold, as for a machine. Its image is then to be image_length
+ * bytes, in a buffer image_capacity long. */
+const char *mcp_floppy_check(const floppy_t *written);
+
 /* Stand a Spectrum's ULA at the T-state of the frame its frame_tick names, as
  * anything that places the chip from outside must: its beam counters are
  * derived from that tick (ula.h, ula_seek). */

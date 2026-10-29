@@ -24,10 +24,14 @@ const EMULATOR_SOURCES: &[&str] = &["src"];
 // value.
 const MACHINES: &[&str] = &["cpc_t", "spectrum_t"];
 
+// What a state file writes beside a machine, a drive's disc, and a deck and
+// the reader it plays, and everything they hold by value.
+const MEDIA: &[&str] = &["floppy_t", "tape_t", "tzx_t"];
+
 // The types src/fields.rs encodes as a single value, by bindgen's names for
 // them.
 const SCALARS: &[&str] = &[
-    "bool", "u8", "u16", "u32", "u64", "i8", "i32", "c_char", "c_int", "c_uint",
+    "bool", "u8", "u16", "u32", "u64", "usize", "i8", "i32", "c_char", "c_int", "c_uint",
 ];
 
 fn c_files_in(directory: &Path) -> Vec<PathBuf> {
@@ -199,7 +203,11 @@ fn generate(bindings: &Bindings) -> String {
     let mut code = String::new();
     let mut enumerations = BTreeSet::new();
     let mut pointers = Vec::new();
-    let mut pending: Vec<String> = MACHINES.iter().map(|name| name.to_string()).collect();
+    let mut pending: Vec<String> = MACHINES
+        .iter()
+        .chain(MEDIA)
+        .map(|name| name.to_string())
+        .collect();
     let mut generated = Vec::new();
     while let Some(structure) = pending.pop() {
         if generated.contains(&structure) {
@@ -296,7 +304,7 @@ fn generate(bindings: &Bindings) -> String {
     pointers.sort();
     writeln!(
         code,
-        "#[cfg(test)]\nconst POINTERS: &[&str] = &[{}];",
+        "#[cfg(test)]\npub(crate) const POINTERS: &[&str] = &[{}];",
         pointers.join(", ")
     )
     .expect("a String takes writes");

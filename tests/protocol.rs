@@ -24,7 +24,7 @@ use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 22] = [
+const TOOLS: [&str; 23] = [
     "call",
     "disassemble",
     "disc_insert",
@@ -44,6 +44,7 @@ const TOOLS: [&str; 22] = [
     "state_drop",
     "state_keep",
     "state_restore",
+    "state_save",
     "step",
     "tape_insert",
     "type",
@@ -1250,20 +1251,22 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         .contains(&name);
         assert_eq!(annotations["readOnlyHint"], reads, "{name}: {annotations}");
         if !reads {
-            let destroys = !["machine_open", "snapshot_save", "state_keep"].contains(&name);
+            let destroys =
+                !["machine_open", "snapshot_save", "state_keep", "state_save"].contains(&name);
             // A machine stood up again is another machine, and a state kept
             // again another state; every other request that changes a
             // machine, save a restore, is entered in its journal, which a
             // repeat lengthens. A handle put away names nothing again, so
             // putting it away again changes nothing, and so does a state
             // dropped; a state restored again makes the same machine and the
-            // same journal; a snapshot asked for again at its path is
-            // refused, since a file is there.
+            // same journal; a snapshot or a state file asked for again at
+            // its path is refused, since a file is there.
             let repeats = [
                 "machine_close",
                 "snapshot_save",
                 "state_restore",
                 "state_drop",
+                "state_save",
             ]
             .contains(&name);
             assert_eq!(
@@ -7765,7 +7768,8 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
     assert_eq!(
         session.refusal("state_restore", json!({ "handle": cpc, "state": first })),
         format!(
-            "{first} was kept from {spectrum}; restore or drop it through that machine's handle"
+            "{first} was kept from {spectrum}; restore, save or drop it through that machine's \
+             handle"
         )
     );
     session.answer("state_drop", json!({ "handle": spectrum, "state": first }));
@@ -7802,6 +7806,398 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
         )
     );
     assert!(names.insert(keep(&mut session, &reopened)));
+}
+
+fn save_state(session: &mut Session, handle: &str, state: &str, path: &Path) -> Value {
+    session.answer(
+        "state_save",
+        json!({ "handle": handle, "state": state, "path": path }),
+    )
+}
+
+fn open_state(session: &mut Session, machine: &str, path: &Path) -> Value {
+    session.answer("machine_open", json!({ "machine": machine, "state": path }))
+}
+
+// A state file's first line, as JSON, and the bytes after it.
+fn state_file(path: &Path) -> (Value, Vec<u8>) {
+    let contents = fs::read(path).expect("a state file");
+    let line = contents
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("a line");
+    let heading = serde_json::from_slice(&contents[..line]).expect("a line of JSON");
+    (heading, contents[line + 1..].to_vec())
+}
+
+// A state file written from a first line and the bytes after it.
+fn state_file_written(path: &Path, heading: &Value, bytes: &[u8]) {
+    let mut contents = serde_json::to_vec(heading).unwrap();
+    contents.push(b'\n');
+    contents.extend_from_slice(bytes);
+    fs::write(path, contents).expect("a state file is written");
+}
+
+// A machine stood up from a state file by another server stands as the state
+// kept it, with its tick and its journal, and runs on as the machine the
+// state was kept from runs on: a Spectrum writing its screen, read from a
+// snapshot, and a 6128 writing its screen and its second 64K. The answer
+// names the firmware and the state file; the journal, the files the machine
+// was built from.
+#[test]
+fn a_machine_stood_up_from_its_state_file_stands_as_kept_and_runs_on_alike() {
+    let roms = Roms::programmed("spectrum48.rom", &spectrum_counting_on_its_screen());
+    roms.write_at("cpc6128.rom", 0, &cpc_counting_in_both_64ks());
+    let snapshot = roms.write("spectrum.sna", &spectrum_snapshot());
+    let mut session = Session::start(&roms);
+    let mut another = Session::start(&roms);
+    let spectrum = session.open_from("spectrum48", &snapshot);
+    session.set(&spectrum, json!({ "cpu.pc": 0 }));
+    let opened = session.answer("machine_open", json!({ "machine": "cpc6128" }));
+    assert_eq!(opened["tick"], 0);
+    let cpc = opened["handle"].as_str().unwrap().to_owned();
+    for (machine, handle) in [("spectrum48", spectrum), ("cpc6128", cpc)] {
+        session.poke(&handle, json!("&9000"), "AA");
+        let ran = session.run(&handle, json!({ "frames": 3 }));
+        let state = keep(&mut session, &handle);
+        let kept = everything(&mut session, &handle);
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        let path = roms.0.join(format!("{machine}.state"));
+        let saved = save_state(&mut session, &handle, &state, &path);
+        assert_eq!(
+            saved,
+            json!({
+                "handle": handle, "state": state, "tick": ran["tick"], "path": path,
+                "sha256": sha256(&fs::read(&path).unwrap()),
+            })
+        );
+        let stretch = json!({ "frames": 2 });
+        session.run(&handle, stretch.clone());
+        let ran_on = everything(&mut session, &handle);
+        let opened = open_state(&mut another, machine, &path);
+        let read = opened["handle"].as_str().unwrap().to_owned();
+        let mut files: Vec<Value> = journal["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|file| file["path"].as_str().unwrap().ends_with(".rom"))
+            .cloned()
+            .collect();
+        files.push(json!({ "path": path, "sha256": saved["sha256"] }));
+        assert_eq!(opened["tick"], ran["tick"]);
+        assert_eq!(opened["files"], json!(files));
+        assert!(everything(&mut another, &read) == kept, "{machine}");
+        let read_journal = another.answer("journal", json!({ "handle": read }));
+        for part in ["build", "files", "count", "entries"] {
+            assert_eq!(read_journal[part], journal[part], "{machine}: {part}");
+        }
+        another.run(&read, stretch);
+        assert!(everything(&mut another, &read) == ran_on, "{machine}");
+    }
+}
+
+// Kept inside a chain of prefixes, a machine is written to its state file
+// inside its instruction, and stood up from it there.
+#[test]
+fn a_machine_kept_inside_an_instruction_is_stood_up_from_its_state_file_inside_it() {
+    let roms = Roms::programmed("spectrum48.rom", &[PREFIX_DD; 0x4000]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.fill(&handle, 0x4000, &[PREFIX_DD; 0xC000]);
+    let ran = session.run(&handle, json!({ "ticks": 100 }));
+    assert_eq!(ran["settled"], false, "{ran}");
+    let state = keep(&mut session, &handle);
+    let kept = everything(&mut session, &handle);
+    let path = roms.0.join("inside.state");
+    save_state(&mut session, &handle, &state, &path);
+    session.run(&handle, json!({ "ticks": 20000 }));
+    let ran_on = everything(&mut session, &handle);
+    let read = open_state(&mut session, "spectrum48", &path)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(everything(&mut session, &read) == kept);
+    session.run(&read, json!({ "ticks": 20000 }));
+    assert!(everything(&mut session, &read) == ran_on);
+}
+
+// A state file is written only of a state kept, through its machine's
+// handle, where no file is, and opened only as the machine it holds, on the
+// build that wrote it and the firmware it was kept on, whole and as it was
+// written.
+#[test]
+fn a_state_file_opens_only_as_written_by_this_build_on_its_firmware() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    let cpc = session.open("cpc6128");
+    let state = keep(&mut session, &spectrum);
+    let path = roms.0.join("spectrum.state");
+    let save =
+        |handle: &str, state: &str| json!({ "handle": handle, "state": state, "path": path });
+    assert_eq!(
+        session.refusal("state_save", save(&spectrum, "state-9")),
+        format!("no state is named state-9; states kept from {spectrum}: {state}")
+    );
+    assert_eq!(
+        session.refusal("state_save", save(&cpc, &state)),
+        format!(
+            "{state} was kept from {spectrum}; restore, save or drop it through that machine's \
+             handle"
+        )
+    );
+    save_state(&mut session, &spectrum, &state, &path);
+    assert_eq!(
+        session.refusal("state_save", save(&spectrum, &state)),
+        format!(
+            "{} already exists, and files are never overwritten; give a path that names nothing \
+             yet",
+            path.display()
+        )
+    );
+    let state_files = "give a file that state_save wrote";
+    let opening = |machine: &str, path: &Path| json!({ "machine": machine, "state": path });
+    assert_eq!(
+        session.refusal(
+            "machine_open",
+            json!({ "machine": "spectrum48", "state": path, "snapshot": path }),
+        ),
+        "give snapshot or state, not both: a snapshot is loaded into a machine at power-on, and a \
+         state file replaces the whole machine"
+    );
+    assert_eq!(
+        session.refusal("machine_open", opening("cpc664", &path)),
+        format!(
+            "{} holds a spectrum48; open it with machine spectrum48",
+            path.display()
+        )
+    );
+    let text = roms.write("text.state", b"a line\nand another\n");
+    let refused = session.refusal("machine_open", opening("spectrum48", &text));
+    assert!(
+        refused.starts_with(&format!(
+            "{} does not begin with a state file's line of JSON: ",
+            text.display()
+        )) && refused.ends_with(&format!("; {state_files}")),
+        "{refused}"
+    );
+    let unbroken = roms.write("unbroken.state", b"{}");
+    assert_eq!(
+        session.refusal("machine_open", opening("spectrum48", &unbroken)),
+        format!(
+            "{} has no line break, or a first line longer than the 33554432 bytes a state file's \
+             first line holds; {state_files}",
+            unbroken.display()
+        )
+    );
+    // A first line of 32MB is read, and one a byte longer is not.
+    let longest = roms.write(
+        "longest.state",
+        &[&[b' '; 32 * 1024 * 1024 - 2][..], b"{}\n"].concat(),
+    );
+    assert_eq!(
+        session.refusal("machine_open", opening("spectrum48", &longest)),
+        format!(
+            "{} does not begin with a state file's line of JSON: missing field `format` at line \
+             1 column 33554432; {state_files}",
+            longest.display()
+        )
+    );
+    let longer = roms.write(
+        "longer.state",
+        &[&[b' '; 32 * 1024 * 1024 - 1][..], b"{}\n"].concat(),
+    );
+    assert_eq!(
+        session.refusal("machine_open", opening("spectrum48", &longer)),
+        format!(
+            "{} has no line break, or a first line longer than the 33554432 bytes a state file's \
+             first line holds; {state_files}",
+            longer.display()
+        )
+    );
+    assert_eq!(
+        session.refusal("machine_open", opening("spectrum48", &roms.0)),
+        format!(
+            "{} is not a file of at most 134217728 bytes; {state_files}",
+            roms.0.display()
+        )
+    );
+    let (heading, bytes) = state_file(&path);
+    let changed = roms.0.join("changed.state");
+    let changing = |session: &mut Session, change: &dyn Fn(&mut Value), tail: &[u8]| {
+        let mut changed_heading = heading.clone();
+        change(&mut changed_heading);
+        state_file_written(&changed, &changed_heading, tail);
+        session.refusal("machine_open", opening("spectrum48", &changed))
+    };
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| heading["format"] = json!("a list"),
+            &bytes
+        ),
+        format!(
+            "{} has the format \"a list\", not \"colophon-mcp state\"; {state_files}",
+            changed.display()
+        )
+    );
+    let build = session.answer("journal", json!({ "handle": spectrum }))["build"].clone();
+    assert_eq!(heading["build"], build);
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| heading["build"] = json!("0.0.0+other"),
+            &bytes
+        ),
+        format!(
+            "{} was written by build 0.0.0+other, not by this server's build {}; a state file \
+             opens only on the build that wrote it, so on this build make the requests in its \
+             journal again, from the files the journal names; the journal is in the file's \
+             first line, as JSON",
+            changed.display(),
+            build.as_str().unwrap()
+        )
+    );
+    let unhold = |problem: &str| {
+        format!(
+            "{} does not hold a machine this server can build: {problem}; make the machine again \
+             from the requests in the journal in its first line",
+            changed.display()
+        )
+    };
+    let picture = 448 * 312;
+    assert_eq!(
+        changing(&mut session, &|_| {}, &bytes[..bytes.len() - 10]),
+        unhold(&format!(
+            "ends {} bytes into the picture, which is {picture} bytes",
+            picture - 10
+        ))
+    );
+    assert_eq!(
+        changing(&mut session, &|_| {}, &[&bytes[..], &[0; 3]].concat()),
+        format!(
+            "{} holds 3 bytes past the buffers its first line names; {state_files}",
+            changed.display()
+        )
+    );
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| {
+                heading["hardware"]["spectrum_t"]["cpu"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("pc");
+            },
+            &bytes
+        ),
+        unhold(
+            "spectrum_t does not read back as given, and must hold every field of its struct in \
+             the form state_save writes it"
+        )
+    );
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| heading["hardware"]["spectrum_t"]["ram_size"] = json!(0x4000),
+            &bytes
+        ),
+        unhold("ram_size is the size of the machine's RAM and cannot change; write it as it reads")
+    );
+    let firmware = heading["files"][0].clone();
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| heading["files"] = json!([firmware, firmware, firmware]),
+            &bytes,
+        ),
+        format!(
+            "{} names 3 files the machine was built from, where a state of this machine names 1 or \
+             2: its firmware, and at most 1 snapshot; {state_files}",
+            changed.display()
+        )
+    );
+    assert_eq!(
+        changing(
+            &mut session,
+            &|heading| heading["tick"] = json!((1u64 << 62) + 1),
+            &bytes
+        ),
+        format!(
+            "{} holds a tick of 4611686018427387905, larger than the 4611686018427387904 a state \
+             file holds; {state_files}",
+            changed.display()
+        )
+    );
+    let disc = roms.write("blank.dsk", &blank_data_disc());
+    session.answer("disc_insert", json!({ "handle": cpc, "path": disc }));
+    let cpcs = keep(&mut session, &cpc);
+    let cpc_path = roms.0.join("cpc.state");
+    save_state(&mut session, &cpc, &cpcs, &cpc_path);
+    let (cpc_heading, cpc_bytes) = state_file(&cpc_path);
+    // A disc is given room past its image to format every track again, a
+    // revolution of 6250 bytes for each of 102 cylinders of 2 sides
+    // (floppy.h), and an image of at most 16MB.
+    let room = 16 * 1024 * 1024 + 102 * 2 * 6250;
+    for (change, problem) in [
+        (
+            &(|heading: &mut Value| heading["hardware"]["cpc_t"]["gate_array"]["pen"] = json!(17))
+                as &dyn Fn(&mut Value),
+            "gate_array.pen selects one of the 17 inks; write 0 to 16".to_owned(),
+        ),
+        (
+            &|heading: &mut Value| heading["hardware"]["fdc.drive"] = json!(2),
+            "fdc.drive is 2, which is not a unit with a drive wired to it".to_owned(),
+        ),
+        (
+            &|heading: &mut Value| {
+                heading["hardware"]["discs"].as_array_mut().unwrap().pop();
+            },
+            "discs is not an array of 2".to_owned(),
+        ),
+        (
+            &|heading: &mut Value| {
+                heading["hardware"]["discs"][0]["tracks"][0][0]["sector_count"] = json!(30)
+            },
+            "discs[0]: floppy_t: a formatted track's sector_count is above 29, the most sectors a \
+             track holds"
+                .to_owned(),
+        ),
+        (
+            &|heading: &mut Value| {
+                heading["hardware"]["discs"][0]["image_capacity"] = json!(room + 1)
+            },
+            format!(
+                "discs[0]: floppy_t: image_capacity is {}, larger than the {room} bytes a disc's \
+                 image is given",
+                room + 1
+            ),
+        ),
+    ] {
+        let mut changed_heading = cpc_heading.clone();
+        change(&mut changed_heading);
+        state_file_written(&changed, &changed_heading, &cpc_bytes);
+        assert_eq!(
+            session.refusal("machine_open", opening("cpc6128", &changed)),
+            unhold(&problem)
+        );
+    }
+    let other = Roms::all();
+    other.write_at("spectrum48.rom", 0x100, &[0xFF]);
+    let refused = Session::start(&other).refusal("machine_open", opening("spectrum48", &path));
+    let sha = |roms: &Roms| sha256(&fs::read(roms.0.join("spectrum48.rom")).unwrap());
+    assert_eq!(
+        refused,
+        format!(
+            "{} was kept on other firmware: the state's is {} ({}), and this server's is {} ({}); \
+             start the server with --roms naming a directory that holds the state's firmware",
+            path.display(),
+            roms.0.join("spectrum48.rom").display(),
+            sha(&roms),
+            other.0.join("spectrum48.rom").display(),
+            sha(&other)
+        )
+    );
 }
 
 // A page of the journal holds as many entries as fit in 8192 characters,
@@ -9830,13 +10226,14 @@ fn a_snapshot_saved_is_the_command_lines_and_runs_on_there() {
 }
 
 // A CPC kept while AMSDOS saves to its disc, its disc controller inside a
-// command, runs on from a restore to the machine it ran on to, and catalogues
-// the disc the same; a disc swapped in since, and the writes since, are undone by
-// restoring a state kept before them, and the catalogue shows the disc as it
-// was then (amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written).
+// command, runs on from a restore, and from its state file in another
+// server, to the machine it ran on to, and catalogues the disc the same; a
+// disc swapped in since, and the writes since, are undone by restoring a
+// state kept before them, and the catalogue shows the disc as it was then
+// (amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written).
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
-fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_alike() {
+fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_and_from_its_state_file_alike() {
     let scratch = Roms::new(&[]);
     let path = scratch.write("blank.dsk", &blank_data_disc());
     let mut session = Session::reading(&firmware());
@@ -9856,12 +10253,22 @@ fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_alike() {
     );
     let writing = keep(&mut session, &handle);
     let kept = everything(&mut session, &handle);
+    let filed = scratch.0.join("writing.state");
+    save_state(&mut session, &handle, &writing, &filed);
     session.run(&handle, json!({ "frames": 250 }));
     let saved = everything(&mut session, &handle);
     restore(&mut session, &handle, &writing);
     assert!(everything(&mut session, &handle) == kept);
     session.run(&handle, json!({ "frames": 250 }));
     assert!(everything(&mut session, &handle) == saved);
+    let mut another = Session::reading(&firmware());
+    let read = open_state(&mut another, "cpc6128", &filed)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(everything(&mut another, &read) == kept);
+    another.run(&read, json!({ "frames": 250 }));
+    assert!(everything(&mut another, &read) == saved);
     let catalogue = |session: &mut Session| {
         session.answer("type", json!({ "handle": handle, "text": "CAT\n" }));
         session.run(&handle, json!({ "frames": 250 }));
@@ -9885,11 +10292,12 @@ fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_alike() {
 
 // A Spectrum kept partway through LOAD "", inside the ROM's LD-BYTES, from
 // &0556 to &0604 (The Complete Spectrum ROM Disassembly), its tape playing,
-// runs on from a restore to the machine it ran on to, the program loaded and
-// run (load_reads_a_program_from_a_tape_and_runs_it).
+// runs on from a restore, and from its state file in another server, to the
+// machine it ran on to, the program loaded and run
+// (load_reads_a_program_from_a_tape_and_runs_it).
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
-fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_alike() {
+fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_and_from_its_state_file_alike() {
     let scratch = Roms::new(&[]);
     let path = scratch.write(
         "program.tap",
@@ -9907,6 +10315,8 @@ fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_alike() {
     );
     let loading = keep(&mut session, &handle);
     let kept = everything(&mut session, &handle);
+    let filed = scratch.0.join("loading.state");
+    save_state(&mut session, &handle, &loading, &filed);
     session.run(&handle, json!({ "frames": 400 }));
     let loaded = everything(&mut session, &handle);
     assert_eq!(session.peek(&handle, json!(30000), 1), "2A");
@@ -9914,4 +10324,93 @@ fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_alike() {
     assert!(everything(&mut session, &handle) == kept);
     session.run(&handle, json!({ "frames": 400 }));
     assert!(everything(&mut session, &handle) == loaded);
+    let mut another = Session::reading(&firmware());
+    let read = open_state(&mut another, "spectrum48", &filed)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(everything(&mut another, &read) == kept);
+    another.run(&read, json!({ "frames": 400 }));
+    assert!(everything(&mut another, &read) == loaded);
+}
+
+// A 6128 stood up from its state file finds its disc controller as AMSDOS
+// set it up with SPECIFY as it started, which a snapshot does not keep
+// (a_cpc_read_from_its_snapshot_finds_its_disc_controller_as_at_power_on),
+// and catalogues its disc and saves to it across two tracks with nothing
+// written in.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_stood_up_from_its_state_file_finds_its_disc_controller_as_amsdos_left_it() {
+    let scratch = Roms::new(&[]);
+    let disc = scratch.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::reading(&firmware());
+    let live = session.open("cpc6128");
+    session.run(&live, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.answer("disc_insert", json!({ "handle": live, "path": disc }));
+    let state = keep(&mut session, &live);
+    let path = scratch.0.join("started.state");
+    save_state(&mut session, &live, &state, &path);
+    let font = cpc_font(&mut session, &live, "cpc6128");
+    let mut another = Session::reading(&firmware());
+    let read = open_state(&mut another, "cpc6128", &path)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (field, value) in [
+        ("fdc.non_dma", json!(true)),
+        ("fdc.step_time", json!(12000)),
+        ("fdc.head_load_time", json!(4000)),
+        ("fdc.head_unload_time", json!(32000)),
+    ] {
+        assert_eq!(another.inspect(&read, field), value, "{field}");
+    }
+    let catalogues = |session: &mut Session, free: &str| {
+        session.answer("type", json!({ "handle": read, "text": "CAT\n" }));
+        session.run(&read, json!({ "frames": 250 }));
+        let text = cpc_text(session, &read, &scratch, &font);
+        text.iter().any(|line| line.replace(' ', "") == free)
+    };
+    assert!(catalogues(&mut another, "178Kfree"));
+    let save = "SAVE\"THREE\",B,&4000,&A00\n";
+    another.answer("type", json!({ "handle": read, "text": save }));
+    another.run(&read, json!({ "frames": 600 }));
+    assert!(catalogues(&mut another, "175Kfree"));
+}
+
+// A run by frames from a state file ends where it ends on the machine the
+// state was kept from, a third of a frame on from a retrace: the 6845's
+// counters and the Gate Array's interrupt counter are the machine's. A
+// snapshot holds neither, so a run by frames from one ends at the retrace
+// the 6845's first vertical sync brings from the top of its frame, as
+// machine_open's description says.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_stood_up_from_its_state_file_keeps_its_place_in_the_frame() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    let live = session.open("cpc6128");
+    session.run(&live, json!({ "frames": 78 }));
+    session.run(&live, json!({ "ticks": CPC_FRAME_TICKS / 3 }));
+    let state = keep(&mut session, &live);
+    let path = scratch.0.join("partway.state");
+    save_state(&mut session, &live, &state, &path);
+    let snapshot = scratch.0.join("partway.sna");
+    session.answer("snapshot_save", json!({ "handle": live, "path": snapshot }));
+    let place = |session: &mut Session, handle: &str| {
+        ["crtc.c4", "crtc.c9", "crtc.c0", "gate_array.r52"]
+            .map(|field| session.inspect(handle, field))
+    };
+    let kept = place(&mut session, &live);
+    let rest = session.run(&live, json!({ "frames": 1 }))["ticks"].clone();
+    let mut another = Session::reading(&firmware());
+    let read = open_state(&mut another, "cpc6128", &path)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(place(&mut another, &read), kept);
+    assert_eq!(another.run(&read, json!({ "frames": 1 }))["ticks"], rest);
+    let from_snapshot = another.open_from("cpc6128", &snapshot);
+    assert!(place(&mut another, &from_snapshot) != kept);
+    assert!(another.run(&from_snapshot, json!({ "frames": 1 }))["ticks"] != rest);
 }

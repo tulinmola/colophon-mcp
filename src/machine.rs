@@ -7,6 +7,8 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{PoisonError, RwLock};
 
+use serde_json::{Map, Value, json};
+
 use crate::emulator::{
     CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, FLOPPY_BYTES_PER_REVOLUTION,
     FLOPPY_MAX_CYLINDERS, FLOPPY_MAX_SIDES, MCP_KINDS, SPECTRUM_FRAMEBUFFER_HEIGHT,
@@ -15,14 +17,15 @@ use crate::emulator::{
     cpc_insert_disc, cpc_peek, cpc_poke, cpc_remap, cpc_set_upper_rom, cpc_snapshot_load,
     cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, floppy_give_room, floppy_t,
     gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
-    mcp_cpc_check, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_spectrum_call,
-    mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t,
-    mcp_z80_halted_for_good, mcp_z80_start, spectrum_connect_monitor, spectrum_init,
+    mcp_cpc_check, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_floppy_check,
+    mcp_spectrum_call, mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step,
+    mcp_watch_t, mcp_z80_halted_for_good, mcp_z80_start, spectrum_connect_monitor, spectrum_init,
     spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek, spectrum_poke,
     spectrum_snapshot_load, spectrum_snapshot_save, spectrum_snapshot_size, spectrum_t, tape_init,
-    tape_insert, tape_play, tape_t, tzx_machine_TZX_SPECTRUM, tzx_next_pulse, tzx_open, tzx_t,
-    ula_rgb as core_ula_rgb, z80_instruction_complete, z80_t,
+    tape_insert, tape_play, tape_pulse_t, tape_t, tzx_machine_TZX_SPECTRUM, tzx_next_pulse,
+    tzx_open, tzx_t, ula_rgb as core_ula_rgb, z80_instruction_complete, z80_t,
 };
+use crate::fields::Fields;
 
 pub use crate::emulator::{
     mcp_capture_t as Capture, mcp_condition_t as Condition, mcp_kind_t as Kind,
@@ -250,6 +253,18 @@ impl z80_t {
     }
 }
 
+impl floppy_t {
+    pub fn check(&self) -> Result<(), String> {
+        // SAFETY: the medium is only read.
+        let sentence = unsafe { mcp_floppy_check(self) };
+        if sentence.is_null() {
+            Ok(())
+        } else {
+            Err(problem(sentence))
+        }
+    }
+}
+
 impl keyboard_t {
     // Holds a key down, as line * 8 + bit.
     pub fn press(&mut self, key: keyboard_key) {
@@ -264,6 +279,9 @@ impl keyboard_t {
 const FORMAT_ROOM: usize = FLOPPY_MAX_CYLINDERS as usize
     * FLOPPY_MAX_SIDES as usize
     * FLOPPY_BYTES_PER_REVOLUTION as usize;
+
+// The most bytes a disc's image or a tape's may hold as it is given.
+pub const MOST_MEDIUM_BYTES: usize = 16 * 1024 * 1024;
 
 // A medium, and the image it borrows, which takes the machine's writes; the
 // drive holds it, and so does every state kept while it stood there. It
@@ -300,7 +318,8 @@ impl Disc {
         // SAFETY: the medium and its image stand beside the machine, which
         // is not running. Every byte of the medium holds a value: it was
         // allocated zeroed, and C has written it since, by its fields and by
-        // floppy_init's assignment, whose padding at worst costs a copy.
+        // floppy_init's assignment, whose padding at worst costs a copy, or
+        // set has, field by field, as a state file was read.
         let (floppy, image) = unsafe {
             let floppy = self.floppy.as_ptr();
             let bytes = std::slice::from_raw_parts(floppy.cast::<u8>(), size_of::<floppy_t>());
@@ -321,6 +340,39 @@ impl Disc {
             disc: Rc::clone(self),
             contents,
         }
+    }
+
+    // A disc as a state file holds it: the medium's fields, then its image.
+    fn filed(medium: &Value, buffers: &mut Buffers) -> Result<Disc, String> {
+        // SAFETY: as for a machine, all-zero bytes are a value of every field.
+        let floppy = Handed::new(unsafe { Box::<floppy_t>::new_zeroed().assume_init() });
+        // SAFETY: the medium is this function's alone.
+        set_whole(unsafe { &mut *floppy.as_ptr() }, medium, "floppy_t")?;
+        Disc::checked(floppy, buffers)
+    }
+
+    // A medium written from outside, and its image, in a buffer image_capacity
+    // long.
+    fn checked(floppy: Handed<floppy_t>, buffers: &mut Buffers) -> Result<Disc, String> {
+        // SAFETY: the medium is this function's alone.
+        let written = unsafe { &mut *floppy.as_ptr() };
+        let room = MOST_MEDIUM_BYTES + FORMAT_ROOM;
+        if written.image_capacity > room {
+            return Err(format!(
+                "floppy_t: image_capacity is {}, larger than the {room} bytes a disc's image is \
+                 given",
+                written.image_capacity
+            ));
+        }
+        written
+            .check()
+            .map_err(|problem| format!("floppy_t: {problem}"))?;
+        let length = written.image_length;
+        let mut image = vec![0; written.image_capacity].into_boxed_slice();
+        image[..length].copy_from_slice(buffers.take(length, "a disc's image")?);
+        let image = Handed::new(image);
+        written.image = image.as_ptr().cast();
+        Ok(Disc::new(floppy, image))
     }
 }
 
@@ -353,10 +405,120 @@ struct Deck {
     reader: tzx_t,
 }
 
+// The most pulses a tape read from a state file is played to find its
+// reader: a tape of 90 minutes at the ROM's own timings, "a reset bit is
+// encoded as two pulses of 855 tstates each, a set bit as two pulses of 1710
+// tstates each" (comp.sys.sinclair FAQ, 16K/48K reference), holds at most
+// some 22 million, and these are some 12 times as many.
+const MOST_PULSES: u64 = 1 << 28;
+
 // A deck, and the image its reader borrows, held as a disc is.
 struct Tape {
     deck: Handed<Deck>,
-    _image: Handed<[u8]>,
+    image: Handed<[u8]>,
+}
+
+impl Tape {
+    // Opens the image as a Spectrum's tape, in a deck of its own, with its
+    // reader at the tape's start and the deck stopped.
+    fn open(contents: &[u8]) -> Result<Tape, String> {
+        let length = u32::try_from(contents.len()).expect("a tape of less than 4GB");
+        let image = Handed::new(contents.to_vec().into_boxed_slice());
+        // SAFETY: all-zero bytes are a value of every field of the deck and
+        // the reader, whose source is then a function pointer of None.
+        let deck = Handed::new(unsafe { Box::<Deck>::new_zeroed().assume_init() });
+        let deck_at = deck.as_ptr();
+        let mut sentence = std::ptr::null();
+        // SAFETY: the reader borrows the image, which is held beside it and
+        // freed with it, and reads no further than the length given.
+        let opened = unsafe {
+            tzx_open(
+                &raw mut (*deck_at).reader,
+                image.as_ptr().cast(),
+                length,
+                SPECTRUM_TICKS_PER_MILLISECOND,
+                tzx_machine_TZX_SPECTRUM,
+                &mut sentence,
+            )
+        };
+        if !opened {
+            return Err(problem(sentence));
+        }
+        // SAFETY: the deck points at its reader in the same allocation.
+        unsafe {
+            tape_init(&raw mut (*deck_at).tape);
+            tape_insert(
+                &raw mut (*deck_at).tape,
+                Some(tzx_next_pulse),
+                (&raw mut (*deck_at).reader).cast(),
+            );
+        }
+        Ok(Tape { deck, image })
+    }
+
+    // A tape as a state file holds it: its image opened again, the reader
+    // played from the tape's start to where the file's stood, and the deck's
+    // own fields. The deck takes a pulse at most once a tick, so a reader
+    // the machine played to in `ticks` stands there within as many pulses;
+    // one past MOST_PULSES is refused.
+    fn filed(
+        deck: &Value,
+        reader: &Value,
+        ticks: u64,
+        buffers: &mut Buffers,
+    ) -> Result<Tape, String> {
+        // SAFETY: as for a deck's.
+        let mut kept = unsafe { Box::<tzx_t>::new_zeroed().assume_init() };
+        set_whole(&mut *kept, reader, "reader")?;
+        let length = kept.image_length as usize;
+        if length > MOST_MEDIUM_BYTES {
+            return Err(format!(
+                "reader.image_length is {length}, larger than the {MOST_MEDIUM_BYTES} bytes a tape holds"
+            ));
+        }
+        let tape = Tape::open(buffers.take(length, "the tape's image")?)?;
+        let wanted = kept.encode();
+        // SAFETY: the deck is this tape's alone, and its reader borrows the
+        // image held beside it.
+        let standing = unsafe { &raw mut (*tape.deck.as_ptr()).reader };
+        let most = ticks.min(MOST_PULSES);
+        for _pulse in 0..=most {
+            // SAFETY: as above.
+            let before = unsafe { *standing };
+            let placed = (
+                before.block_at,
+                before.phase,
+                before.data_at,
+                before.bit_number,
+            ) == (kept.block_at, kept.phase, kept.data_at, kept.bit_number);
+            if placed && before.encode() == wanted {
+                // SAFETY: as above; set writes no pointer.
+                set_whole(unsafe { &mut (*tape.deck.as_ptr()).tape }, deck, "tape")?;
+                return Ok(tape);
+            }
+            let mut pulse = tape_pulse_t {
+                ticks: 0,
+                level: false,
+            };
+            // SAFETY: as above.
+            let pulsed = unsafe { tzx_next_pulse(standing.cast(), &mut pulse) };
+            // SAFETY: as above.
+            let after = unsafe { *standing };
+            if !pulsed && (after.block_at, after.phase) == (before.block_at, before.phase) {
+                break;
+            }
+        }
+        Err(format!(
+            "reader is at a place the tape does not reach within {most} pulses of its start, the \
+             lesser of the state's tick and {MOST_PULSES}, since the deck takes at most 1 pulse a \
+             tick"
+        ))
+    }
+
+    fn image(&self) -> &[u8] {
+        // SAFETY: the image is written only as it is opened.
+        unsafe { &*self.image.as_ptr() }
+    }
 }
 
 // A CPC as a state keeps it, to be restored into the machine it was kept
@@ -383,6 +545,119 @@ fn saved(bytes: Vec<u8>, written: bool, sentence: *const c_char) -> Result<Vec<u
         Ok(bytes)
     } else {
         Err(problem(sentence))
+    }
+}
+
+// A state as a file holds it: what the machine and the media in its drives
+// or its deck hold, by the names their headers give it, and the buffers they
+// point at, by their bytes, in the order a load takes them. No pointer is
+// written; a machine read from the file points at buffers of its own.
+pub struct Filed<'a> {
+    pub fields: Map<String, Value>,
+    pub buffers: Vec<&'a [u8]>,
+}
+
+// What a state file holds past its fields, taken a buffer at a time.
+pub struct Buffers<'a>(&'a [u8]);
+
+impl<'a> Buffers<'a> {
+    pub fn new(bytes: &'a [u8]) -> Buffers<'a> {
+        Buffers(bytes)
+    }
+
+    pub fn left(&self) -> usize {
+        self.0.len()
+    }
+
+    fn take(&mut self, length: usize, what: &str) -> Result<&'a [u8], String> {
+        if length > self.0.len() {
+            return Err(format!(
+                "ends {} bytes into {what}, which is {length} bytes",
+                self.0.len()
+            ));
+        }
+        let (taken, rest) = self.0.split_at(length);
+        self.0 = rest;
+        Ok(taken)
+    }
+}
+
+fn field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a Value, String> {
+    fields.get(name).ok_or_else(|| format!("has no {name}"))
+}
+
+// Sets every field of a struct as a state file gives it: one left out would
+// keep the value it had, so the struct must read back as given.
+fn set_whole<T: Fields>(structure: &mut T, given: &Value, name: &str) -> Result<(), String> {
+    structure
+        .set(&[], given)
+        .map_err(|problem| format!("{name}: {problem}"))?;
+    if structure.encode() != *given {
+        return Err(format!(
+            "{name} does not read back as given, and must hold every field of its struct in the \
+             form state_save writes it"
+        ));
+    }
+    Ok(())
+}
+
+fn medium(bytes: &[u8]) -> Box<floppy_t> {
+    assert_eq!(bytes.len(), size_of::<floppy_t>(), "a medium's bytes");
+    let mut floppy = Box::<floppy_t>::new_zeroed();
+    // SAFETY: the bytes are a whole medium's, as Disc::kept took them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), floppy.as_mut_ptr().cast(), bytes.len());
+        floppy.assume_init()
+    }
+}
+
+impl CpcState {
+    pub fn filed(&self) -> Filed<'_> {
+        let machine = &*self.machine;
+        let drive = machine.fdc.drive;
+        let unit = machine
+            .fdc
+            .drives
+            .iter()
+            .position(|wired| !drive.is_null() && *wired == drive);
+        assert!(
+            drive.is_null() || unit.is_some(),
+            "fdc.drive points at a drive the controller has not wired"
+        );
+        let mut buffers: Vec<&[u8]> = vec![&self.ram, &self.framebuffer];
+        let mut discs = Vec::new();
+        for disc in &self.discs {
+            discs.push(match disc {
+                None => Value::Null,
+                Some(disc) => {
+                    buffers.push(&disc.contents.image);
+                    medium(&disc.contents.floppy).encode()
+                }
+            });
+        }
+        let mut fields = Map::new();
+        fields.insert("cpc_t".to_owned(), machine.encode());
+        fields.insert("fdc.drive".to_owned(), json!(unit));
+        fields.insert("discs".to_owned(), Value::from(discs));
+        Filed { fields, buffers }
+    }
+}
+
+impl SpectrumState {
+    pub fn filed(&self) -> Filed<'_> {
+        let mut buffers: Vec<&[u8]> = vec![&self.ram, &self.framebuffer];
+        let (tape, reader) = match &self.tape {
+            None => (Value::Null, Value::Null),
+            Some((tape, deck)) => {
+                buffers.push(tape.image());
+                (deck.tape.encode(), deck.reader.encode())
+            }
+        };
+        let mut fields = Map::new();
+        fields.insert("spectrum_t".to_owned(), self.machine.encode());
+        fields.insert("tape".to_owned(), tape);
+        fields.insert("reader".to_owned(), reader);
+        Filed { fields, buffers }
     }
 }
 
@@ -592,6 +867,57 @@ impl Cpc {
         self.remap();
     }
 
+    // Stands the machine as a state file holds it, every pointer its own or
+    // worked out again. Refused, the machine left as it stood, where the core
+    // could not run from what the file holds.
+    pub fn state_file_load(
+        &mut self,
+        fields: &Map<String, Value>,
+        buffers: &mut Buffers,
+    ) -> Result<(), String> {
+        // SAFETY: as for a copy set writes to.
+        let mut written = unsafe { std::ptr::read(self.machine()) };
+        set_whole(&mut written, field(fields, "cpc_t")?, "cpc_t")?;
+        written.fdc.drive = match field(fields, "fdc.drive")? {
+            Value::Null => std::ptr::null_mut(),
+            unit => unit
+                .as_u64()
+                .and_then(|unit| written.fdc.drives.get(usize::try_from(unit).ok()?))
+                .copied()
+                .filter(|drive| !drive.is_null())
+                .ok_or_else(|| {
+                    format!("fdc.drive is {unit}, which is not a unit with a drive wired to it")
+                })?,
+        };
+        let ram = buffers.take(self.ram().len(), "the RAM")?;
+        let framebuffer = buffers.take(self.framebuffer().len(), "the picture")?;
+        let given = field(fields, "discs")?
+            .as_array()
+            .filter(|given| given.len() == self.discs.len())
+            .ok_or_else(|| "discs is not an array of 2".to_owned())?;
+        let mut discs = [None, None];
+        for (drive, medium) in given.iter().enumerate() {
+            if !medium.is_null() {
+                let disc = Disc::filed(medium, buffers)
+                    .map_err(|problem| format!("discs[{drive}]: {problem}"))?;
+                written.drives[drive].floppy = disc.floppy.as_ptr();
+                discs[drive] = Some(Rc::new(disc));
+            } else {
+                written.drives[drive].floppy = std::ptr::null_mut();
+            }
+        }
+        self.check(&written)?;
+        *self.machine_mut() = written;
+        // SAFETY: as for ram() and framebuffer(), mutably.
+        unsafe {
+            (*self.ram.as_ptr()).copy_from_slice(ram);
+            (*self.framebuffer.as_ptr()).copy_from_slice(framebuffer);
+        }
+        self.discs = discs;
+        self.remap();
+        Ok(())
+    }
+
     // The machine as a version 1 snapshot.
     pub fn snapshot_save(&self) -> Result<Vec<u8>, String> {
         // SAFETY: the machine is only read.
@@ -697,45 +1023,15 @@ impl Spectrum {
     // the tape there, which is freed once neither the deck nor any state
     // holds it, and presses PLAY. A refused image leaves the deck as it was.
     pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
-        let length = u32::try_from(contents.len()).expect("a tape of less than 4GB");
-        let image = Handed::new(contents.to_vec().into_boxed_slice());
-        // SAFETY: all-zero bytes are a value of every field of the deck and
-        // the reader, whose source is then a function pointer of None.
-        let deck = Handed::new(unsafe { Box::<Deck>::new_zeroed().assume_init() });
-        let deck_at = deck.as_ptr();
-        let mut sentence = std::ptr::null();
-        // SAFETY: the reader borrows the image, which is held beside it and
-        // freed with it, and reads no further than the length given.
-        let opened = unsafe {
-            tzx_open(
-                &raw mut (*deck_at).reader,
-                image.as_ptr().cast(),
-                length,
-                SPECTRUM_TICKS_PER_MILLISECOND,
-                tzx_machine_TZX_SPECTRUM,
-                &mut sentence,
-            )
-        };
-        if !opened {
-            return Err(problem(sentence));
-        }
-        // SAFETY: the deck points at its reader in the same allocation, and
-        // the machine at the deck, which is held beside the machine for as
-        // long as it or a state holds it.
+        let tape = Tape::open(contents)?;
+        // SAFETY: the machine points at the deck, which is held beside the
+        // machine for as long as it or a state holds it.
         unsafe {
-            tape_init(&raw mut (*deck_at).tape);
-            tape_insert(
-                &raw mut (*deck_at).tape,
-                Some(tzx_next_pulse),
-                (&raw mut (*deck_at).reader).cast(),
-            );
-            spectrum_insert_tape(self.machine.as_ptr(), &raw mut (*deck_at).tape);
-            tape_play(&raw mut (*deck_at).tape);
+            let deck = &raw mut (*tape.deck.as_ptr()).tape;
+            spectrum_insert_tape(self.machine.as_ptr(), deck);
+            tape_play(deck);
         }
-        self.tape = Some(Rc::new(Tape {
-            deck,
-            _image: image,
-        }));
+        self.tape = Some(Rc::new(tape));
         Ok(())
     }
 
@@ -769,6 +1065,44 @@ impl Spectrum {
             (*self.ram.as_ptr()).copy_from_slice(&state.ram);
             (*self.framebuffer.as_ptr()).copy_from_slice(&state.framebuffer);
         }
+    }
+
+    // As a CPC's, its tape played to where the file's stood, which the
+    // machine came to in `ticks`.
+    pub fn state_file_load(
+        &mut self,
+        fields: &Map<String, Value>,
+        ticks: u64,
+        buffers: &mut Buffers,
+    ) -> Result<(), String> {
+        // SAFETY: as for a CPC's.
+        let mut written = unsafe { std::ptr::read(self.machine()) };
+        set_whole(&mut written, field(fields, "spectrum_t")?, "spectrum_t")?;
+        let ram = buffers.take(self.ram().len(), "the RAM")?;
+        let framebuffer = buffers.take(self.framebuffer().len(), "the picture")?;
+        let tape = match field(fields, "tape")? {
+            Value::Null => None,
+            deck => Some(Rc::new(Tape::filed(
+                deck,
+                field(fields, "reader")?,
+                ticks,
+                buffers,
+            )?)),
+        };
+        written.tape = tape.as_ref().map_or(std::ptr::null_mut(), |tape| {
+            // SAFETY: only the address is taken.
+            unsafe { &raw mut (*tape.deck.as_ptr()).tape }
+        });
+        self.check(&written)?;
+        *self.machine_mut() = written;
+        self.seek();
+        // SAFETY: as for a CPC's.
+        unsafe {
+            (*self.ram.as_ptr()).copy_from_slice(ram);
+            (*self.framebuffer.as_ptr()).copy_from_slice(framebuffer);
+        }
+        self.tape = tape;
+        Ok(())
     }
 
     // The machine as a 48K snapshot, which leaves the machine as it stands:
@@ -887,10 +1221,12 @@ impl Spectrum {
 mod tests {
     use super::*;
     use crate::emulator::{
-        Z80_WAIT, cpc_insert_disc, floppy_add_track, floppy_layout_track, floppy_mount, floppy_t,
-        spectrum_instruction_complete, upd765_phase_UPD765_PHASE_COMMAND,
-        upd765_phase_UPD765_PHASE_EXECUTION, upd765_phase_UPD765_PHASE_RESULT,
-        upd765_stage_UPD765_STAGE_FORMAT_IDENTITY, upd765_stage_UPD765_STAGE_FORMAT_TO_IDENTITY,
+        FLOPPY_MAX_SECTORS, Z80_WAIT, cpc_insert_disc, floppy_add_track, floppy_byte,
+        floppy_data_written, floppy_format_track, floppy_layout_track, floppy_mount, floppy_read,
+        floppy_t, floppy_track_t, floppy_write_byte, spectrum_instruction_complete,
+        upd765_phase_UPD765_PHASE_COMMAND, upd765_phase_UPD765_PHASE_EXECUTION,
+        upd765_phase_UPD765_PHASE_RESULT, upd765_stage_UPD765_STAGE_FORMAT_IDENTITY,
+        upd765_stage_UPD765_STAGE_FORMAT_TO_IDENTITY,
     };
     use crate::fields::{self, Fields};
     use serde_json::Value;
@@ -1493,8 +1829,8 @@ mod tests {
         trials
     }
 
-    // Each trial is written to the machine as it stood when the sweep began,
-    // and run half a frame.
+    // Each trial is written to a copy of the struct as it stood when the sweep
+    // began, and handed to the attempt.
     fn sweep<T: Fields>(
         standing: &T,
         trials: &[Vec<(String, Value)>],
@@ -1502,8 +1838,8 @@ mod tests {
     ) -> (usize, usize) {
         let (mut ran, mut checked_out) = (0, 0);
         for trial in trials {
-            // SAFETY: a machine's struct owns nothing; the copy is written to
-            // and handed on, or dropped.
+            // SAFETY: the struct owns nothing; the copy is written to and
+            // handed on, or dropped.
             let mut written = unsafe { std::ptr::read(standing) };
             let typed = trial
                 .iter()
@@ -2299,5 +2635,401 @@ mod tests {
     #[should_panic(expected = "a Spectrum takes 16K or 48K of RAM")]
     fn a_spectrum_refuses_ram_its_board_cannot_take() {
         Spectrum::new(vec![0; 0x8000].into_boxed_slice(), rom(&[], HALT));
+    }
+
+    // Every pointer the headers hold, and how a machine read from a state file
+    // comes by it, since the file holds none. A pointer the core gains fails
+    // this until a state file comes by it too.
+    const POINTED_AGAIN: [&str; 17] = [
+        // The machine's own, as it was built: a CPC's deck is never filled.
+        "cpc_t.lower_rom",
+        "cpc_t.ram",
+        "cpc_t.tape",
+        "cpc_t.upper_roms",
+        "monitor_t.framebuffer",
+        "spectrum_t.ram",
+        "spectrum_t.rom",
+        "upd765_t.drives",
+        // Worked out again by cpc_remap.
+        "cpc_t.read_page",
+        "cpc_t.write_page",
+        // Set as the file says: Cpc::state_file_load and
+        // Spectrum::state_file_load.
+        "drive_t.floppy",
+        "spectrum_t.tape",
+        "upd765_t.drive",
+        // Set as the medium is made again: Disc::checked, and tzx_open and
+        // tape_insert in Tape::open.
+        "floppy_t.image",
+        "tape_t.reader",
+        "tape_t.source",
+        "tzx_t.image",
+    ];
+
+    #[test]
+    fn a_state_file_comes_by_every_pointer_the_headers_hold() {
+        let mut named = POINTED_AGAIN.to_vec();
+        named.sort_unstable();
+        assert_eq!(named, crate::fields::POINTERS);
+    }
+
+    // A state as its file carries it: the fields through JSON's text, as the
+    // file writes and reads them, and the buffers one after another.
+    fn through_a_file(filed: Filed) -> (Map<String, Value>, Vec<u8>) {
+        let text = serde_json::to_string(&filed.fields).unwrap();
+        (serde_json::from_str(&text).unwrap(), filed.buffers.concat())
+    }
+
+    // A CPC read from a state file, a disc in its drive and its controller
+    // busy with its commands, stands as it was kept, pointing at buffers of
+    // its own, and runs on as the machine it was kept from runs on.
+    #[test]
+    fn a_cpc_read_from_its_state_file_runs_on_as_kept() {
+        let (workload, _) = cpc_workload();
+        let build = || {
+            let mut cpc = Cpc::new(vec![0; 0x20000].into_boxed_slice(), rom(&workload, HALT));
+            cpc.fit_disc_interface(true);
+            cpc
+        };
+        let mut kept = build();
+        kept.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        kept.run(3, 8 * CPC_STANDARD_FRAME_TICKS, None);
+        kept.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 3, None);
+        let (fields, bytes) = through_a_file(kept.state().filed());
+        assert_eq!(fields["fdc.drive"], 0);
+        let mut read = build();
+        read.state_file_load(&fields, &mut Buffers::new(&bytes))
+            .unwrap();
+        assert!(through_a_file(read.state().filed()) == (fields, bytes));
+        let disc = read.discs[0].as_ref().expect("a disc");
+        let machine = read.machine();
+        assert_eq!(machine.drives[0].floppy, disc.floppy.as_ptr());
+        assert_eq!(machine.fdc.drive, machine.fdc.drives[0]);
+        assert_eq!(machine.ram, read.ram.as_ptr().cast());
+        // SAFETY: the medium stands beside the machine, which is not running.
+        assert_eq!(
+            unsafe { (*disc.floppy.as_ptr()).image },
+            disc.image.as_ptr().cast()
+        );
+        for _ in 0..3 {
+            kept.run(1, 2 * CPC_STANDARD_FRAME_TICKS, None);
+            read.run(1, 2 * CPC_STANDARD_FRAME_TICKS, None);
+            assert!(through_a_file(kept.state().filed()) == through_a_file(read.state().filed()));
+        }
+    }
+
+    // A Spectrum read from a state file finds its tape where it had played to,
+    // in the leader, in the data and past the tape's end, and runs on as the
+    // machine it was kept from runs on. The block's leader is 3223 pulses of
+    // 2168 T-states (16K/48K reference), its data starting some 6989000
+    // T-states in.
+    #[test]
+    fn a_spectrum_read_from_its_state_file_finds_its_tape_where_it_had_played_to() {
+        let build = || Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+        let tape = [3, 0, 0xFF, 0x01, 0xFE];
+        let mut kept = build();
+        kept.insert_tape(&tape).unwrap();
+        let mut ticks = 0;
+        for until in [140_000, 7_000_000, 12_000_000] {
+            ticks += kept.run(u32::MAX, until - ticks, None).ticks;
+            let (fields, bytes) = through_a_file(kept.state().filed());
+            let mut read = build();
+            read.state_file_load(&fields, ticks, &mut Buffers::new(&bytes))
+                .unwrap();
+            assert!(through_a_file(read.state().filed()) == (fields, bytes));
+            let tape = read.tape.as_ref().expect("a tape");
+            // SAFETY: only the address is taken.
+            assert_eq!(read.machine().tape, unsafe {
+                &raw mut (*tape.deck.as_ptr()).tape
+            });
+            ticks += kept.run(1, 2 * SPECTRUM_FRAME_TICKS, None).ticks;
+            read.run(1, 2 * SPECTRUM_FRAME_TICKS, None);
+            assert!(through_a_file(kept.state().filed()) == through_a_file(read.state().filed()));
+        }
+    }
+
+    // The deck takes its first pulse on its first tick, and each after it as
+    // the last one's ticks run out (tape.c's tape_tick), so a reader T ticks
+    // into a leader of 2168 T-state pulses has taken 1 + (T - 1) / 2168 of
+    // them, and is found in that many pulses and not in one fewer. A reader
+    // no playing of the tape comes to is refused, and so is an image longer
+    // than a tape given.
+    #[test]
+    fn a_tape_read_from_a_state_file_is_played_to_where_it_stood() {
+        let mut spectrum = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+        spectrum.insert_tape(&[3, 0, 0xFF, 0x01, 0xFE]).unwrap();
+        let ticks = spectrum.run(u32::MAX, 140_000, None).ticks;
+        let (fields, bytes) = through_a_file(spectrum.state().filed());
+        let load = |fields: &Map<String, Value>, ticks: u64| {
+            let mut read = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+            read.state_file_load(fields, ticks, &mut Buffers::new(&bytes))
+        };
+        let refused = |pulses: u64| {
+            Err(format!(
+                "reader is at a place the tape does not reach within {pulses} pulses of its start, \
+                 the lesser of the state's tick and 268435456, since the deck takes at most 1 \
+                 pulse a tick"
+            ))
+        };
+        let pulses = 1 + (ticks - 1) / 2168;
+        assert_eq!(load(&fields, pulses), Ok(()));
+        assert_eq!(load(&fields, pulses - 1), refused(pulses - 1));
+        let mut nowhere = fields.clone();
+        nowhere["reader"]["block_at"] = Value::from(1);
+        assert_eq!(load(&nowhere, ticks), refused(ticks));
+        let mut longer = fields.clone();
+        longer["reader"]["image_length"] = Value::from(MOST_MEDIUM_BYTES + 1);
+        assert_eq!(
+            load(&longer, ticks),
+            Err(
+                "reader.image_length is 16777217, larger than the 16777216 bytes a tape holds"
+                    .to_owned()
+            )
+        );
+    }
+
+    // The ULA's line and column are worked out from its frame tick, "cache,
+    // never the state" (ula.h), so a Spectrum read from a state file stands
+    // its ULA where the frame tick the file gives says, as set does.
+    #[test]
+    fn a_spectrum_read_from_a_state_file_stands_its_ula_at_its_frame_tick() {
+        let mut spectrum = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+        let ticks = spectrum.run(u32::MAX, 140_000, None).ticks;
+        let (mut fields, bytes) = through_a_file(spectrum.state().filed());
+        fields["spectrum_t"]["ula"]["frame_tick"] = Value::from(1234);
+        let mut read = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+        read.state_file_load(&fields, ticks, &mut Buffers::new(&bytes))
+            .unwrap();
+        let path = fields::parse("ula.frame_tick").unwrap();
+        // SAFETY: a machine's struct owns nothing, and the copy is only
+        // written.
+        let mut written = unsafe { std::ptr::read(spectrum.machine()) };
+        written.set(&path, &Value::from(1234)).unwrap();
+        *spectrum.machine_mut() = written;
+        spectrum.seek();
+        let ula =
+            |machine: &spectrum_t| (machine.ula.frame_tick, machine.ula.line, machine.ula.column);
+        assert_eq!(ula(read.machine()), ula(spectrum.machine()));
+    }
+
+    // A tape stopped by a pause of none between its blocks, as a multiload's
+    // is between its parts, is found where it stopped, and once PLAY is
+    // pressed again, partway through its next part. "If the value is 0 then
+    // the emulator or utility should (in effect) STOP THE TAPE" ("TZX format"
+    // v1.20, block 20, https://worldofspectrum.net/TZXformat.html), whose file
+    // begins "ZXTape!", 1A and the version, and whose block 10 is a pause
+    // after it, a length and the block as a .tap holds it.
+    #[test]
+    fn a_tape_read_from_a_state_file_is_found_past_where_it_stopped() {
+        let block = [0x10, 0, 0, 3, 0, 0xFF, 0x01, 0xFE];
+        let tape = [&b"ZXTape!\x1A\x01\x14"[..], &block, &[0x20, 0, 0], &block].concat();
+        let build = || Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
+        let mut kept = build();
+        kept.insert_tape(&tape).unwrap();
+        // SAFETY: only the address is taken, of a deck the machine holds
+        // throughout.
+        let deck = unsafe { &raw mut (*kept.tape.as_ref().unwrap().deck.as_ptr()).tape };
+        let mut ticks = kept.run(u32::MAX, 8_000_000, None).ticks;
+        // SAFETY: the deck stands beside the machine, which is not running.
+        assert!(!unsafe { (*deck).playing });
+        for _part in 0..2 {
+            let (fields, bytes) = through_a_file(kept.state().filed());
+            let mut read = build();
+            read.state_file_load(&fields, ticks, &mut Buffers::new(&bytes))
+                .unwrap();
+            assert!(through_a_file(read.state().filed()) == (fields, bytes));
+            // SAFETY: as above.
+            unsafe { tape_play(deck) };
+            ticks += kept.run(u32::MAX, 140_000, None).ticks;
+        }
+    }
+
+    // Each bound the check holds a disc to, met and then passed by one, as
+    // floppy.c trusts it. The image's one track holds one sector, whose
+    // reading ends where the image does.
+    #[test]
+    fn the_disc_check_holds_a_disc_to_every_bound_floppy_c_trusts() {
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        cpc.fit_disc_interface(true);
+        cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        let disc = cpc.discs[0].as_ref().expect("a disc");
+        // SAFETY: the medium stands beside the machine, which is not running.
+        let standing = unsafe { &*disc.floppy.as_ptr() };
+        let check = |change: &dyn Fn(&mut floppy_t)| {
+            // SAFETY: a medium's struct owns nothing, and the copy is only
+            // written and checked.
+            let mut written = Box::new(unsafe { std::ptr::read(standing) });
+            change(&mut written);
+            written.check()
+        };
+        let refused = |change: &dyn Fn(&mut floppy_t), beginning: &str| {
+            let problem = check(change).unwrap_err();
+            assert!(problem.starts_with(beginning), "{problem}");
+        };
+        assert_eq!(check(&|_| {}), Ok(()));
+        let sector = standing.tracks[0][0].sectors[0];
+        assert_eq!(
+            sector.image_offset as usize + sector.recorded as usize,
+            standing.image_length
+        );
+        assert_eq!(
+            check(&|floppy| floppy.image_capacity = floppy.image_length),
+            Ok(())
+        );
+        refused(
+            &|floppy| floppy.image_capacity = floppy.image_length - 1,
+            "image_length is larger",
+        );
+        refused(
+            &|floppy| floppy.tracks[0][0].length = 0,
+            "a formatted track's length",
+        );
+        assert_eq!(check(&|floppy| floppy.tracks[1][0].length = 0), Ok(()));
+        assert_eq!(
+            check(&|floppy| floppy.tracks[0][0].sector_count = 29),
+            Ok(())
+        );
+        refused(
+            &|floppy| floppy.tracks[0][0].sector_count = 30,
+            "a formatted track's sector_count",
+        );
+        let room = |offset: u32, room: u32| {
+            move |floppy: &mut floppy_t| {
+                floppy.tracks[0][0].image_offset = offset;
+                floppy.tracks[0][0].room = room;
+            }
+        };
+        let length = u32::try_from(standing.image_length).unwrap();
+        assert_eq!(check(&room(length - 0x200, 0x200)), Ok(()));
+        refused(&room(length - 0x200, 0x201), "a formatted track's room");
+        assert_eq!(check(&room(length, 0)), Ok(()));
+        refused(&room(length + 1, 0), "a formatted track's room");
+        let reading = |offset: u32, recorded: u32, copies: u32, extent: u32| {
+            move |floppy: &mut floppy_t| {
+                let sector = &mut floppy.tracks[0][0].sectors[0];
+                sector.image_offset = offset;
+                sector.recorded = recorded;
+                sector.copies = copies;
+                sector.extent = extent;
+            }
+        };
+        assert_eq!(check(&reading(length - 0x100, 0x80, 2, 0x80)), Ok(()));
+        refused(&reading(length - 0x100, 0x81, 2, 0x80), "a sector's copies");
+        assert_eq!(check(&reading(length - 0x80, 0x80, 0, 0x80)), Ok(()));
+        refused(&reading(length - 0x7F, 0x80, 0, 0x80), "a sector's copies");
+        assert_eq!(check(&reading(u32::MAX, 0, 1, 0)), Ok(()));
+        refused(&reading(length - 0x80, 0x80, 1, 0x81), "a sector's extent");
+        refused(&reading(length + 1, 1, 1, 0), "a sector's copies");
+    }
+
+    // Every byte of a track read on several revolutions, each sector read at
+    // either end of each reading, every byte written, each sector written
+    // whole, and the track formatted again, into its own room and then past
+    // the image, so that wherever a disc's fields send floppy.c, it goes.
+    fn every_use_of(disc: &super::Disc, cylinder: u8, side: u8) {
+        let floppy = disc.floppy.as_ptr();
+        let positions: Vec<u32> = (0..2 * FLOPPY_BYTES_PER_REVOLUTION)
+            .chain([u32::MAX - 1, u32::MAX])
+            .collect();
+        let mut out = vec![0; 0x400];
+        let identities = [[0, 0, 0xC1, 2]; FLOPPY_MAX_SECTORS as usize];
+        let (c, s) = (usize::from(cylinder), usize::from(side));
+        // SAFETY: the medium borrows the image held beside it, and nothing
+        // else reaches either.
+        unsafe {
+            for &position in &positions {
+                for revolution in [0, 1, 2, u32::MAX] {
+                    floppy_byte(floppy, cylinder, side, position, revolution);
+                }
+            }
+            for index in 0..=FLOPPY_MAX_SECTORS as u8 {
+                let recorded = (*floppy).tracks[c][s]
+                    .sectors
+                    .as_slice()
+                    .get(usize::from(index))
+                    .map_or(0, |sector| sector.recorded);
+                for copy in [0, 1, u32::MAX] {
+                    for offset in [0, recorded.saturating_sub(0x400), recorded] {
+                        let into = out.as_mut_ptr();
+                        floppy_read(floppy, cylinder, side, index, copy, offset, into, 0x400);
+                    }
+                }
+            }
+            for &position in &positions {
+                floppy_write_byte(floppy, cylinder, side, position, 0xA5);
+            }
+            for index in 0..=FLOPPY_MAX_SECTORS as u8 {
+                floppy_data_written(floppy, cylinder, side, index, false);
+            }
+            for (count, size_code) in [(1, 0), (1, 2), (29, 0), (29, 2), (29, 6)] {
+                let ids = identities.as_ptr();
+                floppy_format_track(floppy, cylinder, side, ids, count, size_code, 0x4E, 0xE5);
+            }
+        }
+    }
+
+    // Each extreme of the fields of a track of two sectors and the medium's
+    // own, written into a disc as a state file's fields are, and every use of
+    // the disc made, under the sanitizers: with the track first on the disc
+    // and last, where a sector past the track's runs off the medium, and with
+    // the image's buffer as the disc was given and as long as the image, where
+    // a read or a write past the image runs off the buffer.
+    #[test]
+    #[ignore = "under the sanitizers: make test-sanitized"]
+    fn nothing_the_disc_check_lets_through_runs_out_of_bounds() {
+        let image = one_track_image(0xE5);
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        cpc.fit_disc_interface(true);
+        cpc.insert_disc(0, &image).unwrap();
+        let disc = cpc.discs[0].as_ref().expect("a disc");
+        // SAFETY: the medium stands beside the machine, which is not running.
+        let mut two = Box::new(unsafe { std::ptr::read(disc.floppy.as_ptr()) });
+        let track = &mut two.tracks[0][0];
+        track.sectors[1] = track.sectors[0];
+        track.sectors[1].r = 0xC2;
+        track.sector_count = 2;
+        // SAFETY: the copy's image is the disc's, which only the copy's
+        // layout reads, and floppy_layout_track writes no byte of it.
+        unsafe { floppy_layout_track(&mut *two, 0, 0) };
+        let (mut ran, mut checked_out) = (0, 0);
+        for (cylinder, side) in [(0, 0), (101, 1)] {
+            for tight in [false, true] {
+                let mut standing = two.clone();
+                // SAFETY: all-zero bytes are a track, unformatted.
+                standing.tracks[0][0] = unsafe { std::mem::zeroed::<floppy_track_t>() };
+                standing.tracks[cylinder][side] = two.tracks[0][0];
+                if tight {
+                    standing.image_capacity = standing.image_length;
+                }
+                let mut reached = Map::new();
+                for (name, value) in standing.encode().as_object().unwrap() {
+                    if name != "tracks" {
+                        reached.insert(name.clone(), value.clone());
+                    }
+                }
+                let mut track = standing.tracks[cylinder][side].encode();
+                let sectors = track["sectors"].as_array().unwrap()[..2].to_vec();
+                track["sectors"] = Value::from(sectors);
+                reached.insert(format!("tracks[{cylinder}][{side}]"), track);
+                let trials = trials(&Value::Object(reached), &[("", &[])]);
+                let (swept, refused) = sweep(&*standing, &trials, |written| {
+                    let Some(written) = written else { return false };
+                    let floppy = Handed::new(Box::new(written));
+                    match super::Disc::checked(floppy, &mut Buffers::new(&image)) {
+                        Ok(disc) => {
+                            every_use_of(&disc, cylinder as u8, side as u8);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                });
+                ran += swept;
+                checked_out += refused;
+            }
+        }
+        assert!(
+            ran > 1500 && checked_out > 400,
+            "{ran} ran, {checked_out} checked out"
+        );
     }
 }

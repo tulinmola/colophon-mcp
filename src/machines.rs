@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -19,8 +19,9 @@ use crate::fields::{self, Fields, Segment};
 use crate::firmware::{self, Version};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, Match, PSG, Place, Run,
-    SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Start, Watch, gate_array_rgb, ula_rgb,
+    Buffers, COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, MOST_MEDIUM_BYTES, Match, PSG,
+    Place, Run, SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Start, Watch, gate_array_rgb,
+    ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -128,7 +129,7 @@ pub fn named(name: &str) -> Option<&'static Machine> {
 }
 
 // A file read for a machine or written from one, named by what it holds.
-#[derive(Clone, Serialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FileRead {
     /// The file's absolute path.
     pub path: PathBuf,
@@ -349,12 +350,13 @@ enum HardwareState {
 }
 
 // A request that stood a machine up or changed it.
-#[derive(Clone, Serialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     /// The machine's tick when the request began.
     pub tick: u64,
     /// The tool called.
-    pub tool: &'static str,
+    pub tool: String,
     /// The arguments the tool was given, except the handle, as the journal writes them: `address`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute.
     #[schemars(schema_with = "crate::server::values_schema")]
     pub arguments: Value,
@@ -404,6 +406,57 @@ struct State {
     tick: u64,
     journal: Journal,
 }
+
+// What a state file is, said as its first field.
+const STATE_FORMAT: &str = "colophon-mcp state";
+
+// A state file's first line, a line of JSON before its buffers.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Heading {
+    format: String,
+    build: String,
+    machine: String,
+    tick: u64,
+    files: Vec<FileRead>,
+    journal: Vec<Entry>,
+    hardware: Map<String, Value>,
+}
+
+// What a state file is and the build that wrote it, read before the rest of
+// its first line, which another build may write otherwise; serde_json passes
+// over the rest unbuilt.
+#[derive(Deserialize)]
+struct Named {
+    format: String,
+    build: String,
+}
+
+// A state file as it was read.
+pub struct StateFile {
+    pub read: FileRead,
+    heading: Heading,
+    bytes: Vec<u8>,
+    buffers_at: usize,
+}
+
+// A state file's first line holds the fields of two discs, some 1.2MB a disc,
+// and the journal, an entry for every request that changed the machine: some
+// 60 bytes for a run, some 8K for the longest poke. These leave the journal
+// some 29MB, half a million runs or 3700 of the longest pokes. Parsed, a line
+// of JSON took up to some 35 times its length where this was written, a
+// value being 72 bytes, so these come to some 1.1GB at the most.
+const MOST_HEADING_BYTES: usize = 32 * 1024 * 1024;
+
+// The first line, then the RAM and the picture, 440K on a 6128, and the
+// images of two discs, each of at most MOST_MEDIUM_BYTES and the room past it
+// to format every track again, some 17MB.
+const MOST_STATE_BYTES: u64 = 128 * 1024 * 1024;
+
+// A machine's tick past which the file is refused: some 36000 years of a CPC.
+const MOST_TICKS: u64 = 1 << 62;
+
+const STATE_FILES: &str = "give a file that state_save wrote";
 
 // A machine as the server holds it: the hardware, the ticks it has run since
 // it was stood up, which the core leaves to whoever runs it, the files it was
@@ -529,7 +582,7 @@ impl Machine {
     // under 14MB.
     pub fn disc(&self, path: &Path) -> Result<Vec<u8>, String> {
         self.takes_discs()?;
-        read_whole(path, 16 * 1024 * 1024, "a disc", DISCS)
+        read_whole(path, MOST_MEDIUM_BYTES as u64, "a disc", DISCS)
     }
 
     // A tape is held whole for as long as it is in the deck. 90 minutes of
@@ -539,7 +592,7 @@ impl Machine {
     // 3.5MHz, and the bound stands far past them.
     pub fn tape(&self, path: &Path) -> Result<Vec<u8>, String> {
         self.takes_tapes()?;
-        read_whole(path, 16 * 1024 * 1024, "a tape", TAPES)
+        read_whole(path, MOST_MEDIUM_BYTES as u64, "a tape", TAPES)
     }
 
     // How many characters one request may type: as many as are held and let
@@ -649,6 +702,61 @@ impl Machine {
         }
     }
 
+    // A state file of this machine's, written on this build, read and its
+    // heading taken apart from its buffers.
+    pub fn state(&self, path: &Path) -> Result<StateFile, String> {
+        let bytes = read_whole(path, MOST_STATE_BYTES, "a state file", STATE_FILES)?;
+        let unread = |problem: String| format!("{} {problem}; {STATE_FILES}", path.display());
+        let line = bytes
+            .iter()
+            .take(MOST_HEADING_BYTES + 1)
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| {
+                unread(format!(
+                    "has no line break, or a first line longer than the {MOST_HEADING_BYTES} \
+                     bytes a state file's first line holds"
+                ))
+            })?;
+        let unparsed = |error: serde_json::Error| {
+            unread(format!(
+                "does not begin with a state file's line of JSON: {error}"
+            ))
+        };
+        let named: Named = serde_json::from_slice(&bytes[..line]).map_err(unparsed)?;
+        if named.format != STATE_FORMAT {
+            return Err(unread(format!(
+                "has the format {:?}, not {STATE_FORMAT:?}",
+                named.format
+            )));
+        }
+        let build = env!("COLOPHON_MCP_BUILD");
+        if named.build != build {
+            return Err(format!(
+                "{} was written by build {}, not by this server's build {build}; a state file \
+                 opens only on the build that wrote it, so on this build make the requests in \
+                 its journal again, from the files the journal names; the journal is in the \
+                 file's first line, as JSON",
+                path.display(),
+                named.build
+            ));
+        }
+        let heading: Heading = serde_json::from_slice(&bytes[..line]).map_err(unparsed)?;
+        if heading.machine != self.name {
+            return Err(format!(
+                "{} holds a {}; open it with machine {}",
+                path.display(),
+                heading.machine,
+                heading.machine
+            ));
+        }
+        Ok(StateFile {
+            read: FileRead::of(path, &bytes),
+            heading,
+            bytes,
+            buffers_at: line + 1,
+        })
+    }
+
     // What machine_open would take, said when a snapshot is refused.
     fn snapshots(&self) -> &'static str {
         match self.board {
@@ -683,7 +791,7 @@ impl Parts {
         };
         let mut opening = Entry {
             tick: 0,
-            tool: "machine_open",
+            tool: "machine_open".to_owned(),
             arguments: json!({ "machine": machine.name }),
             file: None,
             written: None,
@@ -1182,7 +1290,7 @@ impl Built {
     ) {
         self.journal.since.push(Entry {
             tick,
-            tool,
+            tool: tool.to_owned(),
             arguments,
             file,
             written,
@@ -1225,6 +1333,114 @@ impl Built {
 
     pub fn state_drop(&mut self, name: &str) -> Result<(), String> {
         self.states.remove(name).map(drop).ok_or_else(|| gone(name))
+    }
+
+    // The state of that name as a file holds it, and its tick: a line of JSON,
+    // then the buffers its hardware names.
+    pub fn state_file(&self, name: &str, machine: &Machine) -> Result<(Vec<u8>, u64), String> {
+        let state = self.states.get(name).ok_or_else(|| gone(name))?;
+        let filed = match &state.hardware {
+            HardwareState::Cpc(state) => state.filed(),
+            HardwareState::Spectrum(state) => state.filed(),
+        };
+        let heading = Heading {
+            format: STATE_FORMAT.to_owned(),
+            build: env!("COLOPHON_MCP_BUILD").to_owned(),
+            machine: machine.name.to_owned(),
+            tick: state.tick,
+            files: self.files.clone(),
+            journal: state.journal.entries().cloned().collect(),
+            hardware: filed.fields,
+        };
+        // serde_json's compact output holds no newline byte: one inside a
+        // string is escaped.
+        let mut bytes = serde_json::to_vec(&heading).map_err(|error| {
+            format!("{name} cannot be written as JSON: {error}; give the server paths in UTF-8")
+        })?;
+        if bytes.len() > MOST_HEADING_BYTES {
+            return Err(format!(
+                "{name} makes a first line of {} bytes, larger than the {MOST_HEADING_BYTES} a \
+                 state file's first line holds, most of it the journal of {} entries; the journal \
+                 tool reads the journal, and its requests rebuild the machine",
+                bytes.len(),
+                heading.journal.len()
+            ));
+        }
+        bytes.push(b'\n');
+        for buffer in filed.buffers {
+            bytes.extend_from_slice(buffer);
+        }
+        Ok((bytes, state.tick))
+    }
+
+    // Stands the machine, as built, as the state file holds it, with its
+    // tick, the files it was built from and its journal; refused where the
+    // firmware differs from the state's, by its hash.
+    pub fn state_file_load(&mut self, state: StateFile) -> Result<(), String> {
+        let heading = state.heading;
+        if heading.tick > MOST_TICKS {
+            return Err(format!(
+                "holds a tick of {}, larger than the {MOST_TICKS} a state file holds; \
+                 {STATE_FILES}",
+                heading.tick
+            ));
+        }
+        let snapshots = heading.files.len().checked_sub(self.files.len());
+        if !matches!(snapshots, Some(0 | 1)) {
+            return Err(format!(
+                "names {} files the machine was built from, where a state of this machine names \
+                 {} or {}: its firmware, and at most 1 snapshot; {STATE_FILES}",
+                heading.files.len(),
+                self.files.len(),
+                self.files.len() + 1
+            ));
+        }
+        let agrees = self
+            .files
+            .iter()
+            .zip(&heading.files)
+            .all(|(read, kept)| read.sha256 == kept.sha256);
+        if !agrees {
+            let named = |files: &[FileRead]| {
+                files
+                    .iter()
+                    .map(|file| format!("{} ({})", file.path.display(), file.sha256))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(format!(
+                "was kept on other firmware: the state's is {}, and this server's is {}; start \
+                 the server with --roms naming a directory that holds the state's firmware",
+                named(&heading.files[..self.files.len()]),
+                named(&self.files)
+            ));
+        }
+        let mut buffers = Buffers::new(&state.bytes[state.buffers_at..]);
+        match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.state_file_load(&heading.hardware, &mut buffers),
+            Hardware::Spectrum(spectrum) => {
+                spectrum.state_file_load(&heading.hardware, heading.tick, &mut buffers)
+            }
+        }
+        .map_err(|problem| {
+            format!(
+                "does not hold a machine this server can build: {problem}; make the machine again \
+                 from the requests in the journal in its first line"
+            )
+        })?;
+        if buffers.left() > 0 {
+            return Err(format!(
+                "holds {} bytes past the buffers its first line names; {STATE_FILES}",
+                buffers.left()
+            ));
+        }
+        self.tick = heading.tick;
+        self.files = heading.files;
+        self.journal = Journal {
+            kept: Vec::new(),
+            since: heading.journal,
+        };
+        Ok(())
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {
@@ -1687,6 +1903,30 @@ mod tests {
             )
             .sha256,
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    // A state whose journal takes its first line past MOST_HEADING_BYTES is
+    // not written, since no build would open the file.
+    #[test]
+    fn a_state_too_long_to_open_is_not_written() {
+        let roms = Roms::new(STAND_INS);
+        let mut built = build("spectrum48", &roms);
+        let arguments = json!({ "bytes": "00".repeat(MOST_HEADING_BYTES / 16) });
+        for _ in 0..8 {
+            built.record(0, "poke", arguments.clone(), None, None);
+        }
+        built.state_keep("long".to_owned());
+        let refused = built.state_file("long", named("spectrum48").unwrap());
+        let problem = refused.expect_err("a first line past the bound");
+        assert!(
+            problem.starts_with("long makes a first line of ")
+                && problem.ends_with(
+                    "bytes, larger than the 33554432 a state file's first line holds, most of it \
+                     the journal of 9 entries; the journal tool reads the journal, and its \
+                     requests rebuild the machine"
+                ),
+            "{problem}"
         );
     }
 

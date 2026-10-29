@@ -261,3 +261,70 @@ const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
   }
   return NULL;
 }
+
+/* reading: `floppy->image + sector->image_offset +
+   (size_t)(revolution % sector->copies) * sector->recorded`, and data_crc
+   over extent bytes of it. floppy_add_sector's own tests, a sector of no
+   copies spanning one. */
+static const char *sector_problem(const floppy_t *written, const floppy_sector_t *sector) {
+  if (sector->extent > sector->recorded) {
+    return "a sector's extent is larger than its recorded bytes";
+  }
+  uint64_t span = (uint64_t)sector->recorded * (sector->copies > 0 ? sector->copies : 1);
+  if (sector->recorded > 0 && (sector->image_offset > written->image_length ||
+                               (uint64_t)(written->image_length - sector->image_offset) < span)) {
+    return "a sector's copies, recorded bytes each from image_offset, run past image_length";
+  }
+  return NULL;
+}
+
+/* A track is read and written only once it is formatted:
+   `track->formatted && !track->unreadable` in readable_track, and
+   `!track->formatted` refused in floppy_write_byte and floppy_format_track. */
+static const char *track_problem(const floppy_t *written, const floppy_track_t *track) {
+  if (!track->formatted) {
+    return NULL;
+  }
+  /* floppy_byte and floppy_write_byte: `position %= track->length`. */
+  if (track->length == 0) {
+    return "a formatted track's length is 0, and it must be at least 1";
+  }
+  /* Every walk of a track's sectors: `index < track->sector_count`, over
+     `track->sectors[index]`. */
+  if (track->sector_count > FLOPPY_MAX_SECTORS) {
+    return "a formatted track's sector_count is above 29, the most sectors a track holds";
+  }
+  /* floppy_format_track fills the track's room from image_offset:
+     `floppy->image[offset + byte] = filler`. */
+  if (track->image_offset > written->image_length ||
+      written->image_length - track->image_offset < track->room) {
+    return "a formatted track's room, from its image_offset, runs past image_length";
+  }
+  for (uint8_t index = 0; index < track->sector_count; index++) {
+    const char *problem = sector_problem(written, &track->sectors[index]);
+    if (problem != NULL) {
+      return problem;
+    }
+  }
+  return NULL;
+}
+
+/* The bounds below are where floppy.c trusts a disc's fields without checking
+   them, because no path of its own takes a field outside them: the line
+   quoted beside each is the use. colophon-emulator at 7a23101. */
+const char *mcp_floppy_check(const floppy_t *written) {
+  /* floppy_format_track's room past the image: `if (needed >
+     floppy->image_capacity - floppy->image_length) {`. */
+  if (written->image_length > written->image_capacity) {
+    return "image_length is larger than image_capacity, the size of the image's buffer";
+  }
+  for (int cylinder = 0; cylinder < FLOPPY_MAX_CYLINDERS; cylinder++) {
+    for (int side = 0; side < FLOPPY_MAX_SIDES; side++) {
+      const char *problem = track_problem(written, &written->tracks[cylinder][side]);
+      if (problem != NULL) {
+        return problem;
+      }
+    }
+  }
+  return NULL;
+}

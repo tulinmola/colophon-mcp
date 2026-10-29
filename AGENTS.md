@@ -12,7 +12,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 ## The machine
 
 - No machine is the ordinary case. A tool that builds a machine is never given a default for which one, and a machine is named as the emulator's command line names it.
-- The core allocates nothing, so every buffer a machine is given is Rust's, and none may move or be freed while the machine stands or a state of it is kept. A machine holds pointers to its buffers, and a CPC's also points into itself — its disc controller points at its own drives. A state is the machine's own bytes, pointers and all, with the buffers they point at as they stood, so a machine stays where it was built and a state is restored into the machine it was taken from.
+- The core allocates nothing, so every buffer a machine is given is Rust's, and none may move or be freed while the machine stands or a state of it is kept. A machine holds pointers to its buffers, and a CPC's also points into itself — its disc controller points at its own drives. A state is the machine's own bytes, pointers and all, with the buffers they point at as they stood, so a machine stays where it was built and a state kept in memory is restored into the machine it was taken from. A state written to a file holds no pointer, only the fields by their names and the buffers by their bytes, and is read back only by the build that wrote it, into a machine built for it, whose pointers are its own; being the build's alone, the file is no finding, and the journal in it is.
 - Machines share the code and nothing else, save one buffer the core keeps for itself: the empty socket a CPC reads as &FF when neither the upper ROM it selects nor ROM 0 is fitted, which each `cpc_init` fills. No CPC is built while another is being built or is running.
 - A machine stopped mid-instruction has a PC that belongs to no instruction anyone can name, so every tool that stops one leaves it between instructions.
 
@@ -31,7 +31,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 
 ## Tools
 
-- A tool is added the day someone needs it and not before. The first stand machines up, from power-on or from a snapshot, list them and put them away, run them by the frame and step them by the instruction, read and set anything they hold by its path, read, write and search their memory, stop them where they are told and gather what they do on the way, call their routines, show their picture and read their memory as one, disassemble it, type at them, give them their discs and tapes, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
+- A tool is added the day someone needs it and not before. The first stand machines up, from power-on, from a snapshot or from a state of their own, list them and put them away, run them by the frame and step them by the instruction, read and set anything they hold by its path, read, write and search their memory, stop them where they are told and gather what they do on the way, call their routines, show their picture and read their memory as one, disassemble it, type at them, give them their discs and tapes, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
 - A tool's description is the reference for it, as a header is for the core, and a page never restates a schema.
 - A tool speaks in the machine's terms. A field keeps the name its header gives it.
 - A tool that succeeds answers with a JSON object, and the same JSON as text beside it: the older revisions take no other structured answer, and the protocol asks for the text. One that fails answers with text alone, saying what would have worked.
@@ -89,4 +89,4 @@ A page describes what the server does today, and what it owes a reader is its li
 
 ## Unsettled
 
-What a finding looks like on disk, which is the archive's to settle. Restoring a state into a machine other than the one it was taken from. Transports other than standard input and output.
+What a finding looks like on disk, which is the archive's to settle. Transports other than standard input and output.

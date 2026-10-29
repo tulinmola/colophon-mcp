@@ -161,7 +161,8 @@ impl Threads {
         match self.held.iter().find(|(_, held)| held.state == state) {
             Some((held, _)) if held == handle => Ok(()),
             Some((held, _)) => Err(format!(
-                "{state} was kept from {held}; restore or drop it through that machine's handle"
+                "{state} was kept from {held}; restore, save or drop it through that machine's \
+                 handle"
             )),
             None => {
                 let states = self.states_of(handle);
@@ -1377,6 +1378,9 @@ struct OpenRequest {
     /// A snapshot to load once the machine is built: a path on the server's file system. A relative path starts from the server's working directory.
     #[schemars(transform = absent_not_null)]
     snapshot: Option<PathBuf>,
+    /// A state file that `state_save` wrote, to build the machine as the state was: a path on the server's file system. A relative path starts from the server's working directory. Give `snapshot` or `state`, not both.
+    #[schemars(transform = absent_not_null)]
+    state: Option<PathBuf>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1584,6 +1588,17 @@ struct SaveRequest {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct StateSaveRequest {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The state's name, as `state_keep` returned it.
+    state: String,
+    /// Where to write the state file: a path on the server's file system that names no file yet. A relative path starts from the server's working directory.
+    path: PathBuf,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct KeepRequest {
     /// The handle `machine_open` returned.
     handle: String,
@@ -1781,8 +1796,10 @@ struct Opened {
     handle: String,
     /// The machine, by the name the emulator's command line gives it.
     machine: String,
-    /// Every file the machine was built from, with the SHA-256 of what it held: the firmware first, the snapshot last.
+    /// Every file read to build the machine, with the SHA-256 of what it held: the firmware first, the snapshot or the state file last.
     files: Vec<FileRead>,
+    /// The machine's tick: 0, or the state's when built from a state file.
+    tick: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1812,6 +1829,20 @@ struct Saved {
     /// The machine's tick when the snapshot was saved.
     tick: u64,
     /// The absolute path the snapshot was written to.
+    path: PathBuf,
+    /// The SHA-256 of the file written, in hexadecimal.
+    sha256: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct StateSaved {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The name of the state written.
+    state: String,
+    /// The machine's tick, as the state holds it.
+    tick: u64,
+    /// The absolute path the state file was written to.
     path: PathBuf,
     /// The SHA-256 of the file written, in hexadecimal.
     sha256: String,
@@ -1855,7 +1886,7 @@ struct Journal {
     machine: String,
     /// The build the machine ran on, as the server's `serverInfo.version` names it.
     build: String,
-    /// Every file the machine was built from, with the SHA-256 of what it held: the firmware first, the snapshot last.
+    /// Every file the machine was built from, with the SHA-256 of what it held: the firmware first, the snapshot last. For a machine built from a state file, the files the state's machine was built from.
     files: Vec<FileRead>,
     /// The number of entries in the journal.
     count: usize,
@@ -2633,7 +2664,7 @@ impl Server {
         }
     }
 
-    /// Build a machine and return its handle: powered on before its first instruction, or loaded from a snapshot. The handle stays valid until `machine_close` or the server stops, and is never reused. The answer gives the SHA-256 of every file the machine was built from. The machine's tick starts at 0. A snapshot is loaded as the emulator's command line loads it, into the machine named, after the firmware is fitted: on a CPC an SNA of version 1, 2 or 3, of which only the version 1 fields are read; on a Spectrum a 48K .sna. A CPC snapshot's 6845 counters, which only version 3 holds, are not read: the CPC starts its frame from the top, with the Gate Array's interrupt counter and the beam at 0, so its first run by frames ends early, at the retrace that the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen. Until then `monitor.beam_y` is 1 or 2 lines past the 6845's line; after it, on the firmware's screen, 70 or 71 lines past. A Spectrum snapshot holds no beam position. A CPC snapshot does not hold the disc controller, so the controller starts as at power-on: a disc access the snapshot was taken inside does not go on, and the SPECIFY that AMSDOS sends at boot is missing. To set the controller as SPECIFY would have, write these with `set` (times in microseconds):
+    /// Build a machine and return its handle: powered on before its first instruction, loaded from a snapshot, or built from a state file. The handle stays valid until `machine_close` or the server stops, and is never reused. The answer gives the SHA-256 of every file read to build the machine, and the machine's tick, which starts at 0, or at the state's. A state file, which `state_save` writes, gives the machine exactly as the state was, with its tick and its journal; only the build that wrote it opens it, as the same machine, on firmware with the same SHA-256. A snapshot is loaded as the emulator's command line loads it, into the machine named, after the firmware is fitted: on a CPC an SNA of version 1, 2 or 3, of which only the version 1 fields are read; on a Spectrum a 48K .sna. A CPC snapshot's 6845 counters, which only version 3 holds, are not read: the CPC starts its frame from the top, with the Gate Array's interrupt counter and the beam at 0, so its first run by frames ends early, at the retrace that the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen. Until then `monitor.beam_y` is 1 or 2 lines past the 6845's line; after it, on the firmware's screen, 70 or 71 lines past. A Spectrum snapshot holds no beam position. A CPC snapshot does not hold the disc controller, so the controller starts as at power-on: a disc access the snapshot was taken inside does not go on, and the SPECIFY that AMSDOS sends at boot is missing. To set the controller as SPECIFY would have, write these with `set` (times in microseconds):
     /// - `fdc.non_dma`: `true`. Without it AMSDOS reads nothing.
     /// - `fdc.step_time`: `12000`. Without it AMSDOS fails every seek to another track.
     /// - `fdc.head_load_time`: `4000` and `fdc.head_unload_time`: `32000`, the rest of what SPECIFY sets.
@@ -2655,6 +2686,13 @@ impl Server {
                 names.join(", ")
             )
         })?;
+        if request.snapshot.is_some() && request.state.is_some() {
+            return Err(
+                "give snapshot or state, not both: a snapshot is loaded into a machine at \
+                 power-on, and a state file replaces the whole machine"
+                    .to_owned(),
+            );
+        }
         // Numbered in the order asked, before anything is read.
         let opened = {
             let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2666,31 +2704,50 @@ impl Server {
             .as_deref()
             .map(machines::absolute)
             .transpose()?;
+        let state = request
+            .state
+            .as_deref()
+            .map(machines::absolute)
+            .transpose()?;
         let roms = self.roms.clone();
-        let parts = Server::blocking(
+        let (parts, state) = Server::blocking(
             format!("the files {} is built from", machine.name),
-            move || machine.parts(&roms, snapshot.as_deref()),
+            move || {
+                let parts = machine.parts(&roms, snapshot.as_deref())?;
+                let state = state.map(|path| machine.state(&path)).transpose()?;
+                Ok((parts, state))
+            },
         )
         .await?;
-        let files = parts.files.clone();
+        let mut files = parts.files.clone();
+        files.extend(state.as_ref().map(|state| state.read.clone()));
         let handle = format!("{}-{opened}", machine.name);
         // A CPC is built only while no other runs, and the waiting is its
         // thread's, so that the server answers what else it is asked
         // meanwhile. The other CPCs may wait with it: std's lock on Linux lets
         // no run, step or peek past a build waiting for it.
-        let (built, ready) = oneshot::channel::<Result<(), String>>();
+        let (built, ready) = oneshot::channel::<Result<u64, String>>();
         let (orders, received) = mpsc::channel::<Order>();
         let thread = thread::Builder::new()
             .name(handle.clone())
             .spawn(move || {
-                let mut standing = match parts.build(machine) {
+                let standing = parts.build(machine).and_then(|mut standing| {
+                    if let Some(state) = state {
+                        let path = state.read.path.clone();
+                        standing
+                            .state_file_load(state)
+                            .map_err(|problem| format!("{} {problem}", path.display()))?;
+                    }
+                    Ok(standing)
+                });
+                let mut standing = match standing {
                     Ok(standing) => standing,
                     Err(problem) => {
                         let _ = built.send(Err(problem));
                         return;
                     }
                 };
-                let _ = built.send(Ok(()));
+                let _ = built.send(Ok(standing.tick()));
                 for order in received {
                     order(&mut standing);
                 }
@@ -2701,22 +2758,24 @@ impl Server {
                      machine_close frees its thread"
                 )
             })?;
-        let problem = match ready.await {
-            Ok(Ok(())) => None,
-            Ok(Err(problem)) => Some(problem),
-            Err(_) => Some(format!(
+        let tick = ready.await.unwrap_or_else(|_| {
+            Err(format!(
                 "{} could not be built; the server's standard error has the details",
                 machine.name
-            )),
+            ))
+        });
+        let tick = match tick {
+            Ok(tick) => tick,
+            Err(problem) => {
+                let _ = thread.join();
+                return Err(problem);
+            }
         };
-        if let Some(problem) = problem {
-            let _ = thread.join();
-            return Err(problem);
-        }
         let answer = Opened {
             handle: handle.clone(),
             machine: machine.name.to_owned(),
             files,
+            tick,
         };
         let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         let at = threads
@@ -3148,7 +3207,7 @@ impl Server {
         }))
     }
 
-    /// Write a machine to a new file as a snapshot, as the emulator's command line does with --save and `machine_open` reads: an SNA of version 1 for a CPC, a 48K .sna for a Spectrum. Refused if the file exists, inside a chain of prefixes, or on a Spectrum with a stack pointer below &4002. The file holds the whole RAM: a CPC's after its 256-byte header, by the RAM's own addresses as `peek`'s `ram` counts them; a Spectrum's &4000 to &FFFF after its 27-byte header. The answer gives the file's SHA-256 and the machine's tick. A snapshot holds less than the machine:
+    /// Write a machine to a new file as a snapshot, as the emulator's command line does with --save and `machine_open` reads: an SNA of version 1 for a CPC, a 48K .sna for a Spectrum. Refused if the file exists, inside a chain of prefixes, or on a Spectrum with a stack pointer below &4002. The file holds the whole RAM: a CPC's after its 256-byte header, by the RAM's own addresses as `peek`'s `ram` counts them; a Spectrum's &4000 to &FFFF after its 27-byte header. The answer gives the file's SHA-256 and the machine's tick. `state_keep` keeps all of the machine in memory, and `state_save` writes it to a file that only this build opens. A snapshot holds less than the machine:
     /// - Neither format records a HALT, so a machine saved on HALT runs past it once loaded.
     /// - A CPC snapshot holds no disc, no disc controller and no 6845 counters; see `machine_open`.
     /// - A Spectrum snapshot holds no beam position and no tape, and stores the program counter in the 2 bytes below the stack pointer, in the file only, so a machine loaded from it has lost what those bytes held.
@@ -3182,7 +3241,7 @@ impl Server {
         }))
     }
 
-    /// Keep a machine exactly as it is, to return to with `state_restore`: everything it holds (mid-instruction if a run left it in a chain of prefixes), its picture, each disc as written, the tape's position, its tick and its journal. A state lives in the server's memory until `state_drop`, `machine_close` or the server stops, and is never written to a file, since it holds the machine's own pointers. At most 64 states per machine. The answer gives the state's name.
+    /// Keep a machine exactly as it is, to return to with `state_restore`: everything it holds (mid-instruction if a run left it in a chain of prefixes), its picture, each disc as written, the tape's position, its tick and its journal. A state lives in the server's memory until `state_drop`, `machine_close` or the server stops; `state_save` writes it to a file. At most 64 states per machine. The answer gives the state's name.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -3233,6 +3292,45 @@ impl Server {
             handle: request.handle,
             state,
             tick,
+        }))
+    }
+
+    /// Write a kept state to a new file. `machine_open` with `state` builds a new machine from it, exactly as the state was: everything it holds, its picture, its discs as written, its tape's position, its tick and its journal. Refused if the file exists. The answer gives the file's SHA-256 and the state's tick.
+    /// - Only the build that wrote the file opens it, the build `serverInfo.version` names, on firmware with the same SHA-256.
+    /// - The file's first line is JSON: the build, the machine, the tick, the files the machine was built from, the journal, the machine's fields by `inspect`'s names, and its discs' or tape's fields by the names the emulator's headers give them. The machine's RAM, its picture and its disc or tape images follow, as bytes.
+    /// - On another build, the journal's requests, made again in order from the same files, rebuild the machine.
+    /// - A tape is found again by playing it from its start, so a state whose tape had played more than 268435456 pulses is refused when opened.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn state_save(
+        &self,
+        Parameters(request): Parameters<StateSaveRequest>,
+    ) -> Result<Json<StateSaved>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        {
+            let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+            threads.held_of(&request.handle, &request.state)?;
+        }
+        let path = machines::absolute(&request.path)?;
+        let state = request.state.clone();
+        let (bytes, tick) = Server::ask(&request.handle, orders, move |built| {
+            built.state_file(&state, machine)
+        })
+        .await??;
+        let written = Server::blocking(path.display().to_string(), move || {
+            machines::write_new(&path, &bytes)
+        })
+        .await?;
+        Ok(Json(StateSaved {
+            handle: request.handle,
+            state: request.state,
+            tick,
+            path: written.path,
+            sha256: written.sha256,
         }))
     }
 
@@ -3298,7 +3396,8 @@ impl Server {
     }
 
     /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given), paths absolute, and each file read or written named by its SHA-256.
-    /// - Reads are not recorded, nor are states kept or dropped. Restoring a state makes the journal the state's.
+    /// - Reads are not recorded, nor are states kept, saved or dropped. Restoring a state makes the journal the state's.
+    /// - A machine built from a state file takes the state's journal and files: the files the state's machine was built from, as the file names them, not the state file.
     /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
     /// - Entries are returned from `from` on, as many as fit in 8192 characters, and at least one while any remain; `next` gives where the next page starts.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]

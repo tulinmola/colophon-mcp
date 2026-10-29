@@ -185,7 +185,7 @@ macro_rules! signed {
     )*};
 }
 
-unsigned!(u8, u16, u32, u64);
+unsigned!(u8, u16, u32, u64, usize);
 signed!(i8, i32);
 
 impl Fields for bool {
@@ -405,7 +405,8 @@ mod tests {
     }
 
     // What the headers hold by pointer, and nothing else, is left out:
-    // cpc.h, spectrum.h, monitor.h, upd765.h and drive.h.
+    // cpc.h, spectrum.h, monitor.h, upd765.h, drive.h, floppy.h, tape.h and
+    // tzx.h.
     #[test]
     fn only_pointers_are_left_out() {
         assert_eq!(
@@ -418,10 +419,14 @@ mod tests {
                 "cpc_t.upper_roms",
                 "cpc_t.write_page",
                 "drive_t.floppy",
+                "floppy_t.image",
                 "monitor_t.framebuffer",
                 "spectrum_t.ram",
                 "spectrum_t.rom",
                 "spectrum_t.tape",
+                "tape_t.reader",
+                "tape_t.source",
+                "tzx_t.image",
                 "upd765_t.drive",
                 "upd765_t.drives",
             ]
