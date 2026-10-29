@@ -1242,6 +1242,7 @@ fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
 // A number as a CPC's own documentation writes it, in hexadecimal after &:
 // an address or a port in four digits, a byte in two, and an address in a
 // 6128's second 64K in five.
+#[derive(Clone, Copy)]
 struct Hexadecimal {
     value: u32,
     digits: usize,
@@ -1411,7 +1412,7 @@ struct RunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     ticks: Option<i64>,
     /// Conditions that stop the run at the first match; at most 16. The kinds:
-    /// - `{"execute": address}` stops before an instruction that starts at that address. It matches only where an instruction starts: an address the processor passes only as part of a longer instruction does not match. A run that starts at that address runs that instruction first.
+    /// - `{"execute": address}` stops before an instruction that starts at that address. It matches only where an instruction starts: an address the processor passes only as part of a longer instruction does not match. A run that starts at that address runs that instruction first. An instruction that repeats, such as LDIR or LDDR, starts again at its address each time it repeats, and matches each time.
     /// - `{"read": address}` and `{"write": address}` stop at the end of an instruction that reads the byte there as data, or writes it. An instruction's own bytes are never data.
     /// - `{"in": port, "mask": bits}` and `{"out": port, "mask": bits}` stop at the end of an instruction that reads or writes a port whose address matches `port` on the bits set in `mask`, the bits the device decodes: `{"out": "&7F00", "mask": "&C000"}` is a CPC's Gate Array, `{"out": "&FE", "mask": "&01"}` a Spectrum's ULA.
     /// - `{"psg": register}`, CPC only, 0 to 15, stops at the end of an instruction that writes that PSG register. The emulator writes the selected register at every access to the PPI while port C gives the PSG the function WRITE.
@@ -1421,7 +1422,7 @@ struct RunRequest {
     /// - `"to"`: a last address or register, for a range (execute, read, write, psg, crtc).
     /// - `"memory": "ram"` or `"rom"` (execute, read): match only bytes the RAM holds, or only bytes a ROM holds. On a CPC the lower ROM covers &0000 to &3FFF and an upper ROM &C000 to &FFFF, each while the Gate Array enables it; on a Spectrum the ROM covers &0000 to &3FFF.
     /// - `"value"`, with `"value_to"` for a range (all but execute and in): match only when the byte read, written or given to the register is in that range. `{"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"}` matches the writes that set the Gate Array's mode, ROMs and interrupt counter.
-    /// - `"changes": true` (write, psg, crtc): match only a write that changes the byte, or the bits the register keeps. `{"write": "&C7EC", "value": 6, "changes": true}` is the write that makes that byte 6.
+    /// - `"changes": true` (write, psg, crtc): match only a write that changes the byte, or the bits the register keeps. `{"write": "&C7EC", "value": 6, "changes": true}` is the write that makes that byte 6. `changes` leaves out a write to PSG register 13 that writes the shape it already holds, though on the chip every write there restarts the envelope.
     /// - `"capture": {"values": paths, "memory": spans}` (until and gather): each match then has a `captured` field with what the machine held. A path names one of the processor's values under `cpu`, as `inspect` names it: HL is `cpu.h` and `cpu.l`, IX is `cpu.ixh` and `cpu.ixl`, and the alternate set is held in pairs, as `cpu.hl_`. A span is `{"address": address, "length": bytes}`, 1 to 64 bytes (1 if `length` is omitted), none past &FFFF; with `"address": "cpu.sp"` or `"cpu.pc"` it starts where that register points at the capture, and wraps past &FFFF to &0000. An execute captures before its instruction runs. An access captures at the end of the instruction that made it, before any interrupt response there (IFF1 is already clear then); an access made by an interrupt response captures at the response's end. A request's captures may name at most 16 distinct values and spans together, reading at most 64 bytes.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
@@ -1462,7 +1463,7 @@ struct RunRequest {
     /// - CPC: "SPACE", "Q", "RETURN", "SHIFT", "CTRL", "COPY", "f5", "↑", and for joystick 0 "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)", "(SPARE)" and "(FIRE 2)", its main button. A CPC key may also be given by its firmware number, 0 to 79: its matrix line times 8 plus its bit.
     /// - Spectrum: "CAPS", "SYM", "ENTER", "SPACE", "Q".
     ///
-    /// An unknown key is refused with the list of names. A program that reads the keyboard only now and then can miss a key held for less than the time between its reads.
+    /// An unknown key is refused with the list of names. A program that reads the keyboard only now and then can miss a key held for less than the time between its reads. A CPC's firmware scans the keyboard every 1/50 s and marks a key released only when 2 scans in a row find it released, so its key state map still holds a key let go at the end of a run as pressed until its 2nd scan after.
     #[schemars(schema_with = "keys_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
@@ -1703,13 +1704,18 @@ struct FindRequest {
     /// The text to find: 1 to 256 ASCII characters, each matching a byte whose low 7 bits are its code. Case matters. Give this or `bytes`.
     #[schemars(transform = absent_not_null)]
     text: Option<String>,
-    /// The first address searched. Default &0000.
+    /// The first address searched, as the processor reads it. Default &0000. Give this or `ram`, not both.
     #[schemars(schema_with = "address_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     address: Option<Value>,
-    /// The last address searched; a match lies wholly between `address` and `to`. Default &FFFF.
-    #[schemars(schema_with = "address_schema")]
+    /// The first address searched in a CPC's RAM, by the RAM's own addresses. Give this or `address`, not both.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    ram: Option<Value>,
+    /// The last address searched: &0000 to &FFFF, or with `ram` an address in the RAM. A match lies wholly between the first address searched and `to`. Default &FFFF, or the RAM's last address with `ram`.
+    #[schemars(schema_with = "ram_address_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     to: Option<Value>,
@@ -1762,9 +1768,16 @@ struct ScreenRequest {
 struct DisassembleRequest {
     /// The handle `machine_open` returned.
     handle: String,
-    /// Where the first instruction starts: an address, or `"cpu.pc"` or `"cpu.sp"` for the address that register holds.
+    /// Where the first instruction starts, as the processor reads it: an address, or `"cpu.pc"` or `"cpu.sp"` for the address that register holds. Give this or `ram`.
     #[schemars(schema_with = "address_or_register_schema")]
-    address: Value,
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    address: Option<Value>,
+    /// Where the first instruction starts in a CPC's RAM, by the RAM's own addresses. Give this or `address`.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    ram: Option<Value>,
     /// How many instructions, 1 to 256. Default 16.
     #[schemars(range(min = 1, max = MOST_INSTRUCTIONS_LISTED))]
     #[schemars(transform = absent_not_null)]
@@ -2434,11 +2447,11 @@ struct Poked {
 
 #[derive(Serialize, JsonSchema)]
 struct Found {
-    /// The addresses where matches start, in hexadecimal after &, lowest first: at most the first 256.
+    /// The addresses where matches start, in hexadecimal after &, lowest first: at most the first 256. With `ram`, addresses in the RAM.
     addresses: Vec<Hexadecimal>,
-    /// The number of matches from `address` to `to`, listed or not.
+    /// The number of matches from the first address to `to`, listed or not.
     count: usize,
-    /// The address of the first match not listed: search again from it, with the same `to`, for the rest. Not given when every match is listed.
+    /// The address of the first match not listed: search again from it, with `address` or `ram` as before and the same `to`, for the rest. Not given when every match is listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     next: Option<Hexadecimal>,
@@ -2499,8 +2512,14 @@ struct Drawn {
 
 #[derive(Serialize, JsonSchema)]
 struct Listed {
-    /// The instruction's address, in hexadecimal after &.
-    address: Hexadecimal,
+    /// The instruction's address, as the processor reads it, in hexadecimal after &. Given with `address`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    address: Option<Hexadecimal>,
+    /// The instruction's address in the RAM, in hexadecimal after &. Given with `ram`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
     /// The instruction's bytes, as pairs of hexadecimal digits.
     bytes: String,
     /// The instruction in Zilog's mnemonics, with addresses, bytes and displacements in hexadecimal after &, such as "LD HL,&1234".
@@ -2959,7 +2978,9 @@ impl Server {
 
     /// Call a routine the way the machine's own CALL would: push the program counter and jump to `address`. The call ends when the routine returns: the processor is back at the pushed address with the stack pointer where it was, and registers and memory are as the routine left them. The answer has the same form as `run`'s.
     /// - `values` are written first, as `set` writes them, to pass arguments; they may move the stack pointer.
+    /// - The routine runs from what the processor reads at `address`: on a CPC, an address below &4000 while the lower ROM is enabled, or from &C000 while the upper ROM is, runs the ROM, not the RAM beneath it.
     /// - Interrupts stay as they are. A run by frames leaves either machine's firmware inside its frame interrupt handler with IFF1 clear, so a routine called there runs without interrupts unless it enables them.
+    /// - Keys that `set` wrote into the keyboard stay held through the call.
     /// - A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call.
     /// - A routine that has not returned when the call stops (its frames run out, `until` matches, or a gather or count is full) is left running. A later run stops at its return only if `until` asks for the address the program counter held when it was called.
     /// - A routine that halts with interrupts disabled stops the call, answering `"stopped": "halted"`.
@@ -3510,7 +3531,7 @@ impl Server {
                 (Some(Hexadecimal::address(address)), None, bytes)
             }
             (None, Some(given)) => {
-                let ram = ram_address(given)?;
+                let ram = ram_address(given).map_err(|problem| format!("ram {problem}"))?;
                 let length = bytes_asked(length)?;
                 let bytes = Server::ask(&request.handle, orders, move |built| {
                     built.peek_ram(ram, length)
@@ -3534,7 +3555,7 @@ impl Server {
         }))
     }
 
-    /// Search a machine's memory for bytes or for text, read as `peek` reads it with `address`: through the banking and the ROMs in front of the RAM. Matches may overlap.
+    /// Search a machine's memory for bytes or for text, as `peek` reads it: with `address`, as the processor reads it, through the banking and the ROMs in front of the RAM; with `ram`, a CPC's RAM by its own addresses, whatever is paged in, where on a 6128 a match may run from &FFFF on into &10000. Matches may overlap.
     /// - `bytes`: an address is stored low byte first, so `"6F 14"` finds every absolute reference to &146F: CALL, JP and their conditional forms, LD, and tables of addresses. Data may hold the same bytes. A relative jump (JR, DJNZ) holds a displacement instead, and is not found this way.
     /// - `text`: a word or a string whose last character has bit 7 set, as both machines' ROMs end many of theirs, is found too.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
@@ -3554,47 +3575,73 @@ impl Server {
                 );
             }
         };
-        let first = request
-            .address
-            .as_ref()
-            .map(address)
-            .transpose()
-            .map_err(|problem| format!("address {problem}"))?
-            .unwrap_or(0);
-        let last = request
-            .to
-            .as_ref()
-            .map(address)
-            .transpose()
-            .map_err(|problem| format!("to {problem}"))?
-            .unwrap_or(0xFFFF);
-        if last < first {
-            return Err(format!(
-                "to {} is below address {}; give a to of {} or above",
-                Hexadecimal::address(last),
-                Hexadecimal::address(first),
-                Hexadecimal::address(first)
-            ));
-        }
-        let (_, orders) = self.thread(&request.handle)?;
-        let found = Server::ask(&request.handle, orders, move |built| {
-            built.find(first, last, &pattern)
-        })
-        .await?;
+        let (machine, orders) = self.thread(&request.handle)?;
+        let found: Vec<Hexadecimal> = match (&request.address, &request.ram) {
+            (_, None) => {
+                let first = request
+                    .address
+                    .as_ref()
+                    .map(address)
+                    .transpose()
+                    .map_err(|problem| format!("address {problem}"))?
+                    .unwrap_or(0);
+                let last = request
+                    .to
+                    .as_ref()
+                    .map(|to| {
+                        address(to).map_err(|problem| match ram_address(to) {
+                            Ok(ram) if machine.holds_ram(ram) => format!(
+                                "to {problem}; give ram to search a CPC's RAM by its own \
+                                 addresses"
+                            ),
+                            _ => format!("to {problem}"),
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(0xFFFF);
+                Server::ask(&request.handle, orders, move |built| {
+                    built.find(first, last, &pattern)
+                })
+                .await??
+                .into_iter()
+                .map(Hexadecimal::address)
+                .collect()
+            }
+            (None, Some(given)) => {
+                let first = ram_address(given).map_err(|problem| format!("ram {problem}"))?;
+                let last = request
+                    .to
+                    .as_ref()
+                    .map(ram_address)
+                    .transpose()
+                    .map_err(|problem| format!("to {problem}"))?;
+                Server::ask(&request.handle, orders, move |built| {
+                    built.find_ram(first, last, &pattern)
+                })
+                .await??
+                .into_iter()
+                .map(Hexadecimal::ram)
+                .collect()
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    "give address or ram, not both: {\"address\": \"&C000\"} searches as the \
+                     processor reads, through the banking and the ROMs, and {\"ram\": \
+                     \"&1C000\"} searches a CPC's RAM by its own addresses"
+                        .to_owned(),
+                );
+            }
+        };
+        let next = found.get(MOST_FOUND).copied();
+        let count = found.len();
         Ok(Json(Found {
-            addresses: found
-                .iter()
-                .take(MOST_FOUND)
-                .map(|address| Hexadecimal::address(*address))
-                .collect(),
-            count: found.len(),
-            next: found
-                .get(MOST_FOUND)
-                .map(|address| Hexadecimal::address(*address)),
+            addresses: found.into_iter().take(MOST_FOUND).collect(),
+            count,
+            next,
         }))
     }
 
-    /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. A machine that has not run yet shows an unpainted picture. The picture's size and crop:
+    /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. After a run by frames that answered `"stopped": "limit"`, the picture may hold lines painted long before the answer's `tick`, as on a CPC whose 6845 has R0 below R2 and so gives no line sync. A machine that has not run yet shows an unpainted picture. The picture's size and crop:
     /// - CPC: 768 by 544, samples 208 to 975 of a line's 1024 and lines 34 to 305 of 312, each line drawn twice.
     /// - Spectrum: 352 by 264, samples 96 to 447 of 448 and lines 20 to 283 of 312.
     #[tool(
@@ -3664,7 +3711,7 @@ impl Server {
         })
     }
 
-    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. Memory is read as `peek` reads it, wrapping from &FFFF to &0000. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts. On a CPC, an instruction that jumps or calls to an entry of the firmware's jumpblocks has `firmware`, the entry's name in SOFT 968, Amstrad's firmware manual, such as "KM WAIT KEY" for `CALL &BB18`. The name goes with the address, whatever memory holds there now. The entries named, 3 bytes apart:
+    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. With `address`, memory is read as `peek` reads it, wrapping from &FFFF to &0000. With `ram`, it reads a CPC's RAM by its own addresses, in the 64K that holds the first instruction: &0000 to &FFFF, or a 6128's &10000 to &1FFFF. That 64K is listed as `address` lists it when the processor reads that 64K alone, with the ROMs disabled, and the listing wraps from its last byte to its first. Each instruction's `ram` is its address in the RAM. Its `bytes` and `text` are the ones that listing gives, so an address in a text, a relative jump's target among them, is the processor's. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts. On a CPC, an instruction that jumps or calls to an entry of the firmware's jumpblocks has `firmware`, the entry's name in SOFT 968, Amstrad's firmware manual, such as "KM WAIT KEY" for `CALL &BB18`. The name goes with the address, whatever memory holds there now. The entries named, 3 bytes apart:
     /// - The main jumpblock: &BB00 to &BD5B on a cpc6128, to &BD58 on a cpc664, to &BD37 on a cpc464.
     /// - The high kernel jumpblock: &B900 to &B921, and &B92A on a cpc664 or a cpc6128.
     /// - The indirections: &BDCD to &BDF4 on a cpc664 or a cpc6128, to &BDF1 on a cpc464.
@@ -3673,7 +3720,6 @@ impl Server {
         &self,
         Parameters(request): Parameters<DisassembleRequest>,
     ) -> Result<Json<Disassembled>, String> {
-        let (start, address) = start(&request.address)?;
         let instructions = request.instructions.unwrap_or(16);
         let instructions = u16::try_from(instructions)
             .ok()
@@ -3684,22 +3730,49 @@ impl Server {
                      disassemble again from where the listing ends to go further"
                 )
             })?;
+        let most_bytes = usize::from(MOST_BYTES);
         let (machine, orders) = self.thread(&request.handle)?;
-        let listed = Server::ask(&request.handle, orders, move |built| {
-            let address = built.start(start, address);
-            built.disassemble(address, instructions, usize::from(MOST_BYTES))
-        })
-        .await??;
+        let (listed, in_ram) = match (&request.address, &request.ram) {
+            (Some(given), None) => {
+                let (start, address) = start(given)?;
+                let listed = Server::ask(&request.handle, orders, move |built| {
+                    let address = built.start(start, address);
+                    built.disassemble(address, instructions, most_bytes)
+                })
+                .await??;
+                (listed, false)
+            }
+            (None, Some(given)) => {
+                let ram = ram_address(given).map_err(|problem| format!("ram {problem}"))?;
+                let listed = Server::ask(&request.handle, orders, move |built| {
+                    built.disassemble_ram(ram, instructions, most_bytes)
+                })
+                .await??;
+                (listed, true)
+            }
+            _ => {
+                return Err(
+                    "give address or ram, exactly one: {\"address\": \"&4000\"} disassembles as \
+                     the processor reads, through the banking and the ROMs, and {\"ram\": \
+                     \"&1C000\"} disassembles a CPC's RAM by its own addresses"
+                        .to_owned(),
+                );
+            }
+        };
         Ok(Json(Disassembled {
             instructions: listed
                 .into_iter()
-                .map(|(address, bytes, instruction)| Listed {
-                    address: Hexadecimal::address(address),
-                    bytes: digit_pairs(&bytes),
-                    text: instruction.text,
-                    firmware: instruction
-                        .target
-                        .and_then(|target| machine.firmware_entry(target)),
+                .map(|(address, bytes, instruction)| {
+                    let address = Hexadecimal::ram(address);
+                    Listed {
+                        address: (!in_ram).then_some(address),
+                        ram: in_ram.then_some(address),
+                        bytes: digit_pairs(&bytes),
+                        text: instruction.text,
+                        firmware: instruction
+                            .target
+                            .and_then(|target| machine.firmware_entry(target)),
+                    }
                 })
                 .collect(),
         }))

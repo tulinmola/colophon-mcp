@@ -635,6 +635,11 @@ impl Machine {
         }
     }
 
+    // Whether a CPC's RAM holds a byte at this address in it.
+    pub fn holds_ram(&self, ram: u32) -> bool {
+        matches!(self.board, Board::Cpc { ram_size, .. } if (ram as usize) < ram_size)
+    }
+
     // Whether the machine takes a disc, and what does if it does not.
     pub fn takes_discs(&self) -> Result<(), String> {
         match self.board {
@@ -1501,31 +1506,31 @@ impl Built {
 
     // A CPC's RAM by its own addresses, as screen's base counts them, past the
     // banking and the ROMs; refused on a Spectrum, whose RAM the processor
-    // reaches whole.
-    pub fn peek_ram(&self, ram: u32, length: u16) -> Result<Vec<u8>, String> {
-        let Hardware::Cpc(cpc) = &self.hardware else {
-            return Err(
+    // reaches whole, with how to `verb` it there instead.
+    fn cpc_ram(&self, verb: &str) -> Result<&[u8], String> {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => Ok(cpc.ram()),
+            Hardware::Spectrum(_) => Err(format!(
                 "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to \
-                 &FFFF, so read it with address"
-                    .to_owned(),
-            );
-        };
-        let memory = cpc.ram();
+                 &FFFF, so {verb} it with address"
+            )),
+        }
+    }
+
+    pub fn peek_ram(&self, ram: u32, length: u16) -> Result<Vec<u8>, String> {
+        let memory = self.cpc_ram("read")?;
+        within(memory, ram, "ram")?;
         let start = ram as usize;
-        let last = memory.len() - 1;
         memory
             .get(start..start + usize::from(length))
             .map(<[u8]>::to_vec)
             .ok_or_else(|| {
-                if start > last {
-                    format!("&{ram:04X} is past &{last:04X}, the end of the RAM")
-                } else {
-                    format!(
-                        "{length} bytes from &{ram:04X} run past &{last:04X}, the end of the RAM; \
-                         give at most {} from there",
-                        memory.len() - start
-                    )
-                }
+                format!(
+                    "{length} bytes from &{ram:04X} run past &{:04X}, the end of the RAM; give at \
+                     most {} from there",
+                    memory.len() - 1,
+                    memory.len() - start
+                )
             })
     }
 
@@ -1611,68 +1616,59 @@ impl Built {
 
     // Where each match of the pattern starts, lowest first, in memory read as
     // the processor reads it from first to last, no match running past last.
-    pub fn find(&self, first: u16, last: u16, pattern: &[(u8, u8)]) -> Vec<u16> {
-        assert!(!pattern.is_empty(), "a pattern of a byte at least");
+    pub fn find(&self, first: u16, last: u16, pattern: &[(u8, u8)]) -> Result<Vec<u16>, String> {
+        in_order(first.into(), last.into(), "address")?;
         let memory: Vec<u8> = (first..=last).map(|address| self.read(address)).collect();
-        memory
-            .windows(pattern.len())
-            .enumerate()
-            .filter(|(_, bytes)| {
-                bytes
-                    .iter()
-                    .zip(pattern)
-                    .all(|(byte, (value, mask))| byte & mask == *value)
-            })
-            .map(|(offset, _)| first + offset as u16)
-            .collect()
+        Ok(matching(&memory, pattern)
+            .map(|offset| first + offset as u16)
+            .collect())
     }
 
-    // Instructions read as the processor would read them, from an address
-    // on, each with its address and its bytes: as many as were asked, or as
-    // fit in most_bytes.
+    // The same in a CPC's RAM by its own addresses, to the RAM's end unless
+    // `last` is given.
+    pub fn find_ram(
+        &self,
+        first: u32,
+        last: Option<u32>,
+        pattern: &[(u8, u8)],
+    ) -> Result<Vec<u32>, String> {
+        let memory = self.cpc_ram("search")?;
+        within(memory, first, "ram")?;
+        let last = last.unwrap_or(memory.len() as u32 - 1);
+        within(memory, last, "to")?;
+        in_order(first, last, "ram")?;
+        Ok(matching(&memory[first as usize..=last as usize], pattern)
+            .map(|offset| first + offset as u32)
+            .collect())
+    }
+
+    // Instructions as the processor reads them, from an address on.
     pub fn disassemble(
         &self,
         address: u16,
         instructions: u16,
         most_bytes: usize,
-    ) -> Result<Vec<(u16, Vec<u8>, disassembly::Instruction)>, String> {
+    ) -> Result<Vec<(u32, Vec<u8>, disassembly::Instruction)>, String> {
         let read = |address| self.read(address);
-        let mut listed = Vec::new();
-        let (mut at, mut used) = (address, 0);
-        for _ in 0..instructions {
-            let Some(instruction) = disassembly::instruction(&read, at, most_bytes - used) else {
-                break;
-            };
-            if used + instruction.length > most_bytes {
-                break;
-            }
-            let length = instruction.length;
-            let bytes = (0..length as u16)
-                .map(|offset| read(at.wrapping_add(offset)))
-                .collect();
-            listed.push((at, bytes, instruction));
-            used += length;
-            at = at.wrapping_add(length as u16);
-        }
-        if listed.is_empty() {
-            let prefixed = (0..=u16::MAX)
-                .map(|offset| address.wrapping_add(offset))
-                .find(|at| !matches!(read(*at), 0xDD | 0xFD));
-            return Err(match prefixed {
-                Some(at) => {
-                    let last = at.wrapping_sub(1);
-                    format!(
-                        "&{address:04X} starts a chain of DD and FD prefixes running to \
-                         &{last:04X}, longer than the {most_bytes} bytes a listing reads; the last \
-                         prefix decides the instruction, so disassemble from &{last:04X}"
-                    )
-                }
-                None => "memory holds nothing but DD and FD prefixes, which the processor runs as \
-                         one endless instruction; there is nothing to list"
-                    .to_owned(),
-            });
-        }
-        Ok(listed)
+        listing(&read, None, address, instructions, most_bytes)
+    }
+
+    // The same in a CPC's RAM by its own addresses: the 64K that holds `ram`,
+    // listed as the processor's view is when that 64K is all it reads, the
+    // ROMs disabled and the base 64K under RAM configuration 0 or a 6128's
+    // second under 2, each instruction given its address in the RAM.
+    pub fn disassemble_ram(
+        &self,
+        ram: u32,
+        instructions: u16,
+        most_bytes: usize,
+    ) -> Result<Vec<(u32, Vec<u8>, disassembly::Instruction)>, String> {
+        let memory = self.cpc_ram("disassemble")?;
+        within(memory, ram, "ram")?;
+        let base = ram & !0xFFFF;
+        let window = &memory[base as usize..][..0x10000];
+        let read = |address: u16| window[usize::from(address)];
+        listing(&read, Some(base), ram as u16, instructions, most_bytes)
     }
 
     pub fn poke(&mut self, address: u16, bytes: &[u8]) {
@@ -1684,6 +1680,106 @@ impl Built {
             }
         }
     }
+}
+
+// A refusal of an address in the RAM, given as `named`, past its end.
+fn within(memory: &[u8], ram: u32, named: &str) -> Result<(), String> {
+    let last = memory.len() - 1;
+    if ram as usize > last {
+        return Err(format!(
+            "{named} &{ram:04X} is past &{last:04X}, the end of the RAM; give a {named} of \
+             &{last:04X} or below"
+        ));
+    }
+    Ok(())
+}
+
+// A refusal of a search whose last address, `to`, is below its first, given
+// as `named`.
+fn in_order(first: u32, last: u32, named: &str) -> Result<(), String> {
+    if last < first {
+        return Err(format!(
+            "to &{last:04X} is below {named} &{first:04X}; give a to of &{first:04X} or above"
+        ));
+    }
+    Ok(())
+}
+
+// Where each match of the pattern starts in memory, by its offset, lowest
+// first, no match running past memory's end.
+fn matching<'a>(memory: &'a [u8], pattern: &'a [(u8, u8)]) -> impl Iterator<Item = usize> + 'a {
+    assert!(!pattern.is_empty(), "a pattern of a byte at least");
+    memory
+        .windows(pattern.len())
+        .enumerate()
+        .filter(move |(_, bytes)| {
+            bytes
+                .iter()
+                .zip(pattern)
+                .all(|(byte, (value, mask))| byte & mask == *value)
+        })
+        .map(|(offset, _)| offset)
+}
+
+// Instructions from `address` on, read through `read`, a 64K that wraps
+// past &FFFF as the processor's view does, each with its address and its
+// bytes: as many as were asked, or as fit in most_bytes. A listing of a CPC's
+// RAM gives `ram_base`, where its 64K starts in the RAM: its addresses count
+// from there, and its refusals speak of the RAM.
+fn listing(
+    read: &dyn Fn(u16) -> u8,
+    ram_base: Option<u32>,
+    address: u16,
+    instructions: u16,
+    most_bytes: usize,
+) -> Result<Vec<(u32, Vec<u8>, disassembly::Instruction)>, String> {
+    let base = ram_base.unwrap_or(0);
+    let mut listed = Vec::new();
+    let (mut at, mut used) = (address, 0);
+    for _ in 0..instructions {
+        let Some(instruction) = disassembly::instruction(read, at, most_bytes - used) else {
+            break;
+        };
+        if used + instruction.length > most_bytes {
+            break;
+        }
+        let length = instruction.length;
+        let bytes = (0..length as u16)
+            .map(|offset| read(at.wrapping_add(offset)))
+            .collect();
+        listed.push((base + u32::from(at), bytes, instruction));
+        used += length;
+        at = at.wrapping_add(length as u16);
+    }
+    if listed.is_empty() {
+        let prefixed = (0..=u16::MAX)
+            .map(|offset| address.wrapping_add(offset))
+            .find(|at| !matches!(read(*at), 0xDD | 0xFD));
+        let first = base + u32::from(address);
+        let form = if ram_base.is_some() { "with ram " } else { "" };
+        return Err(match prefixed {
+            Some(at) => {
+                let last = base + u32::from(at.wrapping_sub(1));
+                format!(
+                    "&{first:04X} starts a chain of DD and FD prefixes running to &{last:04X}, \
+                     which with the instruction it prefixes is longer than the {most_bytes} bytes \
+                     a listing reads; the last prefix decides the instruction, so disassemble \
+                     {form}from &{last:04X}"
+                )
+            }
+            None => {
+                let held = match ram_base {
+                    Some(base) => format!("&{base:04X} to &{:04X} of the RAM", base + 0xFFFF),
+                    None => "memory".to_owned(),
+                };
+                format!(
+                    "{held} holds nothing but DD and FD prefixes, which the processor runs as one \
+                     endless instruction; there is nothing to list"
+                )
+            }
+        });
+    }
+    Ok(listed)
 }
 
 #[cfg(test)]

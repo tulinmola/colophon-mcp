@@ -1077,6 +1077,7 @@ const LD_BC: u8 = 0x01;
 const LD_BC_TO: [u8; 2] = [0xED, 0x43];
 const LD_B: u8 = 0x06;
 const LD_C: u8 = 0x0E;
+const LD_DE: u8 = 0x11;
 const LD_E: u8 = 0x1E;
 const LD_E_A: u8 = 0x5F;
 const LD_HL: u8 = 0x21;
@@ -1084,6 +1085,7 @@ const LD_HL_TO: u8 = 0x22;
 const LD_I_A: [u8; 2] = [0xED, 0x47];
 const LD_SP: u8 = 0x31;
 const LD_TO_A: u8 = 0x32;
+const LDIR: [u8; 2] = [0xED, 0xB0];
 const NOP: u8 = 0x00;
 const OUT_C_A: [u8; 2] = [0xED, 0x79];
 const OUT_C_C: [u8; 2] = [0xED, 0x49];
@@ -1947,7 +1949,7 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
     let cpc464 = session.open("cpc464");
     assert_eq!(
         refused(&mut session, &cpc464, json!({ "ram": "&10000" })),
-        "&10000 is past &FFFF, the end of the RAM"
+        "ram &10000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
     );
     let spectrum = session.open("spectrum48");
     assert_eq!(
@@ -2102,6 +2104,69 @@ fn find_searches_memory_as_the_processor_reads_it() {
     );
 }
 
+// With ram, a 6128's RAM is searched by its own addresses, whatever is paged
+// in: beneath the enabled lower ROM, and on into the second 64K, whose last
+// byte ends the search unless to ends it sooner. Configuration 4 puts that
+// 64K's first block at &4000, and 7 its last ("Ram management", cpctech).
+// With the ROMs disabled and configuration 0, the base 64K is what the
+// processor reads, and a search of either finds the same.
+#[test]
+fn find_searches_a_cpcs_ram_by_its_own_addresses() {
+    let roms = Roms::programmed("cpc6128.rom", &REFERRING[..3]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.poke(&handle, json!("&0010"), "CD6F14");
+    session.poke(&handle, json!("&FFFF"), "CD");
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(&handle, json!("&4000"), "6F14");
+    session.set(&handle, json!({ "mmr": 0xC7 }));
+    session.poke(&handle, json!("&7FFD"), "CD6F14");
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    let mut find = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("find", arguments)
+    };
+    assert_eq!(
+        find(json!({ "bytes": "CD 6F 14", "to": "&3FFF" })),
+        json!({ "addresses": ["&0000"], "count": 1 })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "CD 6F 14", "ram": 0 })),
+        json!({ "addresses": ["&0010", "&FFFF", "&1FFFD"], "count": 3 })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "CD 6F 14", "ram": "&0011", "to": "&10001" })),
+        json!({ "addresses": ["&FFFF"], "count": 1 })
+    );
+    assert_eq!(
+        find(json!({ "bytes": "CD 6F 14", "ram": "&0011", "to": "&10000" })),
+        json!({ "addresses": [], "count": 0 })
+    );
+    let addresses: Vec<Value> = (0x10002..0x10102)
+        .map(|address| json!(format!("&{address:05X}")))
+        .collect();
+    assert_eq!(
+        find(json!({ "bytes": "00", "ram": "&10000" })),
+        json!({ "addresses": addresses, "count": 0x10000 - 5, "next": "&10102" })
+    );
+    session.set(
+        &handle,
+        json!({ "gate_array.lower_rom_enabled": false, "gate_array.upper_rom_enabled": false }),
+    );
+    let mut find = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("find", arguments)
+    };
+    let alone = json!({ "addresses": ["&0010"], "count": 1 });
+    assert_eq!(find(json!({ "bytes": "CD 6F 14" })), alone);
+    assert_eq!(
+        find(json!({ "bytes": "CD 6F 14", "ram": 0, "to": "&FFFF" })),
+        alone
+    );
+}
+
 #[test]
 fn find_says_what_would_have_worked() {
     let roms = Roms::all();
@@ -2160,6 +2225,22 @@ fn find_says_what_would_have_worked() {
         "to \"cpu.sp\" is not an address; an address is a number from 0 to 65535, or \
          hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it"
     );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "to": "&10000" })),
+        "to \"&10000\" is not an address; an address is a number from 0 to 65535, or \
+         hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "address": 0, "ram": 0 })),
+        "give address or ram, not both: {\"address\": \"&C000\"} searches as the processor \
+         reads, through the banking and the ROMs, and {\"ram\": \"&1C000\"} searches a CPC's \
+         RAM by its own addresses"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "ram": "&4000" })),
+        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+         search it with address"
+    );
     let found = session.answer(
         "find",
         json!({ "handle": handle, "bytes": "?? ".repeat(256), "to": "&00FF" }),
@@ -2170,6 +2251,44 @@ fn find_says_what_would_have_worked() {
         json!({ "handle": handle, "text": "\u{0}".repeat(256), "to": "&00FF" }),
     );
     assert_eq!(found["count"], 1, "{found}");
+    let cpc464 = session.open("cpc464");
+    let mut refused = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(cpc464);
+        session.refusal("find", arguments)
+    };
+    assert_eq!(
+        refused(json!({ "bytes": "00", "ram": "&10000" })),
+        "ram &10000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "ram": 0, "to": "&10000" })),
+        "to &10000 is past &FFFF, the end of the RAM; give a to of &FFFF or below"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "ram": "&1000", "to": "&0FFF" })),
+        "to &0FFF is below ram &1000; give a to of &1000 or above"
+    );
+    assert_eq!(
+        refused(json!({ "bytes": "00", "ram": "&18000", "to": "&17000" })),
+        "ram &18000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
+    );
+    let plain = "to \"&10000\" is not an address; an address is a number from 0 to 65535, or \
+                 hexadecimal from &0000 to &FFFF, written with &, #, $ or 0x before it";
+    assert_eq!(refused(json!({ "bytes": "00", "to": "&10000" })), plain);
+    assert!(
+        refused(json!({ "bytes": "00", "ram": "cpu.pc" })).starts_with(
+            "ram \"cpu.pc\" is not an address in the RAM; an address in the RAM is a number"
+        )
+    );
+    let cpc6128 = session.open("cpc6128");
+    assert_eq!(
+        session.refusal(
+            "find",
+            json!({ "handle": cpc6128, "bytes": "00", "to": "&10000" })
+        ),
+        format!("{plain}; give ram to search a CPC's RAM by its own addresses")
+    );
 }
 
 // A snapshot of version 1, laid out by "Snapshot (.SNA) file format" (Kevin
@@ -2723,6 +2842,28 @@ fn a_run_stopped_before_an_instruction_runs_it_first_when_it_runs_on() {
             "{machine}"
         );
     }
+}
+
+// "If BC is not 0, the program counter is decremented by two and the
+// instruction is repeated" (UM0080, LDIR), so LDIR at &000A with BC 5 begins
+// there five times, and matches each time.
+#[test]
+fn a_repeating_instruction_matches_each_time_it_repeats() {
+    let program = [
+        DI, LD_HL, 0x00, 0x80, LD_DE, 0x00, 0x90, LD_BC, 5, 0, LDIR[0], LDIR[1], HALT,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let at = json!([{ "execute": "&000A" }]);
+    let ran = session.run(&handle, json!({ "frames": 1, "gather": at, "count": at }));
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        seen(&ran["gathered"]),
+        [("execute", 10, None, None); 5],
+        "{ran}"
+    );
+    assert_eq!(ran["counted"][0]["count"], 5, "{ran}");
 }
 
 // Each pass reads a byte as data and writes it back one more, sends it to a
@@ -4010,6 +4151,37 @@ fn a_psg_write_changes_by_the_bits_its_register_keeps() {
     );
 }
 
+// The same envelope shape written to R13 twice. The second write changes
+// nothing, so changes leaves it out, though on the chip it restarts the
+// envelope: MAME's ay8910.cpp (b2a182f) sets the shape anew at every write to
+// R13, and floooh's chips ay38910.h (9e88298) calls
+// _ay38910_restart_env_shape at every write to it.
+const WRITING_R13_TWICE: [u8; 24] = [
+    DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_C, 13, LD_A, 0x0E, CALL,
+    0x00, 0x01, LD_C, 13, LD_A, 0x0E, CALL, 0x00, 0x01, HALT,
+];
+
+#[test]
+fn an_envelope_shape_written_again_is_no_change() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_R13_TWICE);
+    roms.write_at("cpc6128.rom", 0x100, &WRITE_TO_PSG);
+    let mut session = Session::start(&roms);
+    let mut gathered = |condition: Value| {
+        let handle = session.open("cpc6128");
+        let ran = session.run(&handle, json!({ "frames": 1, "gather": [condition] }));
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        psg_writes(&ran["gathered"])
+    };
+    assert_eq!(
+        gathered(json!({ "psg": 13 })),
+        [(13, 0x0E, 0x0115), (13, 0x0E, 0x0115)]
+    );
+    assert_eq!(
+        gathered(json!({ "psg": 13, "changes": true })),
+        [(13, 0x0E, 0x0115)]
+    );
+}
+
 // Interrupt mode 1 pushes the program counter and runs from &0038 (UM0080),
 // where the handler writes a byte with LD (HL),n, takes interrupts again and
 // returns.
@@ -4514,6 +4686,67 @@ fn a_call_that_cannot_return_is_refused_and_changes_nothing() {
     }
 }
 
+// A routine runs from what the processor reads at its address: with a
+// CPC's ROMs enabled, as it stands up, LD A,&11 in the lower ROM at &0100
+// and LD A,&33 in the upper ROM at &C100, BASIC's socket 0 being the second
+// half of a 464's file; with them paged off, LD A,&22 and LD A,&44 in the
+// RAM beneath them.
+#[test]
+fn a_call_runs_what_the_processor_reads_at_its_address() {
+    let roms = Roms::all();
+    roms.write_at("cpc464.rom", 0x0100, &[LD_A, 0x11, RET]);
+    roms.write_at("cpc464.rom", 0x4100, &[LD_A, 0x33, RET]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.poke(&handle, json!("&0100"), "3E22C9");
+    session.poke(&handle, json!("&C100"), "3E44C9");
+    let called = |session: &mut Session, address: &str| {
+        let arguments = json!({
+            "handle": handle,
+            "address": address,
+            "values": { "cpu.sp": 0x8000 },
+        });
+        let called = session.answer("call", arguments);
+        assert_eq!(called["stopped"], "returned", "{called}");
+        session.inspect(&handle, "cpu.a")
+    };
+    assert_eq!(called(&mut session, "&0100"), 0x11);
+    assert_eq!(called(&mut session, "&C100"), 0x33);
+    session.set(
+        &handle,
+        json!({ "gate_array.lower_rom_enabled": false, "gate_array.upper_rom_enabled": false }),
+    );
+    assert_eq!(called(&mut session, "&0100"), 0x22);
+    assert_eq!(called(&mut session, "&C100"), 0x44);
+}
+
+// SYM SHIFT, written into the keyboard by set, is held through a call: the
+// routine at &0100 reads it as bit 1 of &7FFE's half-row, clear while it is
+// down (16K/48K reference, as over READING_TWO_HALF_ROWS), and it is still
+// held once the call is done.
+#[test]
+fn keys_written_into_the_keyboard_are_held_through_a_call() {
+    let roms = Roms::all();
+    roms.write_at(
+        "spectrum48.rom",
+        0x0100,
+        &[LD_BC, 0xFE, 0x7F, IN_A_C[0], IN_A_C[1], RET],
+    );
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.set(&handle, json!({ "keyboard.lines[7]": 0xFD }));
+    let called = session.answer(
+        "call",
+        json!({ "handle": handle, "address": "&0100", "values": { "cpu.sp": 0x8000 } }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    assert_eq!(
+        session.inspect(&handle, "cpu.a").as_u64().unwrap() & 0x1F,
+        0x1D
+    );
+    assert_eq!(session.inspect(&handle, "keyboard.lines[7]"), 0xFD);
+}
+
 // A loop that stands at &0006 with interrupts on in mode 1, whose handler at
 // &0038 writes &55 to &9000 and keeps A; and a routine at &0100 that counts
 // BC down from &2000, three frames' worth, then writes A to &9001.
@@ -4801,7 +5034,11 @@ fn only_a_read_offers_sp_and_pc_as_an_address() {
     let span = &run["$defs"]["Capture"]["properties"]["memory"]["items"]["properties"]["address"];
     assert!(offers("run", span));
     assert!(!offers("find", &property("find", "address")));
-    assert!(!offers("find", &property("find", "to")));
+    let ram = &property("peek", "ram")["anyOf"];
+    assert!(ram.is_array(), "{ram}");
+    for (tool, name) in [("find", "ram"), ("find", "to"), ("disassemble", "ram")] {
+        assert_eq!(&property(tool, name)["anyOf"], ram, "{tool} {name}");
+    }
     assert!(!offers("poke", &property("poke", "address")));
     assert!(!offers("call", &property("call", "address")));
     let execute = &run["$defs"]["Condition"]["oneOf"][0]["properties"]["execute"];
@@ -5362,6 +5599,37 @@ fn the_monitor_says_whether_its_beam_is_partway_through_its_picture() {
     }
 }
 
+// A run by frames ends just past the monitor's retrace, inside the Gate
+// Array's frame sync, which ends with the sixth of the 6845's line syncs
+// since its vertical sync began (Compendium ch. 16.2.3). "When C0=R2 then a
+// HSYNC is generated" (ch. 14.7.1), and with C0 below 13 when R0 is set to
+// 13, C0 counts no further than 13 and never reaches R2's 46, so the frame
+// sync never ends. The monitor retraces once in a frame sync and is armed
+// again only by a line's short pulse (the emulator's monitor.c), so its beam
+// stays on line 0, above the picture. The run stops at its limit, and the
+// picture is the one before it, painted before the border changed.
+#[test]
+fn a_picture_after_a_run_whose_frames_never_came_holds_what_came_before() {
+    let roms = Roms::programmed("cpc464.rom", &cpc_screen_program());
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.run_past_its_halt(&handle, 2);
+    let (_, before) = session.pictured("monitor", json!({ "handle": handle }));
+    assert!(session.inspect(&handle, "crtc.c0").as_u64().unwrap() < 13);
+    session.set(
+        &handle,
+        json!({ "crtc.registers[0]": 13, "gate_array.inks[16]": INKS[1] }),
+    );
+    let ran = session.run(&handle, json!({ "frames": 1 }));
+    assert_eq!(
+        (&ran["stopped"], &ran["frames"]),
+        (&json!("limit"), &json!(0)),
+        "{ran}"
+    );
+    let (answer, after) = session.pictured("monitor", json!({ "handle": handle }));
+    assert!(after.indices == before.indices, "{answer}");
+}
+
 // The monitor's picture where the display falls, held to the memory the 6845
 // is displaying, as screen reads it with nothing asked: pen for colour, every
 // pixel of every line. With the firmware's horizontal timing and its frame
@@ -5709,7 +5977,7 @@ fn screen_says_what_would_have_worked() {
             &mut session,
             json!({ "reading": "columns", "base": "&10000", "width": 2, "height": 2 })
         ),
-        "&10000 is past &FFFF, the end of the RAM"
+        "&10000 is past &FFFF, the end of the RAM; give a base of &FFFF or below"
     );
     assert_eq!(
         refused(&mut session, json!({ "base": "&200000" })),
@@ -5924,8 +6192,9 @@ fn disassemble_says_what_would_have_worked() {
             "disassemble",
             json!({ "handle": handle, "address": "&8000" })
         ),
-        "&8000 starts a chain of DD and FD prefixes running to &8FFF, longer than the 4096 bytes a \
-         listing reads; the last prefix decides the instruction, so disassemble from &8FFF"
+        "&8000 starts a chain of DD and FD prefixes running to &8FFF, which with the instruction \
+         it prefixes is longer than the 4096 bytes a listing reads; the last prefix decides the \
+         instruction, so disassemble from &8FFF"
     );
     // With its last three bytes an instruction, the chain and the
     // instruction it prefixes come to the 4096 bytes a listing reads.
@@ -5940,6 +6209,139 @@ fn disassemble_says_what_would_have_worked() {
         "{listed:.200}"
     );
     assert_eq!(listed["instructions"][0]["text"], "LD IX,&1234");
+}
+
+// With ram, a 6128's RAM is listed by its own addresses, whatever is paged
+// in: beneath the enabled lower ROM, and in the second 64K, read as
+// configuration 2 puts it before the processor, all of it and nothing else
+// ("Ram management", cpctech), its listing wrapping from &1FFFF to &10000.
+#[test]
+fn disassemble_reads_a_cpcs_ram_by_its_own_addresses() {
+    let roms = Roms::programmed("cpc6128.rom", &[LD_A, 0x11]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.poke(&handle, json!(0), "18FE");
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(&handle, json!("&4000"), "3412");
+    session.set(&handle, json!({ "mmr": 0xC7 }));
+    session.poke(&handle, json!("&7FFF"), "21");
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    let mut listed = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("disassemble", arguments)["instructions"].clone()
+    };
+    assert_eq!(
+        listed(json!({ "address": 0, "instructions": 1 })),
+        json!([{ "address": "&0000", "bytes": "3E11", "text": "LD A,&11" }])
+    );
+    assert_eq!(
+        listed(json!({ "ram": 0, "instructions": 1 })),
+        json!([{ "ram": "&0000", "bytes": "18FE", "text": "JR &0000" }])
+    );
+    assert_eq!(
+        listed(json!({ "ram": "&1FFFF", "instructions": 2 })),
+        json!([
+            { "ram": "&1FFFF", "bytes": "213412", "text": "LD HL,&1234" },
+            { "ram": "&10002", "bytes": "00", "text": "NOP" },
+        ])
+    );
+}
+
+// A listing of either 64K of a 6128's RAM is the processor's listing of it
+// with the ROMs disabled, in configuration 2 for the second and 0 for the
+// base, but for the addresses, which are the RAM's: the same bytes, the same
+// texts, relative jumps' targets among them, the same firmware names, and the
+// same wrap past &FFFF. A restart at &0007 told apart in each 64K shows each
+// listing read its own.
+#[test]
+fn a_listing_of_the_ram_is_the_processors_with_that_64k_alone() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.set(
+        &handle,
+        json!({ "gate_array.lower_rom_enabled": false, "gate_array.upper_rom_enabled": false }),
+    );
+    let program = [
+        ("&0000", "18FE10FCC3FFFF"),
+        ("&BB14", "180218FCCD18BB"),
+        ("&FFFD", "0018FD"),
+    ];
+    for (mmr, base, restart) in [(0xC2, 0x10000, "FF"), (0xC0, 0, "C7")] {
+        session.set(&handle, json!({ "mmr": mmr }));
+        for (address, bytes) in program {
+            session.poke(&handle, json!(address), bytes);
+        }
+        session.poke(&handle, json!("&0007"), restart);
+        for start in [0x0000, 0xBB14, 0xFFFD] {
+            let listed = |session: &mut Session, arguments: Value| {
+                let mut arguments = arguments;
+                arguments["handle"] = json!(handle);
+                arguments["instructions"] = json!(4);
+                session.answer("disassemble", arguments)["instructions"].clone()
+            };
+            let mut expected = listed(&mut session, json!({ "address": start }));
+            for instruction in expected.as_array_mut().expect("a listing") {
+                let address = instruction
+                    .as_object_mut()
+                    .expect("an instruction")
+                    .remove("address")
+                    .expect("an address");
+                let ram = base + after_ampersand(&address, 4);
+                instruction["ram"] = json!(format!("&{ram:04X}"));
+            }
+            assert_eq!(
+                listed(&mut session, json!({ "ram": base + start })),
+                expected,
+                "configuration {mmr:02X}, from &{start:04X}"
+            );
+        }
+    }
+}
+
+#[test]
+fn disassemble_says_what_would_have_worked_with_ram() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    let cpc464 = session.open("cpc464");
+    let cpc6128 = session.open("cpc6128");
+    for half in [0, 0x8000] {
+        session.fill(&cpc6128, half, &[PREFIX_DD; 0x8000]);
+    }
+    session.set(&cpc6128, json!({ "mmr": 0xC4 }));
+    session.fill(&cpc6128, 0x4000, &[PREFIX_DD; 4096]);
+    let mut refused = |handle: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.refusal("disassemble", arguments)
+    };
+    let either = "give address or ram, exactly one: {\"address\": \"&4000\"} disassembles as \
+                  the processor reads, through the banking and the ROMs, and {\"ram\": \
+                  \"&1C000\"} disassembles a CPC's RAM by its own addresses";
+    assert_eq!(refused(&cpc464, json!({})), either);
+    assert_eq!(refused(&cpc464, json!({ "address": 0, "ram": 0 })), either);
+    assert_eq!(
+        refused(&spectrum, json!({ "ram": "&4000" })),
+        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+         disassemble it with address"
+    );
+    assert_eq!(
+        refused(&cpc464, json!({ "ram": "&10000" })),
+        "ram &10000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
+    );
+    assert_eq!(
+        refused(&cpc6128, json!({ "ram": "&10000" })),
+        "&10000 starts a chain of DD and FD prefixes running to &10FFF, which with the \
+         instruction it prefixes is longer than the 4096 bytes a listing reads; the last prefix \
+         decides the instruction, so disassemble with ram from &10FFF"
+    );
+    assert_eq!(
+        refused(&cpc6128, json!({ "ram": 0 })),
+        "&0000 to &FFFF of the RAM holds nothing but DD and FD prefixes, which the processor runs \
+         as one endless instruction; there is nothing to list"
+    );
 }
 
 const KINDS: [&str; 5] = ["execute", "read", "write", "in", "out"];
@@ -9953,6 +10355,36 @@ fn keys_held_through_a_run_are_the_keys_basic_reads() {
         let printed: Vec<&String> = text.iter().filter(|line| !line.trim().is_empty()).collect();
         assert_eq!(printed[printed.len() - 2].trim(), read, "{keys}: {text:#?}");
     }
+}
+
+// "The key debouncing requires that a key should be released for two scans
+// of the keyboard before it is marked as released in the key state map",
+// which KM TEST KEY, &BB1E, reads, answering Zero false for a key pressed
+// (SOFT 968, KM TEST KEY), and the scan "occurs automatically every fiftieth
+// of a second" (section 3.1). SPACE, 47, let go at the end of a run still
+// tests pressed there and a frame later, and released a frame after that.
+// Each test is made from a state kept for it, so the machine runs on as if
+// it had not been made.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_key_let_go_is_marked_released_at_the_second_scan_after() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.run(&handle, json!({ "frames": 10, "keys": ["SPACE"] }));
+    let mut pressed = Vec::new();
+    for _ in 0..3 {
+        let state = keep(&mut session, &handle);
+        let tested = session.answer(
+            "call",
+            json!({ "handle": handle, "address": "&BB1E", "values": { "cpu.a": 47 } }),
+        );
+        assert_eq!(tested["stopped"], "returned", "{tested}");
+        pressed.push(session.inspect(&handle, "cpu.f").as_u64().unwrap() & 0x40 == 0);
+        restore(&mut session, &handle, &state);
+        session.run(&handle, json!({ "frames": 1 }));
+    }
+    assert_eq!(pressed, [true, true, false]);
 }
 
 // CAPS SHIFT with SPACE "acts as a BREAK" (ZX Spectrum BASIC programming,

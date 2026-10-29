@@ -127,8 +127,9 @@ pub fn settle(asked: &Asked, cpc: &cpc_t) -> Result<Screen, String> {
         }
         Some(base) if base >= cpc.ram_size => {
             return Err(format!(
-                "&{base:04X} is past &{:04X}, the end of the RAM",
-                cpc.ram_size - 1
+                "&{base:04X} is past &{last:04X}, the end of the RAM; give a base of &{last:04X} \
+                 or below",
+                last = cpc.ram_size - 1
             ));
         }
         Some(base) => (base, character_of(base)),
