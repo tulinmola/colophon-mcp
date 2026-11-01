@@ -11,10 +11,12 @@
    registers. The core runs the chip on every access to the PPI, which the
    board decodes from A11 low, and port C's top two bits are the chip's BDIR
    and BC1: each access that leaves them giving it WRITE writes port A's byte
-   to the selected register (colophon-emulator's cpc.c, io_write, io_read and
-   run_psg, at 7a23101). */
+   to the selected register while the chip is selected (colophon-emulator's
+   cpc.c, cpc_init, io_write, io_read and run_psg, and its ay38910.c,
+   ay38910_init and ay38910_access, at 2898ddd). */
 static bool psg_written(const cpc_t *cpc, uint16_t port) {
-  return (port & 0x0800) == 0 && ppi_output_of(&cpc->ppi, PPI_PORT_C) >> 6 == PSG_WRITE;
+  return (port & 0x0800) == 0 && ppi_output_of(&cpc->ppi, PPI_PORT_C) >> 6 == AY38910_WRITE &&
+         cpc->psg.chip_selected;
 }
 
 /* Whether an I/O request, begun at this port, wrote one of the 6845's
@@ -201,7 +203,7 @@ const char *mcp_cpc_call(cpc_t *cpc, uint16_t address) {
 
 /* The bounds below are where the core trusts a field without checking it,
    because no path of its own takes the field outside them: the line quoted
-   beside each is the use. colophon-emulator at 9e4b166. */
+   beside each is the use. colophon-emulator at 2898ddd. */
 const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
   const upd765_t *fdc = &written->fdc;
   const char *problem = mcp_z80_check(&written->cpu);
@@ -223,7 +225,7 @@ const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
   if (written->gate_array.pen > 16) {
     return "gate_array.pen selects one of the 17 inks; write 0 to 16";
   }
-  /* psg_access: `psg->registers[psg->selected]`, as held() above reads it
+  /* ay38910_access: `psg->registers[psg->selected]`, as held() above reads it
      too. */
   if (written->psg.selected > 15) {
     return "psg.selected selects one of the 16 registers; write 0 to 15";

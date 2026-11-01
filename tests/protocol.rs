@@ -2517,6 +2517,7 @@ fn a_cpc_opens_from_its_snapshot_of(version: u8) {
     );
     assert_eq!(session.inspect(&handle, "upper_rom_number"), 7);
     assert_eq!(session.inspect(&handle, "psg.selected"), 9);
+    assert_eq!(session.inspect(&handle, "psg.chip_selected"), true);
     let registers: Vec<u8> = (0..16).collect();
     assert_eq!(session.inspect(&handle, "psg.registers"), json!(registers));
     // "This byte represents the inputs to PPI port A", and to B, and "the
@@ -3831,6 +3832,80 @@ fn a_psg_write_is_matched_at_each_access_to_the_ppi_that_leaves_it_writing() {
     );
 }
 
+// The six high order address bits of the PSG "function as "chip selects"", of
+// which DA7 to DA4 are "programmed to recognize only a 0000 code", and "A
+// valid high order address latches the register address" (General
+// Instrument's AY-3-8910/8912 data manual, February 1979, §2.1.1,
+// https://raw.githubusercontent.com/floooh/emu-info/93d132fc30509f4ff4c147d53b8f92b81999dcc5/gi/GI_AY-3-8910_Feb-1979.pdf).
+// An address that fails the match leaves the chip unselected, as reset does,
+// taking no write until an address passes (deathsoft and lvd's model of the
+// die, PSG_SEL,
+// https://github.com/lvd2/ay-3-8910_reverse_engineered/blob/cf8d14db0aec5ae86ed4f4e6e67bf14c40a42d77/rtl/ay_model.v),
+// and the emulator resets the chip at power-on (its cpc.c, cpc_init, and
+// ay38910.c, ay38910_init, at 2898ddd). The program leaves port C giving
+// WRITE from before the first address, so that a chip selected at power-on
+// would be written at &000C and by the routine's first OUT, at &0102; then,
+// through the routine at &0100, it writes &0A to register 1, &A5 after giving
+// 16 as the address, and, from &001C, &55 to register 0.
+const WRITING_PAST_REGISTER_15: [u8; 36] = [
+    DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x80, 0xF6,
+    OUT_C_C[0], OUT_C_C[1], LD_C, 1, LD_A, 0x0A, CALL, 0x00, 0x01, LD_C, 16, LD_A, 0xA5, CALL,
+    0x00, 0x01, LD_C, 0, LD_A, 0x55, CALL, 0x00, 0x01, HALT,
+];
+
+#[test]
+fn a_psg_write_after_an_address_above_15_is_no_match() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_PAST_REGISTER_15);
+    roms.write_at("cpc6128.rom", 0x100, &WRITE_TO_PSG);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    assert_eq!(session.inspect(&handle, "psg.chip_selected"), false);
+    assert_eq!(session.inspect(&handle, "psg.selected"), 0);
+    let gather = json!([{ "psg": 0, "to": 15 }]);
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 1, "until": [{ "execute": "&001C" }], "gather": gather }),
+    );
+    assert_eq!(ran["stopped"], "matched", "{ran}");
+    assert_eq!(psg_writes(&ran["gathered"]), [(1, 0x0A, 0x0115)], "{ran}");
+    assert_eq!(session.inspect(&handle, "psg.chip_selected"), false);
+    assert_eq!(session.inspect(&handle, "psg.selected"), 1);
+    assert_eq!(session.inspect(&handle, "psg.registers[0]"), 0);
+    assert_eq!(session.inspect(&handle, "psg.registers[1]"), 0x0A);
+    let ran = session.run(&handle, json!({ "frames": 1, "gather": gather }));
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(psg_writes(&ran["gathered"]), [(0, 0x55, 0x0115)], "{ran}");
+    assert_eq!(session.inspect(&handle, "psg.chip_selected"), true);
+}
+
+// "For CPCEMU compatibility, this byte should be in the range 0-15", note 17
+// says of the index of the selected PSG register, at &5A ("Snapshot (.SNA)
+// file format", Kevin
+// Thacker's cpctech,
+// https://web.archive.org/web/20260721051400/https://cpctech.cpcwiki.de/docs/snapshot.html),
+// and the emulator writes a PSG left unselected as its register plus 16, and
+// reads any byte above 15 there as one, selecting the low four bits first
+// (its cpc_snapshot.h, and cpc_snapshot_load and cpc_snapshot_save in
+// cpc_snapshot.c, at 2898ddd).
+#[test]
+fn a_psg_left_unselected_is_saved_and_opened_past_15() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    session.set(&handle, json!({ "psg.selected": 5 }));
+    let saved = roms.0.join("unselected.sna");
+    session.answer("snapshot_save", json!({ "handle": handle, "path": saved }));
+    assert_eq!(fs::read(&saved).unwrap()[0x5A], 0x15);
+    let reopened = session.open_from("cpc464", &saved);
+    assert_eq!(session.inspect(&reopened, "psg.chip_selected"), false);
+    assert_eq!(session.inspect(&reopened, "psg.selected"), 5);
+    let mut snapshot = cpc_snapshot(64, 1);
+    snapshot[0x5A] = 0x13;
+    let opened = session.open_from("cpc464", &roms.write("past-15.sna", &snapshot));
+    assert_eq!(session.inspect(&opened, "psg.chip_selected"), false);
+    assert_eq!(session.inspect(&opened, "psg.selected"), 3);
+}
+
 // "The 6845 is selected when bit 14 of the I/O port address is set to '0'",
 // and its ports are "&BCxx Select 6845 register", "&BDxx Write 6845 register
 // data" and "&BFxx (note 1) Read only" ("CRTC", Kevin Thacker's cpctech,
@@ -4119,8 +4194,9 @@ fn a_value_tells_the_gate_arrays_functions_apart_and_changes_reads_beneath_a_rom
 
 // "The period of the noise generator is set by bits 0..4 of the noise period
 // register", R6 (SOFT 968, Appendix IX), and those five bits are all the
-// emulator keeps of it (its psg.c), so &FF written after &1F leaves it holding
-// what it held. The routine at &0100 is cpctech's .write_to_psg, as above.
+// emulator keeps of it (its ay38910.c at 2898ddd), so &FF written after &1F
+// leaves it holding what it held. The routine at &0100 is cpctech's
+// .write_to_psg, as above.
 const WRITING_R6_TWICE: [u8; 24] = [
     DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_C, 6, LD_A, 0x1F, CALL,
     0x00, 0x01, LD_C, 6, LD_A, 0xFF, CALL, 0x00, 0x01, HALT,
