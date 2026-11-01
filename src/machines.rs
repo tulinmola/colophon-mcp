@@ -1083,9 +1083,9 @@ impl Built {
             (true, None) => (every_place, every_place as u32, u32::MAX),
         };
         let mut counts = vec![0; size];
-        // Room for every place a count to a file can reach, 1949696 on a 6128,
-        // is asked for zeroed rather than filled, so that room no place is
-        // kept in is never written.
+        // Room for every place a count to a file or by range can reach,
+        // 1949696 on a 6128, is asked for zeroed rather than filled, so that
+        // room no place is kept in is never written.
         // SAFETY: as for a match.
         let mut places =
             unsafe { Box::<[Place]>::new_zeroed_slice(place_room as usize).assume_init() }

@@ -131,11 +131,16 @@ static void capture(mcp_watch_t *watch, const z80_t *cpu) {
 }
 
 /* A byte of the instruction under way, kept where it was first matched. */
-static void fetch(mcp_watch_t *watch, uint8_t value) {
+static void fetch(mcp_watch_t *watch, uint16_t address, uint8_t value) {
   mcp_place_t *place = watch->fetching;
-  if (place != NULL && place->length < MCP_INSTRUCTION_BYTES) {
-    place->bytes[place->length++] = value;
+  if (place == NULL || place->length >= MCP_INSTRUCTION_BYTES) {
+    return;
   }
+  if (place->contiguous == place->length &&
+      watch->locate(watch->machine, address, false) == place->first.location + place->length) {
+    place->contiguous++;
+  }
+  place->bytes[place->length++] = value;
 }
 
 /* At an instruction the run has come to: whether it stops before it. */
@@ -234,7 +239,7 @@ void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *moni
       watch->responding = true;
     } else if (opcode || z80_reading_operand(cpu)) {
       watch->fetched |= opcode;
-      fetch(watch, value);
+      fetch(watch, address, value);
     } else {
       see(watch, monitor, tick, MCP_READ, address, value, false, true, true);
     }

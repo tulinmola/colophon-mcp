@@ -72,8 +72,8 @@ const MOST_GATHERED_CAPTURING: u32 = 32;
 // and the room a run keeps for them to some 56MB, and some 140MB more for what
 // they capture, taken up only where a match captures.
 const MOST_GATHERED_TO_A_FILE: u32 = 1 << 20;
-// A place counted takes some 60 characters, so these come to about twice what
-// MOST_BYTES does.
+// A place counted, or a range of places, takes some 60 characters, so these
+// come to about twice what MOST_BYTES does.
 const MOST_COUNTED: u32 = 256;
 // Each is weighed against every access a run makes.
 const MOST_CONDITIONS: usize = 16;
@@ -1129,7 +1129,7 @@ fn watching(
             MOST_GATHERED
         },
         gathers_last: gather_last == Some(true),
-        most_counted: (!filing).then_some(MOST_COUNTED),
+        most_counted: (!filing && count_by != Some(CountBy::Range)).then_some(MOST_COUNTED),
         counts_by_pc: count_by == Some(CountBy::Pc),
     }
 }
@@ -1449,13 +1449,16 @@ struct RunRequest {
     /// - a port written, by its whole address,
     /// - a register of the PSG or the 6845 written.
     ///
-    /// On a CPC a place in memory is a byte of RAM or ROM, not an address: a ROM's byte and the RAM's byte at the same address are 2 places, and a byte of RAM a 6128 pages in at 2 addresses is 1 place, listed at the address the processor first reached it at. `{"execute": "&4000", "to": "&BFFF"}` counts every instruction run in that range. The run stops at the end of the instruction that adds the 256th place; the next run counts afresh. With `path`, the number of places never stops the run.
+    /// On a CPC a place in memory is a byte of RAM or ROM, not an address: a ROM's byte and the RAM's byte at the same address are 2 places, and a byte of RAM a 6128 pages in at 2 addresses is 1 place, listed at the address the processor first reached it at. `{"execute": "&4000", "to": "&BFFF"}` counts every instruction run in that range. The run stops at the end of the instruction that adds the 256th place; the next run counts afresh. With `path` or `count_by` `"range"`, the number of places never stops the run.
     #[schemars(schema_with = "count_conditions_schema")]
     #[schemars(transform = absent_not_null)]
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<Value>,
-    /// `"address"` (the default) counts an access by its place; `"pc"` counts it by the byte of memory where the instruction that made it starts, so a count of writes to the screen shows which instructions wrote it and how often. Instructions run are counted by address either way. With `"pc"`, accesses made by an interrupt response are not counted. Refused without `count`.
+    /// How `count` counts and answers; refused without `count`:
+    /// - `"address"` (the default) counts an access by its place.
+    /// - `"pc"` counts an access by the byte of memory where the instruction that made it starts, so a count of writes to the screen shows which instructions wrote it and how often. Accesses made by an interrupt response are not counted. Instructions run are still counted by address.
+    /// - `"range"` counts as `"address"` does, and answers `ranges` instead of `counted`. A range is the places of 1 kind that follow one another with no gap, both at the addresses the processor first reached them at and in the RAM or ROM holding them. An instruction covers the bytes it fetched, at most 4, before the first that does not follow the one before it in the same RAM or ROM; a byte read or written covers itself; ports and registers follow one another by number. A range gives its first place's address, port or register under its kind, as in `{"write": "&4000", "to": "&5AFF", "places": 6912, "count": 6912}`: `to` is its last place's, and `count` the number of times its places matched. The answer lists the first 256 ranges, and `ranges_counted` says how many there were; `path` takes them all.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
@@ -1469,7 +1472,7 @@ struct RunRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<Value>>,
-    /// A new file to receive what `gather` and `count` find, instead of the answer's lists, for the client to read with its own tools: a path on the server's file system, a relative one starting from the server's working directory. Each line is a JSON object, first the matches, then the places, each as the answer would list it, starting with `"list": "gather"` or `"count"`. The file is complete once the answer gives its SHA-256. Refused if the file exists or its directory does not, and without `gather` or `count`.
+    /// A new file to receive what `gather` and `count` find, instead of the answer's lists, for the client to read with its own tools: a path on the server's file system, a relative one starting from the server's working directory. Each line is a JSON object, first the matches, then the places or the ranges, each as the answer would list it, starting with `"list": "gather"` or `"count"`. The file is complete once the answer gives its SHA-256. Refused if the file exists or its directory does not, and without `gather` or `count`.
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
@@ -1537,12 +1540,14 @@ struct TypeRequest {
     text: String,
 }
 
-// What a count counts an access by.
+// What a count counts an access by, and whether it answers its places as
+// ranges.
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum CountBy {
     Address,
     Pc,
+    Range,
 }
 
 // A CPC's two drives, as AMSDOS names them.
@@ -1936,7 +1941,7 @@ enum Stopped {
     Unsettled,
     /// One of `until`'s conditions matched. `matched` lists the matches.
     Matched,
-    /// `gather` or `count` reached its limit. The run stopped at the end of the instruction that reached it, keeping that instruction's other matches and those of an interrupt response taken at its end. With `gather_last`, `gather` never fills; with `path`, `count` never fills. The limits:
+    /// `gather` or `count` reached its limit. The run stopped at the end of the instruction that reached it, keeping that instruction's other matches and those of an interrupt response taken at its end. With `gather_last`, `gather` never fills; with `path` or `count_by` `"range"`, `count` never fills. The limits:
     /// - `gather`: 128 matches, 32 when one of its conditions captures, or 1048576 with `path`, capturing or not.
     /// - `count`: 256 places.
     Full,
@@ -2245,6 +2250,145 @@ impl Counted {
     }
 }
 
+// Places counted with no gap between them, told by the first and the last.
+#[derive(Serialize, JsonSchema)]
+struct CountedRange {
+    /// The first address where the counted instructions began, in hexadecimal after &.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    execute: Option<Hexadecimal>,
+    /// The first address of the bytes the program read as data, in hexadecimal after &.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    read: Option<Hexadecimal>,
+    /// The first address of the bytes the processor wrote, in hexadecimal after &.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    write: Option<Hexadecimal>,
+    /// The first port the processor read, by its whole address, in hexadecimal after &.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    r#in: Option<Hexadecimal>,
+    /// The first port the processor wrote, by its whole address, in hexadecimal after &.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    out: Option<Hexadecimal>,
+    /// The number of the first of a CPC's PSG registers written, 0 to 15.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    psg: Option<u16>,
+    /// The number of the first of a CPC's 6845 registers written, 0 to 31 (the 6845 has 0 to 17), as its address register holds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    crtc: Option<u16>,
+    /// The last place's address or port, in hexadecimal after &, or its register's number, as the first is given.
+    to: AddressOrNumber,
+    /// On a CPC, the ROM that held the instructions or answered the reads, in the same form as a match's `rom`. Not given when the RAM held them, nor for writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    rom: Option<String>,
+    /// On a CPC, the first place's address in the RAM, as a match's `ram` gives it. Given only when the RAM held the range at addresses other than those the processor reached it at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
+    /// The number of places in the range.
+    places: u32,
+    /// The number of times the range's places matched, together.
+    count: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+enum AddressOrNumber {
+    Address(Hexadecimal),
+    Number(u16),
+}
+
+struct Folding<'a> {
+    first: &'a Place,
+    last: u16,
+    next: u32,
+    places: u32,
+    count: u64,
+}
+
+impl CountedRange {
+    fn folded(counts: &[(Place, u32)], paged: bool) -> Vec<CountedRange> {
+        // Places that may share a range: of one kind, in the RAM or in one
+        // ROM, each reached at an address the same distance from where that
+        // holds it.
+        let apart = |place: &Place| {
+            let first = &place.first;
+            let rom = first
+                .location
+                .checked_sub(FIRST_ROM_LOCATION)
+                .map(|byte| byte / ROM_BYTES);
+            (
+                first.kind,
+                rom,
+                i64::from(first.location) - i64::from(first.address),
+            )
+        };
+        let mut sorted: Vec<&(Place, u32)> = counts.iter().collect();
+        sorted.sort_by_key(|(place, _)| (apart(place), place.first.address));
+        let mut foldings: Vec<Folding> = Vec::new();
+        for (place, count) in sorted {
+            let address = u32::from(place.first.address);
+            let covered = if place.first.kind == EXECUTE {
+                u32::from(place.contiguous)
+            } else {
+                1
+            };
+            match foldings.last_mut() {
+                Some(folding)
+                    if apart(folding.first) == apart(place) && address <= folding.next =>
+                {
+                    folding.last = place.first.address;
+                    folding.next = folding.next.max(address + covered);
+                    folding.places += 1;
+                    folding.count += u64::from(*count);
+                }
+                _ => foldings.push(Folding {
+                    first: place,
+                    last: place.first.address,
+                    next: address + covered,
+                    places: 1,
+                    count: u64::from(*count),
+                }),
+            }
+        }
+        foldings.sort_by_key(|folding| {
+            let first = &folding.first.first;
+            (first.kind, first.address, first.location)
+        });
+        foldings
+            .into_iter()
+            .map(|folding| {
+                let kind = folding.first.first.kind;
+                let first = Matched::of(&folding.first.first, None, paged);
+                CountedRange {
+                    execute: first.execute,
+                    read: first.read,
+                    write: first.write,
+                    r#in: first.r#in,
+                    out: first.out,
+                    psg: first.psg,
+                    crtc: first.crtc,
+                    to: if kind == PSG || kind == CRTC {
+                        AddressOrNumber::Number(folding.last)
+                    } else {
+                        AddressOrNumber::Address(Hexadecimal::address(folding.last))
+                    },
+                    rom: first.rom,
+                    ram: first.ram,
+                    places: folding.places,
+                    count: folding.count,
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 struct Ran {
     #[serde(flatten)]
@@ -2267,14 +2411,22 @@ struct Ran {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<Vec<Matched>>,
-    /// Each place that matched `count`'s conditions, listed once as its first match, with the number of times it matched. Given with `count`, without `path`. A byte of memory the processor reaches at 2 addresses is 1 place, listed at the address of its first match. The order:
+    /// Each place that matched `count`'s conditions, listed once as its first match, with the number of times it matched. Given with `count`, without `path` or `count_by` `"range"`. A byte of memory the processor reaches at 2 addresses is 1 place, listed at the address of its first match. The order:
     /// - By kind: `execute`, `read`, `write`, `in`, `out`, `psg`, `crtc`.
     /// - Within a kind, by address or register, or by `pc` with `count_by` `"pc"`.
     /// - At the same address, the RAM's places first, by their addresses in the RAM, then the lower ROM's, then the upper ROMs' by number.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<Vec<Counted>>,
-    /// The file written at `path`. It holds what `gathered` and `counted` would have listed, and they are not given. Given with `path`.
+    /// The ranges `count`'s places make, as `count_by` `"range"` folds them, in the order `counted` lists places, by their first places: at most the first 256. Given with `count_by` `"range"`, without `path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ranges: Option<Vec<CountedRange>>,
+    /// The number of ranges, listed or not. Given with `ranges`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ranges_counted: Option<usize>,
+    /// The file written at `path`. It holds what `gathered`, `counted` and `ranges` would have listed, all the ranges and not only the first 256, and they are not given. Given with `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     written: Option<Filed>,
@@ -2289,7 +2441,7 @@ struct Filed {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     gathered: Option<usize>,
-    /// The number of the file's lines that are `count`'s places, which follow. Given with `count`.
+    /// The number of the file's lines that are `count`'s places, or its ranges with `count_by` `"range"`, which follow. Given with `count`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     counted: Option<usize>,
@@ -2300,6 +2452,7 @@ struct Filed {
 struct Lists {
     gathering: bool,
     counting: bool,
+    ranging: bool,
     file: Option<NewFile>,
 }
 
@@ -2316,12 +2469,26 @@ fn line<T: Serialize>(file: &mut NewFile, list: &'static str, entry: T) -> io::R
     file.write_all(b"\n")
 }
 
-fn write_lists(file: &mut NewFile, watched: &Watched, watched_for: &WatchedFor) -> io::Result<()> {
+fn write_lists(
+    file: &mut NewFile,
+    watched: &Watched,
+    watched_for: &WatchedFor,
+    ranges: Option<Vec<CountedRange>>,
+) -> io::Result<()> {
     for matched in Matched::listed(watched, watched_for, |seen| seen.gathers) {
         line(file, "gather", matched)?;
     }
-    for place in &watched.counts {
-        line(file, "count", Counted::of(place, watched.paged))?;
+    match ranges {
+        Some(ranges) => {
+            for range in ranges {
+                line(file, "count", range)?;
+            }
+        }
+        None => {
+            for place in &watched.counts {
+                line(file, "count", Counted::of(place, watched.paged))?;
+            }
+        }
     }
     Ok(())
 }
@@ -2346,6 +2513,8 @@ impl Ran {
             matched: None,
             gathered: None,
             counted: None,
+            ranges: None,
+            ranges_counted: None,
             written: None,
         }
     }
@@ -2374,20 +2543,30 @@ impl Ran {
         self.matched = watched
             .matched
             .then(|| Matched::listed(watched, watched_for, |seen| seen.stops).collect());
+        let ranges = lists
+            .ranging
+            .then(|| CountedRange::folded(&watched.counts, watched.paged));
+        let counted = ranges.as_ref().map_or(watched.counts.len(), Vec::len);
         let Some(mut file) = lists.file else {
             self.gathered = lists
                 .gathering
                 .then(|| Matched::listed(watched, watched_for, |seen| seen.gathers).collect());
-            self.counted = lists.counting.then(|| {
-                watched
-                    .counts
-                    .iter()
-                    .map(|place| Counted::of(place, watched.paged))
-                    .collect()
-            });
+            if let Some(mut ranges) = ranges {
+                self.ranges_counted = Some(ranges.len());
+                ranges.truncate(MOST_COUNTED as usize);
+                self.ranges = Some(ranges);
+            } else if lists.counting {
+                self.counted = Some(
+                    watched
+                        .counts
+                        .iter()
+                        .map(|place| Counted::of(place, watched.paged))
+                        .collect(),
+                );
+            }
             return Ok(self);
         };
-        let written = write_lists(&mut file, watched, watched_for);
+        let written = write_lists(&mut file, watched, watched_for, ranges);
         let file = file.finish(written).map_err(|problem| {
             format!(
                 "{problem}. The run still happened: it ran {} ticks, and the machine is at tick {} \
@@ -2401,7 +2580,7 @@ impl Ran {
         self.written = Some(Filed {
             file,
             gathered: lists.gathering.then_some(gathered),
-            counted: lists.counting.then_some(watched.counts.len()),
+            counted: lists.counting.then_some(counted),
         });
         Ok(self)
     }
@@ -2902,6 +3081,7 @@ impl Server {
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let (gather_last, count_by) = (request.gather_last, request.count_by);
+        let ranging = count_by == Some(CountBy::Range);
         let path = request.path;
         let ran = match (request.frames, request.ticks) {
             (Some(frames), None) => {
@@ -2928,6 +3108,7 @@ impl Server {
                     let lists = Lists {
                         gathering,
                         counting,
+                        ranging,
                         file,
                     };
                     let ran = Ran::of(run, built, stopped).watched(&watched, &watched_for, lists);
@@ -2956,6 +3137,7 @@ impl Server {
                     let lists = Lists {
                         gathering,
                         counting,
+                        ranging,
                         file,
                     };
                     let ran =
@@ -3026,6 +3208,7 @@ impl Server {
         let gathering = request.gather.is_some();
         let counting = request.count.is_some();
         let (gather_last, count_by) = (request.gather_last, request.count_by);
+        let ranging = count_by == Some(CountBy::Range);
         let mut arguments = journaled(&request);
         arguments["address"] = json!(Hexadecimal::address(address));
         journal_conditions(&mut arguments, &watched_for);
@@ -3055,6 +3238,7 @@ impl Server {
             let lists = Lists {
                 gathering,
                 counting,
+                ranging,
                 file,
             };
             let ran = Ran::of(run, built, stopped).watched(&watched, &watched_for, lists);

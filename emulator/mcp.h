@@ -177,6 +177,11 @@ typedef struct {
      longer, as only a chain of prefixes makes one. None for an access. */
   uint8_t bytes[MCP_INSTRUCTION_BYTES];
   uint8_t length;
+  /* How many of them, from the first, the processor fetched from locations
+     one after another: fewer than length where the instruction runs on into
+     memory that does not follow its first byte's, as a block paged in at the
+     next 16K may not. */
+  uint8_t contiguous;
 } mcp_place_t;
 
 /* What a run watches for and what it saw. The caller sets what comes before

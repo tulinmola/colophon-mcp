@@ -7153,6 +7153,435 @@ fn a_file_holds_what_gather_and_count_would_have_listed() {
     assert!(written[0] == written[1]);
 }
 
+// What a count by range answers, folded from the places a count by address
+// lists, in their order: a place joins a range of its kind where its bytes
+// begin inside the range's or right after them, the processor reaching it at
+// an address the same distance from where the RAM, or the same ROM, holds it
+// as the range's first place is. An instruction's bytes are those it first
+// ran with, which the programs folded here fetch from one memory each, and
+// on a Spectrum, whose places name no ROM, they keep to the ROM or the RAM.
+fn ranges_of(places: &[Value]) -> Vec<Value> {
+    let every_kind = ["execute", "read", "write", "in", "out", "psg", "crtc"];
+    let kind = |place: &Value| {
+        *every_kind
+            .iter()
+            .find(|kind| place.get(**kind).is_some())
+            .expect("a kind")
+    };
+    let number = |place: &Value| {
+        let given = &place[kind(place)];
+        given.as_u64().unwrap_or_else(|| after_ampersand(given, 4))
+    };
+    let apart = |place: &Value| {
+        let held = place.get("ram").map_or(number(place), |ram| {
+            u64::from_str_radix(&ram.as_str().unwrap()[1..], 16).unwrap()
+        });
+        let rom = place.get("rom").map(Value::to_string);
+        (kind(place), rom, held as i64 - number(place) as i64)
+    };
+    let mut order: Vec<usize> = (0..places.len()).collect();
+    order.sort_by_key(|index| (apart(&places[*index]), number(&places[*index])));
+    let mut ranges: Vec<(usize, u64, u64, u64, u64)> = Vec::new();
+    for index in order {
+        let place = &places[index];
+        let (begins, count) = (number(place), place["count"].as_u64().unwrap());
+        let covered = place
+            .get("bytes")
+            .map_or(1, |bytes| bytes.as_str().unwrap().len() as u64 / 2);
+        match ranges.last_mut() {
+            Some((first, last, end, held, matched))
+                if apart(&places[*first]) == apart(place) && begins <= *end =>
+            {
+                *last = begins;
+                *end = (*end).max(begins + covered);
+                *held += 1;
+                *matched += count;
+            }
+            _ => ranges.push((index, begins, begins + covered, 1, count)),
+        }
+    }
+    ranges.sort();
+    ranges
+        .into_iter()
+        .map(|(first, last, _, held, matched)| {
+            let place = &places[first];
+            let mut range = json!({ kind(place): place[kind(place)] });
+            range["to"] = if place[kind(place)].is_u64() {
+                json!(last)
+            } else {
+                ampersand(u16::try_from(last).unwrap())
+            };
+            for memory in ["rom", "ram"] {
+                if let Some(holder) = place.get(memory) {
+                    range[memory] = holder.clone();
+                }
+            }
+            range["places"] = json!(held);
+            range["count"] = json!(matched);
+            range
+        })
+        .collect()
+}
+
+// A machine counting over a stretch by address to a file, which never fills,
+// and its twin counting over the same ticks by range see the same places: the
+// first's, folded, are the twin's ranges, which a third writes to a file as
+// the answer lists them. The stretches run the program that walks 256 bytes
+// on either machine, and on a 6128 the one that sets up its screen through
+// the 6845 and the Gate Array, then counts in both its 64Ks.
+#[test]
+fn counting_by_range_folds_what_counting_by_address_lists() {
+    let memory = json!([
+        { "execute": 0, "to": "&FFFF" },
+        { "read": 0, "to": "&FFFF" },
+        { "write": 0, "to": "&FFFF" },
+        { "out": 0, "mask": 0 },
+    ]);
+    let mut chips = memory.clone();
+    chips
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "crtc": 0, "to": 31 }));
+    for (file, machine, program, conditions) in [
+        ("spectrum48.rom", "spectrum48", passing(0x00FE), &memory),
+        ("cpc6128.rom", "cpc6128", passing(0x7F00), &memory),
+        (
+            "cpc6128.rom",
+            "cpc6128",
+            cpc_counting_in_both_64ks(),
+            &chips,
+        ),
+    ] {
+        let roms = Roms::programmed(file, &program);
+        let mut session = Session::start(&roms);
+        let stretch = 3 * SPECTRUM_FRAME_TICKS;
+        let path = roms.0.join("places.jsonl");
+        let handle = session.open(machine);
+        session.run(
+            &handle,
+            json!({ "ticks": stretch, "count": conditions, "path": path }),
+        );
+        let places: Vec<Value> = lines_of(&path)
+            .into_iter()
+            .map(|(_, place)| place)
+            .collect();
+        let ranges = ranges_of(&places);
+        assert!(
+            ranges.len() > 4 && ranges.len() * 4 < places.len() && ranges.len() <= 256,
+            "{machine}: {} ranges of {} places",
+            ranges.len(),
+            places.len()
+        );
+        let twin = session.open(machine);
+        let ranged = session.run(
+            &twin,
+            json!({ "ticks": stretch, "count": conditions, "count_by": "range" }),
+        );
+        assert_eq!(
+            (&ranged["stopped"], ranged.get("counted")),
+            (&json!("ticks"), None),
+            "{machine}: {ranged}"
+        );
+        assert_eq!(ranged["ranges"], json!(ranges), "{machine}");
+        assert_eq!(ranged["ranges_counted"], ranges.len(), "{machine}");
+        let path = roms.0.join("ranges.jsonl");
+        let filed = session.open(machine);
+        let ranged = session.run(
+            &filed,
+            json!({ "ticks": stretch, "count": conditions, "count_by": "range", "path": path }),
+        );
+        assert_eq!(ranged["written"]["counted"], ranges.len(), "{machine}");
+        let lines: Vec<(String, Value)> = ranges
+            .into_iter()
+            .map(|range| ("count".to_owned(), range))
+            .collect();
+        assert_eq!(lines_of(&path), lines, "{machine}");
+    }
+}
+
+// Instructions laid one after another make a range, and one the processor
+// jumps over ends it: JR's operand is the distance from the address after it
+// (UM0080), so JR at &001F goes over the two bytes at &0021. LD DE,nn holds
+// nn after its opcode, low byte first, so CALL &0027 runs the RET at &0027,
+// the low byte of the operand of LD DE,&00C9 at &0026, which runs whole once
+// the RET returns to it: the RET begins inside its bytes and ends before they
+// do, and both are of the range. A chain of DD prefixes is one instruction,
+// since "no interrupts are accepted during the execution of these sequences"
+// ("The Undocumented Z80 Documented", Sean Young, 5.5), of which a count
+// keeps the first four bytes: the chain at &0029 follows on from LD DE,nn,
+// and the HALT at &0030 begins past the bytes counted for the chain, a range
+// of its own. Each of LDIR's sixteen repetitions begins the instruction again
+// (UM0080), reading sixteen bytes on from &3FF8, eight of them in "the 16K
+// ROM which occupies the lowest part of the address space", and eight in the
+// RAM after it (comp.sys.sinclair FAQ, 16K/48K reference,
+// https://worldofspectrum.org/faq/reference/48kreference.htm), and writing
+// sixteen on from &A000; LD A,(nn) reads &4009, past the gap at &4008, and
+// RET the two bytes CALL pushed below &8000. OUT (C),A writes the port BC
+// holds, &1234, then &1235, and IN A,(C) reads &1235, then &1234.
+#[test]
+fn a_range_is_the_places_whose_bytes_follow_on() {
+    let program = [
+        &[DI, LD_SP, 0x00, 0x80, LD_HL, 0xF8, 0x3F, LD_DE, 0x00, 0xA0][..],
+        &[LD_BC, 0x10, 0x00],
+        &LDIR,
+        &[LD_A_FROM, 0x09, 0x40, LD_BC, 0x34, 0x12],
+        &OUT_C_A,
+        &[INC_BC],
+        &OUT_C_A,
+        &IN_A_C,
+        &[DEC_BC],
+        &IN_A_C,
+        &[JR, 0x02, NOP, NOP, CALL, 0x27, 0x00, LD_DE, RET, 0x00],
+        &[
+            PREFIX_DD, PREFIX_DD, PREFIX_DD, PREFIX_DD, LD_HL, 0x34, 0x12, HALT,
+        ],
+    ]
+    .concat();
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 1000,
+            "count": [
+                { "execute": 0, "to": "&3FFF" },
+                { "read": 0, "to": "&FFFF" },
+                { "write": "&A000", "to": "&FFFF" },
+                { "in": 0, "mask": 0 },
+                { "out": 0, "mask": 0 },
+            ],
+            "count_by": "range",
+        }),
+    );
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        ran["ranges"],
+        json!([
+            { "execute": "&0000", "to": "&001F", "places": 15, "count": 30 },
+            { "execute": "&0023", "to": "&0029", "places": 4, "count": 4 },
+            { "execute": "&0030", "to": "&0030", "places": 1, "count": 1 },
+            { "read": "&3FF8", "to": "&3FFF", "places": 8, "count": 8 },
+            { "read": "&4000", "to": "&4007", "places": 8, "count": 8 },
+            { "read": "&4009", "to": "&4009", "places": 1, "count": 1 },
+            { "read": "&7FFE", "to": "&7FFF", "places": 2, "count": 2 },
+            { "write": "&A000", "to": "&A00F", "places": 16, "count": 16 },
+            { "in": "&1234", "to": "&1235", "places": 2, "count": 2 },
+            { "out": "&1234", "to": "&1235", "places": 2, "count": 2 },
+        ]),
+        "{ran}"
+    );
+    assert_eq!(ran["ranges_counted"], 10, "{ran}");
+}
+
+// An instruction covers only the bytes the processor fetched one after
+// another from the memory holding its first. RAM configuration 4 puts the
+// second 64K's block 0 at &4000, and configuration 0 the first 64K's blocks
+// 0 to 3 ("Ram management", cpctech,
+// https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html),
+// so in configuration 4 LD HL,nn at &3FFF fetches its opcode from the first
+// 64K and nn, which follows it (UM0080), from the second, where the program
+// runs on and selects configuration 0. Its JP to &4001 then runs the HALT
+// there from the first 64K, whose &4000 never runs, so the HALT is a range of
+// its own. A count by address still keeps all three bytes of LD HL,nn.
+#[test]
+fn an_instruction_covers_the_bytes_its_own_memory_held() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let mut stood_up = || {
+        let handle = session.open("cpc6128");
+        session.set(&handle, json!({ "mmr": 0xC4 }));
+        session.poke(&handle, json!("&4000"), "34 12 01 C0 7F ED 49");
+        session.set(&handle, json!({ "mmr": 0xC0 }));
+        session.poke(&handle, json!("&3FFF"), "21");
+        session.poke(&handle, json!("&4001"), "76");
+        session.poke(&handle, json!("&4007"), "C30140");
+        session.set(
+            &handle,
+            json!({ "mmr": 0xC4, "gate_array.lower_rom_enabled": false, "cpu.pc": 0x3FFF }),
+        );
+        handle
+    };
+    let ranged = stood_up();
+    let counted = stood_up();
+    let count = json!([{ "execute": 0, "to": "&FFFF" }]);
+    let ran = session.run(
+        &ranged,
+        json!({ "ticks": 200, "count": count, "count_by": "range" }),
+    );
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        ran["ranges"],
+        json!([
+            { "execute": "&3FFF", "to": "&3FFF", "places": 1, "count": 1 },
+            { "execute": "&4001", "to": "&4001", "places": 1, "count": 1 },
+            { "execute": "&4002", "to": "&4005", "ram": "&10002", "places": 2, "count": 2 },
+            { "execute": "&4007", "to": "&4007", "places": 1, "count": 1 },
+        ]),
+        "{ran}"
+    );
+    let ran = session.run(&counted, json!({ "ticks": 200, "count": count }));
+    assert_eq!(ran["counted"][0]["bytes"], "213412", "{ran}");
+}
+
+// Registers follow one another by number. The routine at &0100 is the
+// .write_to_psg of "AY-3-8912 PSG" (Kevin Thacker's cpctech,
+// https://web.archive.org/web/20220626135348/https://cpctech.cpcwiki.de/docs/psg.html),
+// the register in C and the byte in A, after the page's %10000010, "Port A
+// output, Port B input, Port C output", and writes the PSG's registers 0, 1
+// and 7; the 6845's are selected through &BCxx and written through &BDxx
+// ("CRTC", cpctech,
+// https://web.archive.org/web/20220626145908id_/https://cpctech.cpcwiki.de/docs/crtcnew.html),
+// 12, 13 and 1.
+#[test]
+fn registers_follow_one_another_by_number() {
+    let mut program = vec![
+        DI, LD_SP, 0x00, 0xC0, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1],
+    ];
+    for (register, value) in [(0, 0x11), (1, 0x02), (7, 0x3E)] {
+        program.extend([LD_C, register, LD_A, value, CALL, 0x00, 0x01]);
+    }
+    for (register, value) in [(12, 0x30), (13, 0x00), (1, 0x28)] {
+        program.extend([LD_BC, register, 0xBC, OUT_C_C[0], OUT_C_C[1]]);
+        program.extend([LD_BC, value, 0xBD, OUT_C_C[0], OUT_C_C[1]]);
+    }
+    program.push(HALT);
+    let roms = Roms::programmed("cpc6128.rom", &program);
+    roms.write_at("cpc6128.rom", 0x100, &WRITE_TO_PSG);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 2000,
+            "count": [{ "psg": 0, "to": 15 }, { "crtc": 0, "to": 31 }],
+            "count_by": "range",
+        }),
+    );
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        ran["ranges"],
+        json!([
+            { "psg": 0, "to": 1, "places": 2, "count": 2 },
+            { "psg": 7, "to": 7, "places": 1, "count": 1 },
+            { "crtc": 1, "to": 1, "places": 1, "count": 1 },
+            { "crtc": 12, "to": 13, "places": 2, "count": 2 },
+        ]),
+        "{ran}"
+    );
+}
+
+// A range keeps to the memory that holds it. While a 6128's lower ROM is
+// enabled, "all CPU read operations where the ROM is paged will, fortunatly,
+// read the ROM" ("The Gate Array", Grim,
+// https://web.archive.org/web/20260710174425/https://www.grimware.org/doku.php/documentations/devices/gatearray),
+// so LDIR from &3FF8 reads eight bytes of the ROM, then eight of the RAM from
+// &4000. RAM configuration 4 puts the second 64K's block 0 at &4000, among
+// the first 64K's blocks 0, 2 and 3 ("Ram management", cpctech,
+// https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html),
+// so LDIR from &7FF8 reads the last eight bytes of that block, at &13FF8 in
+// the RAM, then eight of the first 64K's from &8000, and LDIR from &4000 the
+// block's first eight, at &10000, which the first 64K's eight at &4000 stay
+// apart from. Configuration 5 puts the second 64K's block 1 there instead,
+// whose first eight bytes, at &14000, follow block 0's last in the RAM, but
+// not at the addresses the processor reads them at.
+#[test]
+fn a_range_keeps_to_the_memory_that_holds_it() {
+    let program = [
+        &[DI, LD_HL, 0xF8, 0x3F, LD_DE, 0x00, 0x90, LD_BC, 0x10, 0x00][..],
+        &LDIR,
+        &[LD_BC, 0xC4, 0x7F],
+        &OUT_C_C,
+        &[LD_HL, 0xF8, 0x7F, LD_DE, 0x00, 0x91, LD_BC, 0x10, 0x00],
+        &LDIR,
+        &[LD_HL, 0x00, 0x40, LD_DE, 0x00, 0x92, LD_BC, 0x08, 0x00],
+        &LDIR,
+        &[LD_BC, 0xC5, 0x7F],
+        &OUT_C_C,
+        &[LD_HL, 0x00, 0x40, LD_DE, 0x00, 0x93, LD_BC, 0x08, 0x00],
+        &LDIR,
+        &[HALT],
+    ]
+    .concat();
+    let roms = Roms::programmed("cpc6128.rom", &program);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let ran = session.run(
+        &handle,
+        json!({
+            "ticks": 2000,
+            "count": [{ "read": 0, "to": "&FFFF" }, { "write": 0, "to": "&FFFF" }],
+            "count_by": "range",
+        }),
+    );
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+    assert_eq!(
+        ran["ranges"],
+        json!([
+            { "read": "&3FF8", "to": "&3FFF", "rom": "lower", "places": 8, "count": 8 },
+            { "read": "&4000", "to": "&4007", "places": 8, "count": 8 },
+            { "read": "&4000", "to": "&4007", "ram": "&10000", "places": 8, "count": 8 },
+            { "read": "&4000", "to": "&4007", "ram": "&14000", "places": 8, "count": 8 },
+            { "read": "&7FF8", "to": "&7FFF", "ram": "&13FF8", "places": 8, "count": 8 },
+            { "read": "&8000", "to": "&8007", "places": 8, "count": 8 },
+            { "write": "&9000", "to": "&900F", "places": 16, "count": 16 },
+            { "write": "&9100", "to": "&910F", "places": 16, "count": 16 },
+            { "write": "&9200", "to": "&9207", "places": 8, "count": 8 },
+            { "write": "&9300", "to": "&9307", "places": 8, "count": 8 },
+        ]),
+        "{ran}"
+    );
+}
+
+// The program writes every other byte from &9000, three hundred of them, then
+// halts. Counted by range, the places never stop the run, which halts, and
+// its answer lists the first 256 ranges of the three hundred, the last at
+// &91FE; a file takes them all. Counted by address, the run stops at the
+// 256th place.
+#[test]
+fn a_count_by_range_runs_on_and_lists_its_first_256_ranges() {
+    let program = [
+        DI, LD_HL, 0x00, 0x90, LD_BC, 0x2C, 0x01, LD_AT_HL_A, INC_HL, INC_HL, DEC_BC, LD_A_B, OR_C,
+        JR_NZ, 0xF8, HALT,
+    ];
+    let roms = Roms::programmed("spectrum48.rom", &program);
+    let mut session = Session::start(&roms);
+    let writes = json!([{ "write": "&9000", "to": "&9FFF" }]);
+    let range = |address: u16| json!({ "write": ampersand(address), "to": ampersand(address), "places": 1, "count": 1 });
+    let all: Vec<Value> = (0..300).map(|index| range(0x9000 + 2 * index)).collect();
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 20000, "count": writes, "count_by": "range" }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["ranges_counted"]),
+        (&json!("halted"), &json!(300)),
+        "{ran}"
+    );
+    assert_eq!(ran["ranges"], json!(all[..256]), "{ran}");
+    let path = roms.0.join("ranges.jsonl");
+    let handle = session.open("spectrum48");
+    let ran = session.run(
+        &handle,
+        json!({ "ticks": 20000, "count": writes, "count_by": "range", "path": path }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["written"]["counted"]),
+        (&json!("halted"), &json!(300)),
+        "{ran}"
+    );
+    assert_eq!((ran.get("ranges"), ran.get("ranges_counted")), (None, None));
+    let lines: Vec<(String, Value)> = all
+        .into_iter()
+        .map(|range| ("count".to_owned(), range))
+        .collect();
+    assert_eq!(lines_of(&path), lines);
+    let handle = session.open("spectrum48");
+    let ran = session.run(&handle, json!({ "ticks": 20000, "count": writes }));
+    assert_eq!(ran["stopped"], "full", "{ran}");
+}
+
 // A file is made only where none is, and a request whose file cannot be made
 // is refused before the machine moves, its journal as it was; a call refused
 // takes the file made for it away again. A relative path is taken from the
@@ -9626,6 +10055,56 @@ fn a_count_by_pc_names_the_instructions_that_clear_the_spectrums_screen() {
     assert_eq!(gathered.len(), 128, "{called}");
     let ending: Vec<u64> = gathered[125..].iter().map(|seen| seen.1).collect();
     assert_eq!(ending, [0x0E84, 0x0E85, 0x0E87], "{called}");
+}
+
+// CL-LINE, at &0E44 in the 48K ROM, is followed by the two routines it calls,
+// CL-ATTR at &0E88 and CL-ADDR at &0E9B, whose RET is at &0EAB; CL-LINE's JR
+// Z at &0E7B, after BIT 0,(IY+$02), jumps over LD A,($5C48) at &0E7D to &0E80
+// "if handling the main part of the screen (bit 0 of TV-FLAG reset)" (The
+// Complete Spectrum ROM Disassembly, as SkoolKit gives it,
+// https://skoolkid.github.io/rom/asm/0E44.html). Its source,
+// https://github.com/skoolkid/rom/blob/20260409/sources/rom.skool, puts
+// TV-FLAG at &5C3C and lists thirty-seven instructions from &0E44 to &0E7B
+// and thirty-seven from &0E80 to &0EAB. Called with B 24 and that bit reset,
+// the routine runs each of them, so a count by range finds the two runs of
+// instructions, and the 6912 bytes it clears, those the ULA reads to display
+// the screen (comp.sys.sinclair FAQ, 16K/48K reference,
+// https://worldofspectrum.org/faq/reference/48kreference.htm), each written
+// once.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_count_by_range_finds_the_stretches_of_code_that_clear_the_spectrums_screen() {
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("spectrum48");
+    session.run(&handle, json!({ "frames": 150 }));
+    let tv_flag = bytes_of(&session.peek(&handle, json!("&5C3C"), 1))[0] & !1;
+    session.poke(&handle, json!("&5C3C"), &format!("{tv_flag:02X}"));
+    let called = session.answer(
+        "call",
+        json!({
+            "handle": handle,
+            "address": "&0E44",
+            "values": { "cpu.b": 24 },
+            "count": [{ "execute": "&0E44", "to": "&0EAB" }, { "write": "&4000", "to": "&5AFF" }],
+            "count_by": "range",
+        }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    let mut ranges = called["ranges"].clone();
+    for range in ranges.as_array_mut().unwrap() {
+        if range.get("execute").is_some() {
+            range.as_object_mut().unwrap().remove("count");
+        }
+    }
+    assert_eq!(
+        ranges,
+        json!([
+            { "execute": "&0E44", "to": "&0E7B", "places": 37 },
+            { "execute": "&0E80", "to": "&0EAB", "places": 37 },
+            { "write": "&4000", "to": "&5AFF", "places": 6912, "count": 6912 },
+        ]),
+        "{called}"
+    );
 }
 
 // The Complete Spectrum ROM Disassembly (rom.skool, as SkoolKit's author
