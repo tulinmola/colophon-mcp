@@ -43,3 +43,37 @@ jobs:
           node-version: 24
 
       - run: make test-inspector
+
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: colophon-mcp
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: colophon-mcp
+
+      - uses: actions/checkout@v5
+        with:
+          repository: tulinmola/colophon-emulator
+          path: colophon-emulator
+
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libclang-dev
+
+      - run: cargo test --no-fail-fast
+
+      - if: ${{ !cancelled() }}
+        run: make test-firmware
