@@ -558,7 +558,7 @@ fn the_build_is_named_for_the_commits_it_was_compiled_from() {
     let build = env!("COLOPHON_MCP_BUILD");
     let mcp = git_head(env!("CARGO_MANIFEST_DIR"));
     let emulator = git_head(env!("COLOPHON_MCP_EMULATOR_DIR"));
-    let pattern = format!("0.0.0+mcp.{mcp}");
+    let pattern = format!("{}+mcp.{mcp}", env!("CARGO_PKG_VERSION"));
     assert!(build.starts_with(&pattern), "{build}");
     assert!(build.contains(&format!(".emulator.{emulator}")), "{build}");
 }

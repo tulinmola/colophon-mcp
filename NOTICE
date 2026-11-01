@@ -1,0 +1,26 @@
+Colophon MCP's release archives carry the server and the firmware it reads.
+
+The server is under the MIT licence in LICENSE. The firmware in roms/ is not: it is the machines' own, and it is carried under the permissions Amstrad and Locomotive Software gave emulators in 1999.
+
+- cpc464.rom, cpc664.rom and cpc6128.rom: each a CPC's operating system followed by its BASIC.
+- amsdos.rom: the CPC's disc operating system, which carries no copyright message of its own. Neither post quoted below names it: it is carried under Amstrad's permission, which Lawson gave for "all the CPC stuff", and Locomotive's permission is for the CPC BASIC alone.
+- spectrum48.rom: the ZX Spectrum 48K's ROM.
+
+Amstrad have kindly given their permission for the redistribution of their copyrighted material but retain that copyright.
+
+Cliff Lawson of Amstrad plc, on comp.sys.sinclair on 31 August 1999, cross-posted to comp.sys.amstrad.8bit because "it applies equally well to all the CPC stuff (though some bits of that are also (c)Locomotive so you need to seek their permission too - however I don't think there's ever a problem in so doing)":
+
+"Amstrad are happy for emulator writers to include images of our copyrighted code as long as the (c)opyright messages are not altered and we appreciate it if the program/manual includes a note to the effect that "Amstrad have kindly given their permission for the redistribution of their copyrighted material but retain that copyright"."
+
+"No one should be charging for the ROM code"
+
+Howard Fisher of LocoScript Software, answering for Locomotive in the same thread on 1 September 1999:
+
+"The work Locomotive did in the system ROM was done for a one off pittance from Amstrad and therefore (E&OE) is their copyright."
+
+"we are happy for the CPC BASIC to be provided for use in CPC emulators provided that it is not modified from the original code and that this is done on a non-profit basis (ie any charge that is made covers purely the distribution costs). We do ask that anyone who wishes to distribute this code writes to us so that we can issue formal permission."
+
+The images are carried as the emulator fetches them, unmodified and checked by their SHA-256, and nothing is charged for them. No address at which LocoScript Software answers could be found to write to on 1 November 2026.
+
+https://worldofspectrum.net/app/themes/wosc-classic/static/legacy/amstrad-roms.txt
+https://groups.google.com/g/comp.sys.amstrad.8bit/c/HtpBU2Bzv_U/m/HhNDSU3MksAJ

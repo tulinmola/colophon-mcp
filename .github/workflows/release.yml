@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml", "NOTICE"]
+
+permissions:
+  contents: read
+
+jobs:
+  # One commit of the emulator for every platform, and for failed jobs run again.
+  emulator:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+    steps:
+      - id: head
+        run: |
+          commit=$(git ls-remote https://github.com/tulinmola/colophon-emulator HEAD | cut -f1)
+          test -n "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: emulator
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Linux and Windows servers are linked statically, so that one file
+        # runs on a Linux of any distribution, whatever its C library, and on
+        # Windows without Microsoft's Visual C++ runtime installed.
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+            exe: .exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: colophon-mcp
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: colophon-mcp
+
+      - uses: actions/checkout@v5
+        with:
+          repository: tulinmola/colophon-emulator
+          ref: ${{ needs.emulator.outputs.commit }}
+          path: colophon-emulator
+
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libclang-dev musl-dev
+
+      - run: rustup target add ${{ matrix.target }}
+
+      # The server the protocol's tests run is the one the archive carries.
+      - run: cargo test --release --target ${{ matrix.target }}
+
+      - run: make -C ../colophon-emulator roms build/emulator
+
+      - run: cargo test --release --target ${{ matrix.target }} --test protocol -- --ignored
+
+      # What the installation page says of a Linux server and of a Windows one.
+      - run: |
+          server="target/${{ matrix.target }}/release/colophon-mcp${{ matrix.exe }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "$server")
+            if grep NEEDED <<<"$dynamic"; then exit 1; fi
+          fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            imports=$(llvm-objdump -p "$server")
+            if grep -iE 'vcruntime|api-ms-win-crt|ucrtbase' <<<"$imports"; then exit 1; fi
+          fi
+
+      # A release answers with its version and the commits it was built
+      # from, neither marked, and its tag names that version.
+      - id: build
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml)
+          expected="$version+mcp.$(git rev-parse HEAD).emulator.$(git -C ../colophon-emulator rev-parse HEAD)"
+          initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"release","version":"0"}}}'
+          named=$(echo "$initialize" | "target/${{ matrix.target }}/release/colophon-mcp${{ matrix.exe }}" --roms ../colophon-emulator/roms | grep -o '"version":"[^"]*"')
+          if [ "$named" != "\"version\":\"$expected\"" ]; then
+            echo "built as $named, not $expected" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tagged $GITHUB_REF_NAME, but Cargo.toml names version $version" >&2
+            exit 1
+          fi
+          echo "name=$expected" >> "$GITHUB_OUTPUT"
+
+      - run: |
+          archive=colophon-mcp-${{ matrix.target }}
+          mkdir -p "$archive/roms"
+          cp "target/${{ matrix.target }}/release/colophon-mcp${{ matrix.exe }}" LICENSE NOTICE "$archive/"
+          cp ../colophon-emulator/roms/*.rom "$archive/roms/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "$archive.zip" "$archive"
+          else
+            # Without the extended attributes and AppleDouble files macOS's
+            # tar would carry.
+            COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive.tar.gz" "$archive"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: colophon-mcp/colophon-mcp-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: archives
+          merge-multiple: true
+
+      - working-directory: archives
+        run: sha256sum colophon-mcp-* > SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: archives/colophon-mcp-*
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ needs.build.outputs.name }}
+        run: |
+          {
+            echo "Built as \`$BUILD\`."
+            echo
+            echo "Each archive holds the server, the firmware it reads in \`roms/\`, the licence and \`NOTICE\`, which gives the terms the firmware is carried under. \`SHA256SUMS\` holds the archives' hashes, and \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\` checks that one was built by this repository's release workflow. [Installing the server](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/install.en.md) says which archive to take and how a client starts it."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" archives/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md

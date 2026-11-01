@@ -7,19 +7,17 @@ An agent has no eyes on the glass and no fingers on the keys, and what it learns
 
 ## Starting it
 
-`make` builds `target/release/colophon-mcp`, and the server is started with the directory its firmware is read from:
+A release carries the server for each of six platforms with its firmware in `roms` beside it, and [installing it](install.en.md) says which to take; `make` builds it from its source as `target/release/colophon-mcp`. Either is started with the directory its firmware is read from, in an archive's folder as
 
 ```sh
-colophon-mcp --roms ../colophon-emulator/roms
+./colophon-mcp --roms roms
 ```
 
-The directory holds the firmware as the emulator's `make roms` fetches it: `cpc6128.rom`, `cpc664.rom` and `cpc464.rom`, each the operating system followed by BASIC; `amsdos.rom`, for the machines with a disc interface; and `spectrum48.rom`. A file is read when a machine that needs it is opened, so a missing one is reported then, by name, and nothing else is refused for it. A file must be the size of the firmware it is named for, where the emulator's command line takes the first bytes of a longer one.
+and in a checkout beside the emulator as `target/release/colophon-mcp --roms ../colophon-emulator/roms`.
 
-A client is given the same command line, which it starts and speaks to. With Claude Code:
+The directory holds the firmware as a release carries it and as the emulator's `make roms` fetches it: `cpc6128.rom`, `cpc664.rom` and `cpc464.rom`, each the operating system followed by BASIC; `amsdos.rom`, for the machines with a disc interface; and `spectrum48.rom`. A file is read when a machine that needs it is opened, so a missing one is reported then, by name, and nothing else is refused for it. A file must be the size of the firmware it is named for, where the emulator's command line takes the first bytes of a longer one.
 
-```sh
-claude mcp add colophon -- /path/to/colophon-mcp/target/release/colophon-mcp --roms /path/to/colophon-emulator/roms
-```
+A client is given the same command line, with absolute paths, which it starts and speaks to; [installing it](install.en.md) gives the line for each client.
 
 ## What it answers
 
