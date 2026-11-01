@@ -6,6 +6,7 @@
 // specification repository at tag 2026-07-28.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env::consts::EXE_SUFFIX;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -104,6 +105,23 @@ impl Roms {
         let path = self.0.join(name);
         fs::write(&path, contents).expect("a file is written");
         path
+    }
+
+    // The directory as a server beside it names its working directory, to
+    // which std::path::absolute joins a relative path "without accessing the
+    // filesystem" (https://doc.rust-lang.org/std/path/fn.absolute.html).
+    // POSIX names it with "no components that are dot or dot-dot, or are
+    // symbolic links" (POSIX.1-2024: getcwd;
+    // https://pubs.opengroup.org/onlinepubs/9799919799/), as canonicalize
+    // does. Windows names it with the short names it was given, where
+    // canonicalize would lengthen them and "use extended length path syntax"
+    // (https://doc.rust-lang.org/std/fs/fn.canonicalize.html).
+    fn working_directory_of_a_server_beside(&self) -> PathBuf {
+        if cfg!(unix) {
+            fs::canonicalize(&self.0).unwrap()
+        } else {
+            self.0.clone()
+        }
     }
 }
 
@@ -7592,7 +7610,7 @@ fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
     let roms = Roms::all();
     roms.write_at("spectrum48.rom", 0x3000, &[INC_A, RET]);
     let taken = roms.write("taken.jsonl", b"kept");
-    let directory = fs::canonicalize(&roms.0).unwrap();
+    let directory = roms.working_directory_of_a_server_beside();
     let mut session = Session::beside(&roms);
     let handle = session.open("spectrum48");
     let counting = json!([{ "execute": 0, "to": "&3FFF" }]);
@@ -7611,7 +7629,7 @@ fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
     assert!(
         refused.starts_with(&format!(
             "cannot write {}: ",
-            directory.join("nowhere/counted.jsonl").display()
+            directory.join("nowhere").join("counted.jsonl").display()
         )),
         "{refused}"
     );
@@ -7691,6 +7709,7 @@ fn a_run_writes_its_file_only_where_none_is_and_the_journal_names_it() {
 // is catching or ignoring SIGXFSZ, the operation shall fail with an [EFBIG]
 // error" (POSIX.1-2024: ulimit, trap in the Shell Command Language, exec,
 // getrlimit; https://pubs.opengroup.org/onlinepubs/9799919799/).
+#[cfg(unix)]
 fn held_to_four_blocks(roms: &Roms) -> Session {
     Session::spawned(
         Command::new("sh")
@@ -7707,6 +7726,7 @@ fn held_to_four_blocks(roms: &Roms) -> Session {
 // 4000 ticks, and after a call of a thousand more and a RET, 10 T-states
 // (UM0080), which returns there.
 #[test]
+#[cfg(unix)]
 fn a_request_whose_file_cannot_be_written_stands_and_says_where() {
     let roms = Roms::all();
     roms.write_at("spectrum48.rom", 0x23E8, &[RET]);
@@ -8391,7 +8411,7 @@ fn a_snapshot_is_written_only_where_no_file_is_and_only_between_instructions() {
         )
     );
     assert_eq!(fs::read(&taken).unwrap(), b"kept");
-    let nowhere = roms.0.join("nowhere/saved.sna");
+    let nowhere = roms.0.join("nowhere").join("saved.sna");
     let refused = session.refusal(
         "snapshot_save",
         json!({ "handle": handle, "path": nowhere }),
@@ -9434,7 +9454,7 @@ fn a_relative_path_is_taken_from_the_working_directory_and_answered_absolute() {
         &program_tape(b"TEST      ", 10, &poking_program()),
     );
     roms.write("blank.dsk", &blank_data_disc());
-    let directory = fs::canonicalize(&roms.0).unwrap();
+    let directory = roms.working_directory_of_a_server_beside();
     let mut session = Session::beside(&roms);
     let opened = session.answer(
         "machine_open",
@@ -9514,7 +9534,7 @@ fn firmware() -> PathBuf {
 
 // The emulator's command line, run on its own firmware, which must succeed.
 fn command_line<S: AsRef<OsStr>>(arguments: impl IntoIterator<Item = S>) {
-    let command_line = emulator().join("build/emulator");
+    let command_line = emulator().join(format!("build/emulator{EXE_SUFFIX}"));
     assert!(
         command_line.exists(),
         "no command line at {}: run `make` in the emulator",
@@ -10567,7 +10587,7 @@ fn a_sound_queued_writes_the_psg_as_the_sound_manager_does() {
 // standard frames' ticks, and writes its picture, which the png crate reads
 // back as colours.
 fn command_line_screenshot(machine: &str, frames: u64, path: &Path) -> (usize, usize, Vec<u32>) {
-    let command_line = emulator().join("build/emulator");
+    let command_line = emulator().join(format!("build/emulator{EXE_SUFFIX}"));
     let output = Command::new(command_line)
         .arg("boot")
         .args(["--machine", machine, "--frames", &frames.to_string()])

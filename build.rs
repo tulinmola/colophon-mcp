@@ -357,9 +357,14 @@ fn main() {
         emulator.display()
     );
 
-    cc::Build::new()
-        .std("c99")
-        .warnings(true)
+    let mut core = cc::Build::new();
+    // "MSVC does not support … `c99`" (cc 1.8.0: Build::std;
+    // https://docs.rs/cc/1.8.0/cc/struct.Build.html#method.std), and cl warns
+    // that it ignores the flag (D9002) at every file.
+    if !core.get_compiler().is_like_msvc() {
+        core.std("c99");
+    }
+    core.warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true)
         .opt_level(2)
