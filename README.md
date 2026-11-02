@@ -28,6 +28,17 @@ make test-inspector   # the server against the protocol's own Inspector
 
 `make check` also wants clang-format and clang-tidy. The check workflow pins the release it runs, because another may format differently or find other things. `make test-sanitized` wants a C compiler with AddressSanitizer and UBSan. `make test-firmware` has the emulator fetch its firmware, by the hashes it pins, and build its command line. `make test-disassembly` has the emulator fetch its firmware too, and fetches SkoolKit, The Complete Spectrum ROM Disassembly and the text of SOFT 968 by the hashes the Makefile pins, which wants curl, tar, sha256sum or shasum, and Python 3. `make test-inspector` fetches the Inspector through npx, which wants Node 22.19 or later.
 
+## Releasing
+
+A release is cut from a clean, committed tree: one version, then the push. Once, in the two days before the first tag the workflow publishes to npm, the package's trusted publisher is set on npmjs.com, naming this repository and `release.yml`, with `npm publish` allowed.
+
+```sh
+make version VERSION=0.2.0   # write 0.2.0, commit it and tag the commit v0.2.0
+git push --follow-tags       # push the commit and its tag together
+```
+
+`make version` writes the version into `Cargo.toml` and `Cargo.lock` and into the two pins the install page gives, `colophon-mcp@` and `download/v`, commits them under the version's name and tags the commit `vX.Y.Z`. It refuses a tree with changes, a version not past the one `Cargo.toml` gives, and an install page that no longer reads both pins. While the version begins with 0, the middle number moves for new work and the last for a fix.
+
 A tag naming the version `Cargo.toml` gives, `v0.1.0` for 0.1.0, has the release workflow build the server on each of the six platforms, run the tests, the firmware's among them, there against the server it packs, and publish the archives with their hashes and GitHub's attestations of where each was built. It lays the archives' servers out as the npm package, by `npm/assemble.sh`, starts the package through npx on each of the six platforms and holds it to the build's name, and publishes it before the archives, by [trusted publishing](https://docs.npmjs.com/trusted-publishers): npm takes the publish from the workflow the package's settings on npmjs.com name, so the repository keeps no npm token, and records where the package was built. npm trusts a workflow only with a package that already exists, so 0.1.0 was published by hand, from the release's archives; and a trusted publisher newly set on npmjs.com expires, and can no longer be used or edited, unless its first publish comes within two days, so the package's, naming this repository and `release.yml`, is set in the two days before the tag that first publishes with it. A trusted publisher newly set allows `npm publish`, which the workflow runs, only when its settings say so, and the package's is set to allow it. The package carries the name the MCP Registry knows a server by, `mcpName`, as the registry's [quickstart](https://modelcontextprotocol.io/registry/quickstart) asks. A pull request that changes the workflow, `NOTICE`, the package or `tests/build-name.sh` builds the archives and the package and tests the servers they carry, and publishes nothing.
 
 ## Where it stands

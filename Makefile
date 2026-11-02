@@ -93,4 +93,28 @@ lint:
 	cargo clippy --all-targets -- --deny warnings
 	$(CLANG_TIDY) $(BRIDGE_SOURCES) -- -std=c99 -Wall -Wextra -I$(EMULATOR_DIR)/src
 
-.PHONY: all test test-inspector test-sanitized test-firmware test-disassembly test-all check format format-check lint
+# A version cut as the player's `npm version` cuts one: VERSION, past the one
+# Cargo.toml gives, written into Cargo.toml and Cargo.lock and into the two pins
+# the install page gives, committed under its own name and tagged, on a tree
+# with nothing uncommitted. The push is git push --follow-tags.
+version:
+	@test -z "$$(git status --porcelain)" || { echo "the tree has changes; commit them first" >&2; exit 1; }
+	@echo "$(VERSION)" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "VERSION is '$(VERSION)'; give three numbers, as make version VERSION=0.2.0 does" >&2; exit 1; }
+	@set -e; \
+	old=$$(sed -n 's/^version = "\(.*\)"$$/\1/p' Cargo.toml); \
+	if [ "$$old" = "$(VERSION)" ] || [ "$$(printf '%s\n%s\n' "$$old" "$(VERSION)" | sort -V | tail -n 1)" != "$(VERSION)" ]; then \
+	  echo "Cargo.toml gives $$old; give a VERSION past it" >&2; exit 1; \
+	fi; \
+	for pin in "colophon-mcp@$$old" "download/v$$old"; do \
+	  grep -qF "$$pin" docs/install.en.md || { echo "docs/install.en.md no longer reads $$pin; pin the version there again first" >&2; exit 1; }; \
+	done; \
+	pattern=$$(printf '%s' "$$old" | sed 's/\./\\./g'); \
+	sed 's/^version = "'"$$pattern"'"$$/version = "$(VERSION)"/' Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml; \
+	sed -e 's|colophon-mcp@'"$$pattern"'|colophon-mcp@$(VERSION)|g' -e 's|download/v'"$$pattern"'|download/v$(VERSION)|g' \
+	  docs/install.en.md > docs/install.en.md.new && mv docs/install.en.md.new docs/install.en.md; \
+	cargo update --workspace --offline; \
+	git commit -q -m "$(VERSION)" Cargo.toml Cargo.lock docs/install.en.md; \
+	git tag -a "v$(VERSION)" -m "Colophon MCP $(VERSION)"; \
+	echo "v$(VERSION) is tagged; git push --follow-tags publishes it"
+
+.PHONY: all test test-inspector test-sanitized test-firmware test-disassembly test-all check format format-check lint version
