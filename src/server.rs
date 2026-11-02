@@ -1382,6 +1382,16 @@ struct OpenRequest {
     /// A state file that `state_save` wrote, to build the machine as the state was: a path on the server's file system. A relative path starts from the server's working directory. Give `snapshot` or `state`, not both.
     #[schemars(transform = absent_not_null)]
     state: Option<PathBuf>,
+    /// The type of a CPC's 6845, its CRTC, numbered as the Amstrad CPC CRTC Compendium numbers them:
+    /// - 0: the Hitachi HD6845S or the UMC UM6845, the type of the first CPCs. The type when `crtc_type` is left out.
+    /// - 1: the UMC UM6845R.
+    /// - 2: the Motorola MC6845.
+    /// - 3: the 6845 that ASIC 40489 emulates in the CPC Plus. The machine has none of the Plus's other hardware. A program that tells the 2 ASICs apart by that hardware finds a low-cost CPC, a type 4.
+    /// - 4: the 6845 that ASIC 40226 emulates, in the low-cost CPC.
+    ///
+    /// Amstrad fitted 6845s from different manufacturers to the same models, so the type is a choice, not part of the model. A program that times its writes to the 6845, as many demos do, may run and draw differently on each type, and a program can find out which type it runs on. `inspect` reads the type as `crtc.type`, and `set` does not change it. Not given with `state`: a state file opens with the type it was kept with. A Spectrum has no 6845 and takes no `crtc_type`.
+    #[schemars(range(min = 0, max = 4), transform = absent_not_null)]
+    crtc_type: Option<u8>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1818,6 +1828,10 @@ struct Opened {
     files: Vec<FileRead>,
     /// The machine's tick: 0, or the state's when built from a state file.
     tick: u64,
+    /// The type of a CPC's 6845, numbered as `crtc_type` numbers them: the type given, the state file's, or 0. Absent on a Spectrum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    crtc_type: Option<u8>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1956,7 +1970,7 @@ enum Stopped {
 
 #[derive(Serialize, JsonSchema)]
 struct Matched {
-    /// The machine's tick: for an `execute` match, just before the instruction begins; for an access, just after the tick that put it on the bus.
+    /// The machine's tick: for an `execute` match, just before the instruction begins; for an access, just after the tick that put it on the bus. A `crtc` match is made just after the tick the 6845 takes the write. On types 3 and 4 the 6845 takes an `OUT (C),r` or `OUT (C),0` write in the instruction's 4th microsecond, not its 3rd.
     tick: u64,
     /// The address of an instruction about to begin, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2862,7 +2876,7 @@ impl Server {
         }
     }
 
-    /// Build a machine and return its handle: powered on before its first instruction, loaded from a snapshot, or built from a state file. The handle stays valid until `machine_close` or the server stops, and is never reused. The answer gives the SHA-256 of every file read to build the machine, and the machine's tick, which starts at 0, or at the state's. A state file, which `state_save` writes, gives the machine exactly as the state was, with its tick and its journal; only the build that wrote it opens it, as the same machine, on firmware with the same SHA-256. A snapshot is loaded as the emulator's command line loads it, into the machine named, after the firmware is fitted: on a CPC an SNA of version 1, 2 or 3, of which only the version 1 fields are read; on a Spectrum a 48K .sna. A CPC snapshot whose byte at &5A, the PSG's selected register, is above 15 opens with `psg.chip_selected` false and `psg.selected` the byte's low 4 bits. A CPC snapshot's 6845 counters, which only version 3 holds, are not read: the CPC starts its frame from the top, with the Gate Array's interrupt counter and the beam at 0, so its first run by frames ends early, at the retrace that the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen. Until then `monitor.beam_y` is 1 or 2 lines past the 6845's line; after it, on the firmware's screen, 70 or 71 lines past. A Spectrum snapshot holds no beam position. A CPC snapshot does not hold the disc controller, so the controller starts as at power-on: a disc access the snapshot was taken inside does not go on, and the SPECIFY that AMSDOS sends at boot is missing. To set the controller as SPECIFY would have, write these with `set` (times in microseconds):
+    /// Build a machine and return its handle: powered on before its first instruction, loaded from a snapshot, or built from a state file. The handle stays valid until `machine_close` or the server stops, and is never reused. The answer gives the SHA-256 of every file read to build the machine, and the machine's tick, which starts at 0, or at the state's. A state file, which `state_save` writes, gives the machine exactly as the state was, with its tick and its journal; only the build that wrote it opens it, as the same machine, on firmware with the same SHA-256. A snapshot is loaded as the emulator's command line loads it, into the machine named, after the firmware is fitted: on a CPC an SNA of version 1, 2 or 3, of which only the version 1 fields are read; on a Spectrum a 48K .sna. A version 3's CRTC type is not read: the 6845 is of the type `crtc_type` gives, or type 0. A CPC snapshot whose byte at &5A, the PSG's selected register, is above 15 opens with `psg.chip_selected` false and `psg.selected` the byte's low 4 bits. A CPC snapshot's 6845 counters, which only version 3 holds, are not read: the CPC starts its frame from the top, with the Gate Array's interrupt counter and the beam at 0, so its first run by frames ends early, at the retrace that the 6845's first vertical sync brings, some 62000 ticks in on the firmware's screen. Until then `monitor.beam_y` is 1 or 2 lines past the 6845's line; after it, on the firmware's screen, 70 or 71 lines past. A Spectrum snapshot holds no beam position. A CPC snapshot does not hold the disc controller, so the controller starts as at power-on: a disc access the snapshot was taken inside does not go on, and the SPECIFY that AMSDOS sends at boot is missing. To set the controller as SPECIFY would have, write these with `set` (times in microseconds):
     /// - `fdc.non_dma`: `true`. Without it AMSDOS reads nothing.
     /// - `fdc.step_time`: `12000`. Without it AMSDOS fails every seek to another track.
     /// - `fdc.head_load_time`: `4000` and `fdc.head_unload_time`: `32000`, the rest of what SPECIFY sets.
@@ -2891,6 +2905,16 @@ impl Server {
                     .to_owned(),
             );
         }
+        if request.crtc_type.is_some() && request.state.is_some() {
+            return Err(
+                "give crtc_type or state, not both: a state file opens with the 6845 type it was \
+                 kept with"
+                    .to_owned(),
+            );
+        }
+        if let Some(crtc_type) = request.crtc_type {
+            machine.takes_crtc_type(crtc_type)?;
+        }
         // Numbered in the order asked, before anything is read.
         let opened = {
             let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2908,12 +2932,18 @@ impl Server {
             .map(machines::absolute)
             .transpose()?;
         let roms = self.roms.clone();
-        let (parts, state) = Server::blocking(
+        let given_type = request.crtc_type;
+        let (parts, state, crtc_type) = Server::blocking(
             format!("the files {} is built from", machine.name),
             move || {
-                let parts = machine.parts(&roms, snapshot.as_deref())?;
                 let state = state.map(|path| machine.state(&path)).transpose()?;
-                Ok((parts, state))
+                let crtc_type = match &state {
+                    Some(state) => state.crtc_type()?,
+                    None => given_type,
+                };
+                let parts = machine.parts(&roms, snapshot.as_deref(), crtc_type)?;
+                let crtc_type = parts.crtc_type();
+                Ok((parts, state, crtc_type))
             },
         )
         .await?;
@@ -2974,6 +3004,7 @@ impl Server {
             machine: machine.name.to_owned(),
             files,
             tick,
+            crtc_type,
         };
         let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         let at = threads
@@ -3414,7 +3445,7 @@ impl Server {
 
     /// Write a machine to a new file as a snapshot, as the emulator's command line does with --save and `machine_open` reads: an SNA of version 1 for a CPC, a 48K .sna for a Spectrum. Refused if the file exists, inside a chain of prefixes, or on a Spectrum with a stack pointer below &4002. The file holds the whole RAM: a CPC's after its 256-byte header, by the RAM's own addresses as `peek`'s `ram` counts them; a Spectrum's &4000 to &FFFF after its 27-byte header. A CPC whose `psg.chip_selected` is false is written with `psg.selected` plus 16 at &5A, outside the 0 to 15 the format asks for there; `machine_open` reads it back the same way. The answer gives the file's SHA-256 and the machine's tick. `state_keep` keeps all of the machine in memory, and `state_save` writes it to a file that only this build opens. A snapshot holds less than the machine:
     /// - Neither format records a HALT, so a machine saved on HALT runs past it once loaded.
-    /// - A CPC snapshot holds no disc, no disc controller and no 6845 counters; see `machine_open`.
+    /// - A CPC snapshot holds no disc, no disc controller, no 6845 counters and no CRTC type; see `machine_open`.
     /// - A Spectrum snapshot holds no beam position and no tape, and stores the program counter in the 2 bytes below the stack pointer, in the file only, so a machine loaded from it has lost what those bytes held.
     #[tool(annotations(
         read_only_hint = false,
@@ -3600,7 +3631,7 @@ impl Server {
         }))
     }
 
-    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given), paths absolute, and each file read or written named by its SHA-256.
+    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given), paths absolute, a CPC's `machine_open` with its `crtc_type` whether or not it was given, and each file read or written named by its SHA-256.
     /// - Reads are not recorded, nor are states kept, saved or dropped. Restoring a state makes the journal the state's.
     /// - A machine built from a state file takes the state's journal and files: the files the state's machine was built from, as the file names them, not the state file.
     /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
@@ -3654,7 +3685,7 @@ impl Server {
 
     /// Read what a machine holds by path, written as a C expression on the emulator's struct for the machine, `cpc_t` or `spectrum_t`: `cpu.pc`, `crtc.registers[12]`, `gate_array.inks`, `fdc.units[0].head`. Without a path, the whole machine. Fields keep their header names, numbers are JSON numbers, and an enum is given by its enumerator's name. Pointers are not followed; `peek` reads memory. Most fields are the chips' inner workings, the board's links and drives, or the emulator's own machinery for stepping the chips tick by tick. The fields a program works with most, and the monitor's beam, are these:
     /// - Both machines: the processor's `cpu.a`, `cpu.f`, `cpu.b`, `cpu.c`, `cpu.d`, `cpu.e`, `cpu.h`, `cpu.l`, `cpu.ixh`, `cpu.ixl`, `cpu.iyh`, `cpu.iyl`, `cpu.sp`, `cpu.pc`, `cpu.i`, `cpu.r`, `cpu.im`, `cpu.iff1`, `cpu.iff2` and `cpu.halted`, and its alternate set as pairs, `cpu.af_`, `cpu.bc_`, `cpu.de_` and `cpu.hl_`. The main set, IX and IY are read a byte at a time: HL is `cpu.h` and `cpu.l`. The keyboard's `keyboard.lines`, a set bit meaning a key released. Where the monitor's beam stands, `monitor.beam_x` and `monitor.beam_y`.
-    /// - CPC: the 6845's `crtc.registers` and `crtc.address_register`, and its counters `crtc.c0` (characters), `crtc.c9` (the line within the row) and `crtc.c4` (rows). The Gate Array's `gate_array.pen`, `gate_array.inks` (the border at 16), `gate_array.mode`, `gate_array.lower_rom_enabled`, `gate_array.upper_rom_enabled` and `gate_array.r52`, its interrupt counter. `upper_rom_number`, the upper ROM selected, and `mmr`, a 6128's RAM configuration. `ppi.output` and `ppi.control`, `psg.registers`, `psg.selected` and `psg.chip_selected`. `psg.chip_selected` is whether the PSG takes writes. It is false at power-on, after a snapshot whose byte at &5A is above 15, and after port C gives the PSG the function SELECT with a byte above 15 on port A; SELECT with a byte from 0 to 15, or a snapshot with one at &5A, makes it true. While it is false, `psg.selected` holds the register last selected: 0 at power-on, the low 4 bits of &5A after a snapshot, or the register selected before the byte above 15. The disc controller's `fdc.st0`, `fdc.st1`, `fdc.st2`, `fdc.c`, `fdc.h`, `fdc.r` and `fdc.n`, and what SPECIFY sets: `fdc.step_time`, `fdc.head_load_time` and `fdc.head_unload_time`, in microseconds, and `fdc.non_dma`.
+    /// - CPC: the 6845's `crtc.type`, `crtc.registers` and `crtc.address_register`, and its counters `crtc.c0` (characters), `crtc.c9` (the line within the row) and `crtc.c4` (rows). The Gate Array's `gate_array.pen`, `gate_array.inks` (the border at 16), `gate_array.mode`, `gate_array.lower_rom_enabled`, `gate_array.upper_rom_enabled` and `gate_array.r52`, its interrupt counter. `upper_rom_number`, the upper ROM selected, and `mmr`, a 6128's RAM configuration. `ppi.output` and `ppi.control`, `psg.registers`, `psg.selected` and `psg.chip_selected`. `psg.chip_selected` is whether the PSG takes writes. It is false at power-on, after a snapshot whose byte at &5A is above 15, and after port C gives the PSG the function SELECT with a byte above 15 on port A; SELECT with a byte from 0 to 15, or a snapshot with one at &5A, makes it true. While it is false, `psg.selected` holds the register last selected: 0 at power-on, the low 4 bits of &5A after a snapshot, or the register selected before the byte above 15. The disc controller's `fdc.st0`, `fdc.st1`, `fdc.st2`, `fdc.c`, `fdc.h`, `fdc.r` and `fdc.n`, and what SPECIFY sets: `fdc.step_time`, `fdc.head_load_time` and `fdc.head_unload_time`, in microseconds, and `fdc.non_dma`.
     /// - Spectrum: the ULA's `ula.border`, `ula.speaker` and `ula.microphone`, and `ula.frame_tick`, the T-states since the frame's interrupt.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -3669,7 +3700,7 @@ impl Server {
         Ok(Json(Inspected { path, value }))
     }
 
-    /// Write what a machine holds, by `inspect`'s paths; every value is written, or none. An unsigned field takes a number, or hexadecimal written with &, #, $ or 0x; a signed field takes a number. A value of the wrong kind, or one the emulator could not run from, such as a `gate_array.pen` above 16, is refused and the machine left unchanged. Afterwards a CPC's memory map is worked out again, and a Spectrum's ULA is moved to the tick of the frame that `ula.frame_tick` names. The answer gives each path as it now reads. Writing the emulator's machinery rather than chip registers can leave a machine in a state no real hardware reaches, and what conditions see from there is not guaranteed.
+    /// Write what a machine holds, by `inspect`'s paths; every value is written, or none. An unsigned field takes a number, or hexadecimal written with &, #, $ or 0x; a signed field takes a number. A value of the wrong kind, one the emulator could not run from, such as a `gate_array.pen` above 16, or another type for a CPC's 6845, is refused and the machine left unchanged. Afterwards a CPC's memory map is worked out again, and a Spectrum's ULA is moved to the tick of the frame that `ula.frame_tick` names. The answer gives each path as it now reads. Writing the emulator's machinery rather than chip registers can leave a machine in a state no real hardware reaches, and what conditions see from there is not guaranteed.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -4074,7 +4105,7 @@ mod tests {
         rom[..PUSHING.len()].copy_from_slice(&PUSHING);
         fs::write(directory.join("spectrum48.rom"), rom).expect("a stand-in is written");
         let machine = machines::named("spectrum48").expect("the 48");
-        let parts = machine.parts(&directory, None);
+        let parts = machine.parts(&directory, None, None);
         let _ = fs::remove_dir_all(&directory);
         let mut built = parts
             .expect("its stand-in is read")

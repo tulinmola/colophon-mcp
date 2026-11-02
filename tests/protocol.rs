@@ -727,6 +727,67 @@ fn machine_open_offers_the_machines_by_their_names() {
     assert_eq!(schema["required"], json!(["machine"]));
 }
 
+// A CPC's 6845 is built as the type machine_open gives it, and as a type 0
+// where none is given; the answer and the journal say which either way. A
+// Spectrum, which has no 6845, takes no type, and a state file opens with the
+// type it was kept with, so it takes none either.
+#[test]
+fn a_cpc_is_built_with_the_6845_it_is_given_or_a_type_0() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let schema = input_schema(&tools(&mut session), "machine_open");
+    let crtc_type = &schema["properties"]["crtc_type"];
+    assert_eq!(
+        (&crtc_type["minimum"], &crtc_type["maximum"]),
+        (&json!(0), &json!(4)),
+        "{schema}"
+    );
+    for (given, built) in [None, Some(0), Some(1), Some(2), Some(3), Some(4)]
+        .into_iter()
+        .zip([0, 0, 1, 2, 3, 4])
+    {
+        let mut arguments = json!({ "machine": "cpc464" });
+        if let Some(given) = given {
+            arguments["crtc_type"] = json!(given);
+        }
+        let opened = session.answer("machine_open", arguments);
+        assert_eq!(opened["crtc_type"], built, "{opened}");
+        let handle = opened["handle"].as_str().unwrap().to_owned();
+        assert_eq!(session.inspect(&handle, "crtc.type"), built);
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        assert_eq!(
+            journal["entries"][0]["arguments"],
+            json!({ "machine": "cpc464", "crtc_type": built })
+        );
+    }
+    let spectrum = session.answer("machine_open", json!({ "machine": "spectrum48" }));
+    assert!(spectrum["crtc_type"].is_null(), "{spectrum}");
+    assert_eq!(
+        session.refusal(
+            "machine_open",
+            json!({ "machine": "cpc6128", "crtc_type": 5 })
+        ),
+        "crtc_type is 5, and a CPC's 6845 is of type 0 to 4; give one of those, or leave \
+         crtc_type out for type 0"
+    );
+    assert_eq!(
+        session.refusal(
+            "machine_open",
+            json!({ "machine": "spectrum48", "crtc_type": 0 })
+        ),
+        "a spectrum48 has no 6845, so it takes no crtc_type; leave crtc_type out, or open a \
+         cpc464, a cpc664 or a cpc6128"
+    );
+    assert_eq!(
+        session.refusal(
+            "machine_open",
+            json!({ "machine": "cpc6128", "crtc_type": 0, "state": roms.0.join("kept.state") })
+        ),
+        "give crtc_type or state, not both: a state file opens with the 6845 type it was kept \
+         with"
+    );
+}
+
 fn a_machine_stands_from_its_opening_to_its_closing(session: &mut Session) {
     assert!(session.handles().is_empty());
     let handle = session.open("spectrum48");
@@ -1109,6 +1170,7 @@ const OUT_C_A: [u8; 2] = [0xED, 0x79];
 const OUT_C_C: [u8; 2] = [0xED, 0x49];
 const OR_C: u8 = 0xB1;
 const OUT_N_A: u8 = 0xD3;
+const OUTI: [u8; 2] = [0xED, 0xA3];
 const POP_AF: u8 = 0xF1;
 const POP_DE: u8 = 0xD1;
 const PREFIX_DD: u8 = 0xDD;
@@ -1780,6 +1842,47 @@ fn set_refuses_what_the_emulator_could_not_run_from() {
     session.set(&handle, json!({ "gate_array.pen": 16 }));
 }
 
+// set gives no 6845 a type but its own: not crtc.type, nor that of a
+// line-end room that keeps a line end, whose type the chip takes back with it
+// (the emulator's crtc.c). A room that keeps nothing may hold any type.
+#[test]
+fn set_changes_no_6845_type() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let opened = session.answer(
+        "machine_open",
+        json!({ "machine": "cpc464", "crtc_type": 3 }),
+    );
+    let handle = opened["handle"].as_str().unwrap().to_owned();
+    let refused = |session: &mut Session, values: Value| {
+        session.refusal("set", json!({ "handle": handle, "values": values }))
+    };
+    assert_eq!(
+        refused(&mut session, json!({ "crtc.type": 0 })),
+        "crtc.type is the type of 6845 the machine was built with and cannot change; write it as \
+         it reads, or open a machine with machine_open's crtc_type"
+    );
+    let rooms = "a line-end room that keeps a line end has crtc.type as its type: \
+                 crtc_line_end_rooms[0].type while crtc.a_line_end_is_kept is true, and \
+                 crtc_line_end_rooms[1].type while crtc.the_line_end_before_is_kept is true as \
+                 well; write the room's type as crtc.type reads, or write \
+                 crtc.a_line_end_is_kept false";
+    assert_eq!(session.inspect(&handle, "crtc_line_end_rooms[0].type"), 0);
+    assert_eq!(
+        refused(&mut session, json!({ "crtc.a_line_end_is_kept": true })),
+        rooms
+    );
+    session.set(
+        &handle,
+        json!({ "crtc_line_end_rooms[1].type": 4, "crtc.the_line_end_before_is_kept": true }),
+    );
+    let both_kept = json!({ "crtc_line_end_rooms[0].type": 3, "crtc.a_line_end_is_kept": true });
+    assert_eq!(refused(&mut session, both_kept.clone()), rooms);
+    session.set(&handle, json!({ "crtc_line_end_rooms[1].type": 3 }));
+    session.set(&handle, both_kept);
+    assert_eq!(session.inspect(&handle, "crtc.type"), 3);
+}
+
 // A processor selects a RAM configuration by writing &C0 and its number, and
 // "Ram management" (Kevin Thacker's cpctech),
 // https://web.archive.org/web/20260511001355/https://cpctech.cpcwiki.de/docs/rampage.html, gives the blocks each puts
@@ -2368,15 +2471,18 @@ fn cpc_snapshot(kilobytes: u16, version: u8) -> Vec<u8> {
 // width 14, ch. 16.2.2 and 16.2.3), and the monitor retraces once it has held
 // a sync for 12µs (ch. 16.2.4, CPC_FRAME_SYNC_SAMPLES in the emulator's
 // src/cpc.h), at character 8 of line 242, where the first run by frames ends
-// with the NOP it stands in; the next takes a standard frame. The beam's
-// line is 0 from the retrace until the monitor sees a line's sync begin
-// again, at character 52 of line 242, where the line pulse the frame sync
-// inverts ends (ch. 16.2.2), and from line 246 at character 48, two after
-// the 6845's; so it counts 312 - 242 + 1 = 71 lines past the 6845's line
-// once a line's sync has begun, and 70 before it. Before the retrace it
-// counts one past for the line's sync, and one more for a line sync the Gate
-// Array raises two characters after the load, its own counter H06 counting
-// from 0 as it stands at power-on (the emulator's src/gate_array.c).
+// with the NOP it stands in; the next takes a standard frame. The emulator's
+// 6845 comes out of power-on having drawn nothing, so its first clock draws
+// character 0 of line 0 rather than moving past it (has_drawn_a_character in
+// its src/crtc.h), and character 8 of line 242 is drawn on clock 242 * 64 + 9.
+// The beam's line is 0 from the retrace until the monitor sees a line's sync
+// begin again, at character 52 of line 242, where the line pulse the frame sync
+// inverts ends (ch. 16.2.2), and from line 246 at character 48, two after the
+// 6845's; so it counts 312 - 242 + 1 = 71 lines past the 6845's line once a
+// line's sync has begun, and 70 before it. Before the retrace it counts one
+// past for the line's sync, and one more for a line sync the Gate Array raises
+// two characters after the load, its own counter H06 counting from 0 as it
+// stands at power-on (the emulator's src/gate_array.c).
 #[test]
 fn a_cpc_opened_from_its_snapshot_starts_its_frame_from_the_top() {
     let roms = Roms::all();
@@ -2402,7 +2508,7 @@ fn a_cpc_opened_from_its_snapshot_starts_its_frame_from_the_top() {
     }
     let first = session.run(&handle, json!({ "frames": 1 }));
     assert_eq!(first["frames"], 1, "{first}");
-    let retrace = 242 * 256 + 8 * 4;
+    let retrace = 242 * 256 + 9 * 4;
     assert!(
         (retrace..retrace + 5).contains(&first["tick"].as_u64().unwrap()),
         "{first}"
@@ -2417,6 +2523,29 @@ fn a_cpc_opened_from_its_snapshot_starts_its_frame_from_the_top() {
         (CPC_FRAME_TICKS..CPC_FRAME_TICKS + 4).contains(&standard["ticks"].as_u64().unwrap()),
         "{standard}"
     );
+}
+
+// A version 3 snapshot keeps the CRTC type at &A4, numbered as the
+// Compendium numbers the five ("Snapshot (.SNA) file format", cpctech), and
+// machine_open does not read it: the 6845 is of the type crtc_type gives, or
+// type 0.
+#[test]
+fn a_cpc_opened_from_its_snapshot_has_the_6845_it_is_given() {
+    let roms = Roms::all();
+    let mut snapshot = cpc_snapshot(64, 3);
+    snapshot[0xA4] = 1;
+    let path = roms.write("type 1.sna", &snapshot);
+    let mut session = Session::start(&roms);
+    for (given, built) in [(None, 0), (Some(2), 2)] {
+        let mut arguments = json!({ "machine": "cpc464", "snapshot": path });
+        if let Some(given) = given {
+            arguments["crtc_type"] = json!(given);
+        }
+        let opened = session.answer("machine_open", arguments);
+        assert_eq!(opened["crtc_type"], built, "{opened}");
+        let handle = opened["handle"].as_str().unwrap().to_owned();
+        assert_eq!(session.inspect(&handle, "crtc.type"), built);
+    }
 }
 
 // The 48K format of "Emulator file formats" (World of Spectrum FAQ),
@@ -4066,6 +4195,75 @@ fn a_6845_register_is_matched_where_its_write_port_is_reached_an_in_among_them()
         })
         .collect();
     assert_eq!(counted, [(4, 2), (12, 2), (13, 1), (16, 1), (20, 1)]);
+}
+
+// R12 selected, then written by an OUT (C),r at &0009, an OUT (n),A at &000D,
+// whose A is both the port's top half and the byte, and an OUTI at &0015,
+// which takes B down to &BD before it sends the byte at HL (Zilog's Z80 CPU
+// User Manual); then R3 written by an OUT (C),r at &001F.
+const WRITING_THE_6845_EACH_WAY: [u8; 35] = [
+    DI, LD_BC, 0x0C, 0xBC, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x20, 0xBD, OUT_C_C[0], OUT_C_C[1], LD_A,
+    0xBD, OUT_N_A, 0x00, LD_HL, 0x22, 0x00, LD_BC, 0x00, 0xBE, OUTI[0], OUTI[1], LD_BC, 0x03, 0xBC,
+    OUT_C_C[0], OUT_C_C[1], LD_BC, 0x05, 0xBD, OUT_C_C[0], OUT_C_C[1], HALT, 0x15,
+];
+
+// "OUT (C),r8 4 µsec 3rd µsec 4th µsec", "OUT (n),A 3 µsec 3rd µsec 3rd µsec"
+// and "OUTI 5 µsec 5th µsec 5th µsec": the microsecond each writes a 6845
+// register in, on types 0, 1 and 2, then on 3 and 4 (the Compendium, ch.
+// 4.4.3). A write is matched where the chip takes it, and changes compares the
+// register across that tick. The board hands an R3 to a type 3 or 4 ahead of
+// the clock's tick (hand_over_a_held_write in the emulator's src/cpc.c).
+#[test]
+fn a_6845_register_is_matched_where_the_6845_takes_the_write_on_every_type() {
+    let roms = Roms::programmed("cpc6128.rom", &WRITING_THE_6845_EACH_WAY);
+    let mut session = Session::start(&roms);
+    for crtc_type in 0..=4 {
+        let late = if crtc_type < 3 { 3 } else { 4 };
+        for condition in [
+            json!({ "crtc": 0, "to": 31 }),
+            json!({ "crtc": 0, "to": 31, "changes": true }),
+        ] {
+            let opened = session.answer(
+                "machine_open",
+                json!({ "machine": "cpc6128", "crtc_type": crtc_type }),
+            );
+            let handle = opened["handle"].as_str().unwrap().to_owned();
+            let ran = session.run(
+                &handle,
+                json!({
+                    "frames": 1,
+                    "gather": [{ "execute": "&0000", "to": "&0040" }, condition],
+                }),
+            );
+            assert_eq!(ran["stopped"], "halted", "{ran}");
+            let mut begun = BTreeMap::new();
+            let mut written = Vec::new();
+            for seen in ran["gathered"].as_array().expect("a list") {
+                let tick = seen["tick"].as_u64().expect("a tick");
+                if !seen["execute"].is_null() {
+                    begun.insert(after_ampersand(&seen["execute"], 4), tick);
+                    continue;
+                }
+                let pc = after_ampersand(&seen["pc"], 4);
+                written.push((
+                    seen["crtc"].as_u64().expect("a register"),
+                    after_ampersand(&seen["value"], 2),
+                    pc,
+                    (tick - begun[&pc]).div_ceil(4),
+                ));
+            }
+            assert_eq!(
+                written,
+                [
+                    (12, 0x20, 0x0009, late),
+                    (12, 0xBD, 0x000D, 3),
+                    (12, 0x15, 0x0015, 5),
+                    (3, 0x05, 0x001F, late),
+                ],
+                "type {crtc_type}, {condition}"
+            );
+        }
+    }
 }
 
 // Writes from &0000 on: LD (HL),n at &0004 and again at &0006 writes 5 to
@@ -8848,6 +9046,46 @@ fn a_machine_kept_inside_an_instruction_is_stood_up_from_its_state_file_inside_i
     assert!(everything(&mut session, &read) == ran_on);
 }
 
+// A state file opens with the 6845 its machine was built with, as the
+// journal in it says, its line-end rooms holding the type a line end left
+// there; one holding a type no CPC here is built with is refused.
+#[test]
+fn a_state_file_opens_with_the_6845_its_machine_was_built_with() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let opened = session.answer(
+        "machine_open",
+        json!({ "machine": "cpc6128", "crtc_type": 2 }),
+    );
+    let handle = opened["handle"].as_str().unwrap().to_owned();
+    session.run(&handle, json!({ "frames": 2 }));
+    assert_eq!(session.inspect(&handle, "crtc_line_end_rooms[0].type"), 2);
+    let state = keep(&mut session, &handle);
+    let path = roms.0.join("type 2.state");
+    save_state(&mut session, &handle, &state, &path);
+    let reopened = open_state(&mut session, "cpc6128", &path);
+    assert_eq!(reopened["crtc_type"], 2, "{reopened}");
+    let reopened = reopened["handle"].as_str().unwrap().to_owned();
+    assert_eq!(session.inspect(&reopened, "crtc.type"), 2);
+    let journal = session.answer("journal", json!({ "handle": reopened }));
+    assert_eq!(journal["entries"][0]["arguments"]["crtc_type"], 2);
+    assert!(everything(&mut session, &reopened) == everything(&mut session, &handle));
+    let (mut heading, bytes) = state_file(&path);
+    heading["hardware"]["cpc_t"]["crtc"]["type"] = json!(5);
+    let changed = roms.0.join("type 5.state");
+    state_file_written(&changed, &heading, &bytes);
+    assert_eq!(
+        session.refusal(
+            "machine_open",
+            json!({ "machine": "cpc6128", "state": changed })
+        ),
+        format!(
+            "{} holds no crtc.type from 0 to 4; give a file that state_save wrote",
+            changed.display()
+        )
+    );
+}
+
 // A state file is written only of a state kept, through its machine's
 // handle, where no file is, and opened only as the machine it holds, on the
 // build that wrote it and the firmware it was kept on, whole and as it was
@@ -9200,7 +9438,10 @@ fn the_journal_made_again_makes_the_machine_again() {
     let disc = roms.write("blank.dsk", &blank_data_disc());
     let not_a_disc = roms.write("not.dsk", &[0; 512]);
     let mut session = Session::start(&roms);
-    let opened = session.answer("machine_open", json!({ "machine": "cpc6128" }));
+    let opened = session.answer(
+        "machine_open",
+        json!({ "machine": "cpc6128", "crtc_type": 1 }),
+    );
     let handle = opened["handle"].as_str().unwrap().to_owned();
     let ask = |session: &mut Session, handle: &str, tool: &str, arguments: &Value| {
         let mut arguments = arguments.clone();
@@ -9209,7 +9450,7 @@ fn the_journal_made_again_makes_the_machine_again() {
     };
     let mut asked = vec![(
         json!("machine_open"),
-        json!({ "machine": "cpc6128" }),
+        json!({ "machine": "cpc6128", "crtc_type": 1 }),
         json!(0),
     )];
     let mut now = json!(0);

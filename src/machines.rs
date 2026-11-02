@@ -19,9 +19,9 @@ use crate::fields::{self, Fields, Segment};
 use crate::firmware::{self, Version};
 use crate::keys::{self, Key, Keystroke};
 use crate::machine::{
-    Buffers, COUNT, CRTC, Capture, Condition, Cpc, CpcState, KINDS, MOST_MEDIUM_BYTES, Match, PSG,
-    Place, Run, SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Start, Watch, gate_array_rgb,
-    ula_rgb,
+    Buffers, COUNT, CRTC, CRTC_TYPES, Capture, Condition, Cpc, CpcState, KINDS, MOST_MEDIUM_BYTES,
+    Match, PSG, Place, Run, SPECTRUM_LOCATIONS, Span, Spectrum, SpectrumState, Start, Watch,
+    gate_array_rgb, ula_rgb,
 };
 use crate::picture::Picture;
 use crate::screen::{self, Asked, Screen};
@@ -88,6 +88,21 @@ pub const MACHINES: &[Machine] = &[
         },
     },
 ];
+
+// The 6845 a CPC is built with where machine_open is given none: type 0, the
+// first CPCs' type. The firmware programs the frame sync's width in R3, which
+// types 1 and 2 ignore, holding it at 16 lines, so that "If AMSTRAD engineers
+// were aware of the existence of these differences, it can be assumed that
+// the first CRTC's used were type 0s, since this function is used and
+// programmed by the ROM", which a 464 prototype confirmed in 2023 (the
+// Compendium, ch. 4.2). The emulator's command line builds every CPC so
+// (crtc_type in its machines table, cli/main.c at 78c56f2), and MAME builds
+// the 464, the 664 and the 6128 with an HD6845S (amstrad_base,
+// https://github.com/mamedev/mame/blob/079ac58c453b09a3ffd8267d1c611b4d2c63795b/src/mame/amstrad/amstrad.cpp#L928);
+// CPCEC has built a type 1 unless told otherwise since its release of
+// 20191117, "More precise emulation of type 1 CRTC (by default instead of
+// 0)" (CPCEC.TXT in cpcec-20261030.zip, http://cngsoft.no-ip.org/cpcec.htm).
+pub const DEFAULT_CRTC_TYPE: u8 = 0;
 
 const AMSDOS: &str = "amsdos.rom";
 const CPC_ROM_SIZE: usize = 0x4000;
@@ -328,6 +343,7 @@ pub struct Parts {
 
 enum Memories {
     Cpc {
+        crtc_type: u8,
         ram: Box<[u8]>,
         lower_rom: Box<[u8; CPC_ROM_SIZE]>,
         basic: Box<[u8; CPC_ROM_SIZE]>,
@@ -357,7 +373,7 @@ pub struct Entry {
     pub tick: u64,
     /// The tool called.
     pub tool: String,
-    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute.
+    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute; `crtc_type` in a CPC's `machine_open`, whether given or not.
     #[schemars(schema_with = "crate::server::values_schema")]
     pub arguments: Value,
     /// The snapshot, disc or tape the request read, with the SHA-256 of what it held.
@@ -440,6 +456,30 @@ pub struct StateFile {
     buffers_at: usize,
 }
 
+impl StateFile {
+    // The type the state's CPC was built with, which set cannot change, so the
+    // machine it opens into is built with it too; None for a Spectrum's.
+    pub fn crtc_type(&self) -> Result<Option<u8>, String> {
+        let Some(machine) = self.heading.hardware.get("cpc_t") else {
+            return Ok(None);
+        };
+        machine
+            .pointer("/crtc/type")
+            .and_then(Value::as_u64)
+            .and_then(|crtc_type| u8::try_from(crtc_type).ok())
+            .filter(|crtc_type| CRTC_TYPES.contains(crtc_type))
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "{} holds no crtc.type from {} to {}; {STATE_FILES}",
+                    self.read.path.display(),
+                    CRTC_TYPES.start(),
+                    CRTC_TYPES.end()
+                )
+            })
+    }
+}
+
 // A state file's first line holds the fields of two discs, some 1.2MB a disc,
 // and the journal, an entry for every request that changed the machine: some
 // 60 bytes for a run, some 8K for the longest poke. These leave the journal
@@ -515,7 +555,12 @@ fn rom<const SIZE: usize>(bytes: &[u8]) -> Box<[u8; SIZE]> {
 }
 
 impl Machine {
-    pub fn parts(&self, roms: &Path, snapshot: Option<&Path>) -> Result<Parts, String> {
+    pub fn parts(
+        &self,
+        roms: &Path,
+        snapshot: Option<&Path>,
+        crtc_type: Option<u8>,
+    ) -> Result<Parts, String> {
         let mut files = Vec::new();
         let memories = match self.board {
             Board::Cpc {
@@ -532,6 +577,7 @@ impl Machine {
                 };
                 let (lower_rom, basic) = firmware.split_at(CPC_ROM_SIZE);
                 Memories::Cpc {
+                    crtc_type: crtc_type.unwrap_or(DEFAULT_CRTC_TYPE),
                     ram: vec![0; ram_size].into_boxed_slice(),
                     lower_rom: rom(lower_rom),
                     basic: rom(basic),
@@ -660,6 +706,25 @@ impl Machine {
         }
     }
 
+    // Whether the machine takes a 6845 of the type given, and what does if it
+    // does not.
+    pub fn takes_crtc_type(&self, crtc_type: u8) -> Result<(), String> {
+        match self.board {
+            Board::Cpc { .. } if CRTC_TYPES.contains(&crtc_type) => Ok(()),
+            Board::Cpc { .. } => Err(format!(
+                "crtc_type is {crtc_type}, and a CPC's 6845 is of type {} to {}; give one of \
+                 those, or leave crtc_type out for type {DEFAULT_CRTC_TYPE}",
+                CRTC_TYPES.start(),
+                CRTC_TYPES.end()
+            )),
+            Board::Spectrum { .. } => Err(format!(
+                "a {} has no 6845, so it takes no crtc_type; leave crtc_type out, or open a \
+                 cpc464, a cpc664 or a cpc6128",
+                self.name
+            )),
+        }
+    }
+
     // Whether the machine takes a tape, and what does if it does not.
     pub fn takes_tapes(&self) -> Result<(), String> {
         match self.board {
@@ -776,15 +841,31 @@ impl Machine {
 }
 
 impl Parts {
+    pub fn crtc_type(&self) -> Option<u8> {
+        match self.memories {
+            Memories::Cpc { crtc_type, .. } => Some(crtc_type),
+            Memories::Spectrum { .. } => None,
+        }
+    }
+
     pub fn build(self, machine: &Machine) -> Result<Built, String> {
+        let mut opening = Entry {
+            tick: 0,
+            tool: "machine_open".to_owned(),
+            arguments: json!({ "machine": machine.name }),
+            file: None,
+            written: None,
+        };
         let mut hardware = match self.memories {
             Memories::Cpc {
+                crtc_type,
                 ram,
                 lower_rom,
                 basic,
                 amsdos,
             } => {
-                let mut cpc = Cpc::new(ram, lower_rom);
+                opening.arguments["crtc_type"] = json!(crtc_type);
+                let mut cpc = Cpc::new(ram, lower_rom, crtc_type);
                 cpc.set_upper_rom(0, basic);
                 if let Some(amsdos) = amsdos {
                     cpc.fit_disc_interface(true);
@@ -793,13 +874,6 @@ impl Parts {
                 Hardware::Cpc(cpc)
             }
             Memories::Spectrum { ram, rom } => Hardware::Spectrum(Spectrum::new(ram, rom)),
-        };
-        let mut opening = Entry {
-            tick: 0,
-            tool: "machine_open".to_owned(),
-            arguments: json!({ "machine": machine.name }),
-            file: None,
-            written: None,
         };
         if let Some((path, bytes)) = self.snapshot {
             let loaded = match &mut hardware {
@@ -1843,7 +1917,7 @@ mod tests {
     fn build(name: &str, roms: &Roms) -> Built {
         let machine = named(name).expect("a machine of that name");
         machine
-            .parts(&roms.0, None)
+            .parts(&roms.0, None, None)
             .expect("its firmware is read")
             .build(machine)
             .expect("a machine without a snapshot is always built")
@@ -2035,7 +2109,10 @@ mod tests {
     #[test]
     fn missing_firmware_says_where_it_was_looked_for_and_how_to_fetch_it() {
         let roms = Roms::new(&[("cpc6128.rom", 0x8000, 0x61)]);
-        let Err(problem) = named("cpc6128").expect("the 6128").parts(&roms.0, None) else {
+        let Err(problem) = named("cpc6128")
+            .expect("the 6128")
+            .parts(&roms.0, None, None)
+        else {
             panic!("the 6128 is built without AMSDOS");
         };
         assert!(
@@ -2052,7 +2129,10 @@ mod tests {
     #[test]
     fn firmware_of_another_size_is_refused() {
         let roms = Roms::new(&[("spectrum48.rom", 0x8000, 0x48)]);
-        let Err(problem) = named("spectrum48").expect("the 48").parts(&roms.0, None) else {
+        let Err(problem) = named("spectrum48")
+            .expect("the 48")
+            .parts(&roms.0, None, None)
+        else {
             panic!("a 32K Spectrum ROM is taken");
         };
         assert_eq!(

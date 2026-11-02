@@ -338,7 +338,11 @@ mod tests {
     use crate::machine::{Cpc, Spectrum};
 
     fn cpc() -> Cpc {
-        Cpc::new(vec![0; 0x10000].into_boxed_slice(), Box::new([0; 0x4000]))
+        Cpc::new(
+            vec![0; 0x10000].into_boxed_slice(),
+            Box::new([0; 0x4000]),
+            0,
+        )
     }
 
     fn spectrum() -> Spectrum {
@@ -405,8 +409,8 @@ mod tests {
     }
 
     // What the headers hold by pointer, and nothing else, is left out:
-    // cpc.h, spectrum.h, monitor.h, upd765.h, drive.h, floppy.h, tape.h and
-    // tzx.h.
+    // cpc.h, crtc.h, spectrum.h, monitor.h, upd765.h, drive.h, floppy.h,
+    // tape.h and tzx.h.
     #[test]
     fn only_pointers_are_left_out() {
         assert_eq!(
@@ -418,6 +422,7 @@ mod tests {
                 "cpc_t.tape",
                 "cpc_t.upper_roms",
                 "cpc_t.write_page",
+                "crtc_t.line_end_rooms",
                 "drive_t.floppy",
                 "floppy_t.image",
                 "monitor_t.framebuffer",
@@ -450,13 +455,24 @@ mod tests {
         );
     }
 
+    // bindgen renders crtc_t's type as type_; af_'s underscore is the
+    // header's own.
+    #[test]
+    fn a_field_keeps_its_header_name_where_that_is_a_rust_keyword() {
+        let cpc = cpc();
+        let read = |path: &str| cpc.machine().get(&parse(path).unwrap());
+        assert_eq!(read("crtc.type"), Ok(Value::from(0)));
+        assert!(read("crtc.type_").is_err());
+        assert!(read("cpu.af_").is_ok());
+    }
+
     #[test]
     fn a_path_that_reaches_nothing_says_what_would() {
         let cpc = cpc();
         let refusal = |path: &str| cpc.machine().get(&parse(path).unwrap()).unwrap_err();
         assert!(
             refusal("crtc.nope").starts_with(
-                "crtc_t has no field nope; its fields are registers, address_register,"
+                "crtc_t has no field nope; its fields are type, registers, address_register,"
             ),
             "{}",
             refusal("crtc.nope")
@@ -464,7 +480,7 @@ mod tests {
         assert!(
             refusal("crtc[0]").starts_with(
                 "crtc_t is a structure, so use a field name, not [0]; its fields \
-                 are registers, address_register,"
+                 are type, registers, address_register,"
             ),
             "{}",
             refusal("crtc[0]")

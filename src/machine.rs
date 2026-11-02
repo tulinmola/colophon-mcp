@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::marker::PhantomData;
+use std::ops::RangeInclusive;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -47,6 +48,10 @@ pub use crate::emulator::{
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
 // are laid out.
 pub const KINDS: [Kind; MCP_KINDS as usize] = [EXECUTE, READ, WRITE, IN, OUT, PSG, CRTC];
+
+// The five types of 6845 a CPC is built with, numbered as the Compendium's
+// ch. 4.2 numbers them (crtc_t's type, in the emulator's crtc.h).
+pub const CRTC_TYPES: RangeInclusive<u8> = 0..=4;
 
 // Each kind's counts stand at its own value in mcp_kind_t.
 const _: () = {
@@ -187,10 +192,11 @@ fn watching(watch: Option<&mut Watch>, locations: u32) -> *mut mcp_watch_t {
     })
 }
 
-// Every CPC reads one buffer of the core's own for an empty upper ROM socket,
-// and each cpc_init fills it, so no CPC is built while another is built or
+// Every CPC reads two buffers of the core's own, which each cpc_init fills:
+// the empty upper ROM socket (cpc.c's absent_rom) and the pens of every byte
+// (gate_array.c's pens_of_byte). So no CPC is built while another is built or
 // runs: https://github.com/tulinmola/colophon-emulator/issues/4
-static EMPTY_SOCKET: RwLock<()> = RwLock::new(());
+static CORE_BUFFERS: RwLock<()> = RwLock::new(());
 
 // What is handed to the core is held by a raw pointer from then on, because
 // the core keeps pointers into it, and moving or reborrowing a Box would
@@ -671,11 +677,15 @@ pub struct Cpc {
 }
 
 impl Cpc {
-    pub fn new(ram: Box<[u8]>, lower_rom: Box<[u8; 0x4000]>) -> Cpc {
+    pub fn new(ram: Box<[u8]>, lower_rom: Box<[u8; 0x4000]>, crtc_type: u8) -> Cpc {
         assert!(
             matches!(ram.len(), 0x10000 | 0x20000),
             "a CPC takes 64K or 128K of RAM, not {} bytes",
             ram.len()
+        );
+        assert!(
+            CRTC_TYPES.contains(&crtc_type),
+            "a CPC's 6845 is of type 0 to 4, not {crtc_type}"
         );
         let ram_size = ram.len() as u32;
         // SAFETY: bindgen renders a machine as integers, bools and pointers,
@@ -685,7 +695,7 @@ impl Cpc {
         let ram = Handed::new(ram);
         let lower_rom = Handed::new(lower_rom);
         let framebuffer = framebuffer(CPC_FRAMEBUFFER_WIDTH, CPC_FRAMEBUFFER_HEIGHT);
-        let _building = EMPTY_SOCKET.write().unwrap_or_else(PoisonError::into_inner);
+        let _building = CORE_BUFFERS.write().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: what is handed over is held beside the machine and freed
         // after it, and the RAM is one of the two sizes cpc_init knows.
         unsafe {
@@ -694,6 +704,7 @@ impl Cpc {
                 ram.as_ptr().cast(),
                 ram_size,
                 lower_rom.as_ptr().cast(),
+                crtc_type,
             );
             cpc_connect_monitor(machine.as_ptr(), framebuffer.as_ptr().cast());
         }
@@ -726,7 +737,7 @@ impl Cpc {
     }
 
     pub fn run(&mut self, frames: u32, limit: u64, watch: Option<&mut Watch>) -> Run {
-        let _running = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
+        let _running = CORE_BUFFERS.read().unwrap_or_else(PoisonError::into_inner);
         let watch = watching(watch, self.locations());
         // SAFETY: the machine and what it was handed stand where they were,
         // and a watch borrows its conditions, 64 at most, its room for
@@ -756,13 +767,13 @@ impl Cpc {
     }
 
     pub fn step(&mut self, instructions: u32) -> Run {
-        let _running = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
+        let _running = CORE_BUFFERS.read().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: as for a run.
         unsafe { mcp_cpc_step(self.machine.as_ptr(), instructions) }
     }
 
     pub fn peek(&self, address: u16) -> u8 {
-        let _reading = EMPTY_SOCKET.read().unwrap_or_else(PoisonError::into_inner);
+        let _reading = CORE_BUFFERS.read().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the memory the machine reads stands where it was handed.
         unsafe { cpc_peek(self.machine.as_ptr(), address) }
     }
@@ -1307,7 +1318,7 @@ mod tests {
     // standing just after a retrace, halted for good: the first run stops at
     // the HALT, and those from there run as asked.
     fn cpc_on_the_standard_screen() -> Cpc {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&standard_screen(), HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&standard_screen(), HALT), 0);
         assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None).frames, 0);
         assert_eq!(cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None).frames, 2);
         cpc
@@ -1321,7 +1332,7 @@ mod tests {
         let mut program = standard_screen();
         let start = program.len() as u16;
         program.extend(code);
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&program, fill));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&program, fill), 0);
         for _instruction in 0..1 + 4 * STANDARD_SCREEN.len() {
             let step = cpc.run(1, 1, None);
             assert!(step.frames == 0 && step.ticks < 64, "a step ran {step:?}");
@@ -1517,7 +1528,7 @@ mod tests {
     #[test]
     fn a_cpc_steps_an_instruction_at_a_time() {
         let program = [NOP, LD_BC, 0x34, 0x12, EX_SP_IX[0], EX_SP_IX[1], NOP];
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&program, HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&program, HALT), 0);
         cpc.step(1);
         let mut ticks = 0;
         for pc in [4, 6, 7] {
@@ -1592,8 +1603,8 @@ mod tests {
             assert!(spectrum.machine().cpu.halted_for_good());
             assert_eq!(spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None).frames, 2);
         }
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP));
-        let mut twin = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP), 0);
+        let mut twin = Cpc::new(sixty_four_k(), rom(&[DI, NOP, HALT], NOP), 0);
         let run = cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
         assert_eq!(
             (run.ticks, run.frames, run.settled),
@@ -1963,9 +1974,9 @@ mod tests {
     // its loop: the first time, before any disc command, so that the
     // controller has chosen no drive; or a quarter of a frame before a
     // retrace, after some.
-    fn busy_cpc(ram: Box<[u8]>, disc: &mut Disc, before_any_command: bool) -> Cpc {
+    fn busy_cpc(ram: Box<[u8]>, crtc_type: u8, disc: &mut Disc, before_any_command: bool) -> Cpc {
         let (workload, looped) = cpc_workload();
-        let mut cpc = Cpc::new(ram, rom(&workload, HALT));
+        let mut cpc = Cpc::new(ram, rom(&workload, HALT), crtc_type);
         cpc.fit_disc_interface(true);
         // Fitted where AMSDOS is, so that the locations run past ROM 0's.
         cpc.set_upper_rom(7, rom(&[], HALT));
@@ -2011,7 +2022,7 @@ mod tests {
     #[test]
     fn a_disc_or_a_tape_replaced_is_freed_once_nothing_points_at_it() {
         let (workload, _) = cpc_workload();
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT), 0);
         cpc.fit_disc_interface(true);
         for image in [
             one_track_image(0xE5),
@@ -2058,7 +2069,7 @@ mod tests {
     #[test]
     fn a_state_keeps_its_disc_and_its_tape_through_a_swap() {
         let (workload, _) = cpc_workload();
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT), 0);
         cpc.fit_disc_interface(true);
         cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
         cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
@@ -2252,22 +2263,26 @@ mod tests {
             ),
             ("fdc.", &[execution, stage("UPD765_STAGE_DATA")]),
         ];
+        // set changes no 6845's type, so a type whose state reaches where a
+        // type 0's does not is swept on a machine of its own: a type 1 fills
+        // the second line-end room, and the board holds a type 3's writes to
+        // the clock, as it does a type 4's.
         let mut disc = Disc::formatted();
-        let mut busy = busy_cpc(sixty_four_k(), &mut disc, false);
+        let mut busy = busy_cpc(sixty_four_k(), 0, &mut disc, false);
         let (ran, checked_out) = sweep_cpc(&mut busy, &contexts);
         assert!(
             ran > 5000 && checked_out > 500,
             "{ran} ran, {checked_out} checked out"
         );
         let mut disc = Disc::formatted();
-        let mut fresh = busy_cpc(sixty_four_k(), &mut disc, true);
+        let mut fresh = busy_cpc(sixty_four_k(), 1, &mut disc, true);
         let (ran, checked_out) = sweep_cpc(&mut fresh, &contexts[..1]);
         assert!(
             ran > 4000 && checked_out > 50,
             "{ran} ran, {checked_out} checked out"
         );
         let mut disc = Disc::formatted();
-        let mut larger = busy_cpc(vec![0; 0x20000].into_boxed_slice(), &mut disc, false);
+        let mut larger = busy_cpc(vec![0; 0x20000].into_boxed_slice(), 3, &mut disc, false);
         let (ran, checked_out) = sweep_cpc(&mut larger, &contexts[..1]);
         assert!(
             ran > 4000 && checked_out > 50,
@@ -2319,7 +2334,7 @@ mod tests {
     // one, as the core trusts it.
     #[test]
     fn the_check_holds_a_cpc_to_every_bound_the_core_trusts() {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.fit_disc_interface(true);
         let check = |change: &dyn Fn(&mut cpc_t)| {
             // SAFETY: a machine's struct owns nothing, and the copy is only
@@ -2425,7 +2440,7 @@ mod tests {
     #[test]
     fn each_machine_is_built_with_the_ram_it_is_handed() {
         for size in [0x10000, 0x20000] {
-            let cpc = Cpc::new(vec![0; size].into_boxed_slice(), rom(&[], HALT));
+            let cpc = Cpc::new(vec![0; size].into_boxed_slice(), rom(&[], HALT), 0);
             assert_eq!(cpc.machine().ram_size as usize, size);
             assert_eq!(cpc.machine().ram, cpc.ram.as_ptr().cast());
         }
@@ -2443,7 +2458,7 @@ mod tests {
     // Spectrum's ROM, or past a 16K Spectrum's RAM, which ends at &7FFF.
     #[test]
     fn a_call_is_refused_where_its_return_address_would_not_read_back() {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[DI], HALT), 0);
         let standing = cpc.machine().cpu;
         for (sp, called) in [
             (0x4002, true),
@@ -2610,7 +2625,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "counts for each of the")]
     fn a_cpc_refuses_counts_for_fewer_locations_than_it_has() {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         let counting = counting_everything();
         let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
         let mut watch = Watch::new(&counting, &mut [], &mut counts, &mut [], 1, 1);
@@ -2620,7 +2635,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "upper ROM 7 is fitted already")]
     fn a_cpc_refuses_a_second_rom_in_a_socket() {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.set_upper_rom(7, rom(&[], HALT));
         cpc.set_upper_rom(7, rom(&[], HALT));
     }
@@ -2628,7 +2643,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "a CPC takes 64K or 128K of RAM")]
     fn a_cpc_refuses_ram_its_board_cannot_take() {
-        Cpc::new(vec![0; 0x8000].into_boxed_slice(), rom(&[], HALT));
+        Cpc::new(vec![0; 0x8000].into_boxed_slice(), rom(&[], HALT), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "a CPC's 6845 is of type 0 to 4, not 5")]
+    fn a_cpc_refuses_a_6845_of_no_type() {
+        Cpc::new(sixty_four_k(), rom(&[], HALT), 5);
     }
 
     #[test]
@@ -2640,12 +2661,15 @@ mod tests {
     // Every pointer the headers hold, and how a machine read from a state file
     // comes by it, since the file holds none. A pointer the core gains fails
     // this until a state file comes by it too.
-    const POINTED_AGAIN: [&str; 17] = [
-        // The machine's own, as it was built: a CPC's deck is never filled.
+    const POINTED_AGAIN: [&str; 18] = [
+        // The machine's own, as it was built: a CPC's deck is never filled,
+        // cpc_tick points the 6845 at its rooms on every tick, and the chip
+        // points a room at them before it takes the room back.
         "cpc_t.lower_rom",
         "cpc_t.ram",
         "cpc_t.tape",
         "cpc_t.upper_roms",
+        "crtc_t.line_end_rooms",
         "monitor_t.framebuffer",
         "spectrum_t.ram",
         "spectrum_t.rom",
@@ -2687,7 +2711,7 @@ mod tests {
     fn a_cpc_read_from_its_state_file_runs_on_as_kept() {
         let (workload, _) = cpc_workload();
         let build = || {
-            let mut cpc = Cpc::new(vec![0; 0x20000].into_boxed_slice(), rom(&workload, HALT));
+            let mut cpc = Cpc::new(vec![0; 0x20000].into_boxed_slice(), rom(&workload, HALT), 0);
             cpc.fit_disc_interface(true);
             cpc
         };
@@ -2849,7 +2873,7 @@ mod tests {
     // reading ends where the image does.
     #[test]
     fn the_disc_check_holds_a_disc_to_every_bound_floppy_c_trusts() {
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.fit_disc_interface(true);
         cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
         let disc = cpc.discs[0].as_ref().expect("a disc");
@@ -2978,7 +3002,7 @@ mod tests {
     #[ignore = "under the sanitizers: make test-sanitized"]
     fn nothing_the_disc_check_lets_through_runs_out_of_bounds() {
         let image = one_track_image(0xE5);
-        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT));
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.fit_disc_interface(true);
         cpc.insert_disc(0, &image).unwrap();
         let disc = cpc.discs[0].as_ref().expect("a disc");

@@ -332,9 +332,10 @@ mcp_run_t mcp_spectrum_step(spectrum_t *spectrum, uint32_t instructions);
  * can, or a sentence naming the first field it would trust past what that
  * field may hold. The core indexes and sizes by some of its fields without
  * checking them, because nothing it does itself can take them out of range;
- * a write from outside can, and these hold it to the same ranges, and keep
- * a processor from being held for good. `standing` is the machine as it
- * stands, whose buffers are of the sizes it was handed when it was built. */
+ * a write from outside can, and these hold it to the same ranges, hold a CPC
+ * to the type of 6845 it was built with, and keep a processor from being held
+ * for good. `standing` is the machine as it stands, whose buffers are of the
+ * sizes it was handed when it was built. */
 const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written);
 const char *mcp_spectrum_check(const spectrum_t *standing, const spectrum_t *written);
 

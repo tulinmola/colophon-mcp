@@ -19,11 +19,12 @@ static bool psg_written(const cpc_t *cpc, uint16_t port) {
          cpc->psg.chip_selected;
 }
 
-/* Whether an I/O request, begun at this port, wrote one of the 6845's
-   registers. The board strobes the chip at any I/O request with A14 low, RS
-   on A8 and R/W on A9, so A8 high and A9 low write the register the address
-   register names; a read writes too, the byte the address bus carries in its
-   top half (colophon-emulator's cpc.c, crtc_bus and io_read, at 7a23101). */
+/* Whether an I/O request at this port writes one of the 6845's registers. The
+   board strobes the chip at any I/O request with A14 low, RS on A8 and R/W on
+   A9, so A8 high and A9 low write the register the address register names; a
+   read writes too, the byte the address bus carries in its top half, once,
+   where RD falls (colophon-emulator's cpc.c, crtc_bus_pins and io_read, at
+   78c56f2). */
 static bool crtc_written(uint16_t port) { return (port & 0x4300) == 0x0100; }
 
 /* The byte the 6845 was given: the data an OUT puts on the bus, and the top
@@ -84,24 +85,28 @@ uint32_t mcp_cpc_locations(const cpc_t *cpc) {
   return MCP_FIRST_ROM_LOCATION + (2 + highest) * MCP_ROM_BYTES;
 }
 
-/* What the watch sees of a tick, given the bus before it and after it, and
-   what a write could change as it stood before it. A read held by WAIT writes
-   the 6845 and the PSG again on every tick it is held, the same byte to the
-   same register, and is seen once, as it begins. */
+/* What the watch sees of a tick, given the bus before it and after it, what a
+   write could change as it stood before it, and whether a write to the 6845
+   awaited the clock as the tick began. A read held by WAIT writes the PSG again
+   on every tick it is held, the same byte to the same register, and is seen
+   once, as it begins. A write to the 6845 is seen on the tick the chip takes
+   it: the tick its request begins, or, on a type 3 or 4, whose board holds an
+   OUT's write to the clock, the first character clock the cycle spans, the
+   cycle still on the bus (colophon-emulator's cpc.c, io_write and cpc_tick, at
+   78c56f2). */
 static void see_tick(cpc_t *cpc, mcp_watch_t *watch, uint64_t before, uint64_t pins, uint64_t ticks,
-                     held_t was) {
+                     held_t was, bool write_awaited_the_clock) {
   held_t is = watch->compares ? held(cpc, z80_address(before)) : was;
   mcp_watch_after(watch, &cpc->cpu, &cpc->monitor, before, pins, ticks, is.memory != was.memory);
-  if (!mcp_request_began(before, pins, Z80_IORQ | Z80_WR) &&
-      !mcp_request_began(before, pins, Z80_IORQ | Z80_RD)) {
-    return;
-  }
+  bool began = mcp_request_began(before, pins, Z80_IORQ | Z80_WR) ||
+               mcp_request_began(before, pins, Z80_IORQ | Z80_RD);
+  bool taken = write_awaited_the_clock && (pins & (Z80_IORQ | Z80_WR)) == (Z80_IORQ | Z80_WR);
   uint16_t port = z80_address(pins);
-  if (crtc_written(port)) {
+  if ((began || taken) && crtc_written(port) && !cpc->crtc_write_awaits_the_clock) {
     mcp_watch_register(watch, &cpc->monitor, ticks, MCP_CRTC, cpc->crtc.address_register,
                        crtc_given(pins), is.crtc != was.crtc);
   }
-  if (psg_written(cpc, port)) {
+  if (began && psg_written(cpc, port)) {
     mcp_watch_register(watch, &cpc->monitor, ticks, MCP_PSG, cpc->psg.selected,
                        ppi_output_of(&cpc->ppi, PPI_PORT_A), is.psg != was.psg);
   }
@@ -114,6 +119,7 @@ static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
     return false;
   }
   bool retraced_before = cpc->monitor.frame_retraced;
+  bool write_awaited_the_clock = cpc->crtc_write_awaits_the_clock;
   uint64_t before = cpc->pins;
   /* z80.c's MEM_WRITE_T1 puts a write's address on the bus a tick before
      MEM_WRITE_T2 writes the byte there. */
@@ -124,7 +130,7 @@ static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
     run->frames++;
   }
   if (watch != NULL) {
-    see_tick(cpc, watch, before, pins, run->ticks, was);
+    see_tick(cpc, watch, before, pins, run->ticks, was, write_awaited_the_clock);
   }
   return true;
 }
@@ -203,7 +209,7 @@ const char *mcp_cpc_call(cpc_t *cpc, uint16_t address) {
 
 /* The bounds below are where the core trusts a field without checking it,
    because no path of its own takes the field outside them: the line quoted
-   beside each is the use. colophon-emulator at 2898ddd. */
+   beside each is the use. colophon-emulator at 78c56f2. */
 const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
   const upd765_t *fdc = &written->fdc;
   const char *problem = mcp_z80_check(&written->cpu);
@@ -214,6 +220,25 @@ const char *mcp_cpc_check(const cpc_t *standing, const cpc_t *written) {
      `bool pal_fitted = cpc->ram_size >= 0x20000;`. */
   if (written->ram_size != standing->ram_size) {
     return "ram_size is the size of the machine's RAM and cannot change; write it as it reads";
+  }
+  /* Not a bound: a type changed under the 6845 would run on from latches the
+     other type set. A kept room is copied back into the chip, its type with it
+     (`*crtc = *room;` in crtc.c), room 1 only while room 0 keeps a line end
+     too, and room 0 may be copied into room 1 first (enter_character). A room
+     that keeps nothing is not read before a line end fills it. */
+  if (written->crtc.type != standing->crtc.type) {
+    return "crtc.type is the type of 6845 the machine was built with and cannot change; write it "
+           "as it reads, or open a machine with machine_open's crtc_type";
+  }
+  bool kept[] = {written->crtc.a_line_end_is_kept,
+                 written->crtc.a_line_end_is_kept && written->crtc.the_line_end_before_is_kept};
+  for (size_t room = 0; room < sizeof kept / sizeof kept[0]; room++) {
+    if (kept[room] && written->crtc_line_end_rooms[room].type != written->crtc.type) {
+      return "a line-end room that keeps a line end has crtc.type as its type: "
+             "crtc_line_end_rooms[0].type while crtc.a_line_end_is_kept is true, and "
+             "crtc_line_end_rooms[1].type while crtc.the_line_end_before_is_kept is true as well; "
+             "write the room's type as crtc.type reads, or write crtc.a_line_end_is_kept false";
+    }
   }
   /* cpc_remap: `banking[cpc->mmr & 0x07]` pages in banks 4 to 7, past the
      end of 64K. */

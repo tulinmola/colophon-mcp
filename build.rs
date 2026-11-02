@@ -175,6 +175,17 @@ impl Bindings {
     }
 }
 
+// A field by its header's name: bindgen renders a field named by a Rust
+// keyword with an underscore after it, crtc_t's type as type_, and syn refuses
+// a keyword as an identifier. af_ and vma_ end in an underscore of their own,
+// a prime mark.
+fn c_name(field: &str) -> &str {
+    match field.strip_suffix('_') {
+        Some(stem) if !stem.is_empty() && syn::parse_str::<syn::Ident>(stem).is_err() => stem,
+        _ => field,
+    }
+}
+
 fn enumerators_constant(enumeration: &str) -> String {
     format!("{}_ENUMERATORS", enumeration.to_uppercase())
 }
@@ -221,7 +232,8 @@ fn generate(bindings: &Bindings) -> String {
                 !field.starts_with('_'),
                 "{structure}.{field} begins as bindgen's own fields do, which C does not have"
             );
-            let kind = bindings.kind(&format!("{structure}.{field}"), ty);
+            let named = c_name(field);
+            let kind = bindings.kind(&format!("{structure}.{named}"), ty);
             let mut element = &kind;
             while let Kind::Array(inner) = element {
                 element = inner;
@@ -234,16 +246,16 @@ fn generate(bindings: &Bindings) -> String {
                 _ => {}
             }
             let Some([encoding, getting, setting]) = calls(&kind, field) else {
-                pointers.push(format!("\"{structure}.{field}\""));
-                writeln!(get, "\"{field}\" => Err(pointer()),").expect("a String takes writes");
-                writeln!(set, "\"{field}\" => Err(pointer()),").expect("a String takes writes");
+                pointers.push(format!("\"{structure}.{named}\""));
+                writeln!(get, "\"{named}\" => Err(pointer()),").expect("a String takes writes");
+                writeln!(set, "\"{named}\" => Err(pointer()),").expect("a String takes writes");
                 continue;
             };
-            names.push(format!("\"{field}\""));
-            writeln!(encode, "fields.insert(\"{field}\".to_owned(), {encoding});")
+            names.push(format!("\"{named}\""));
+            writeln!(encode, "fields.insert(\"{named}\".to_owned(), {encoding});")
                 .expect("a String takes writes");
-            writeln!(get, "\"{field}\" => {getting},").expect("a String takes writes");
-            writeln!(set, "\"{field}\" => {setting},").expect("a String takes writes");
+            writeln!(get, "\"{named}\" => {getting},").expect("a String takes writes");
+            writeln!(set, "\"{named}\" => {setting},").expect("a String takes writes");
         }
         let names = names.join(", ");
         writeln!(
