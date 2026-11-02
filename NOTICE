@@ -1,4 +1,4 @@
-Colophon MCP's release archives carry the server and the firmware it reads.
+Colophon MCP's release archives and its npm package carry the server and the firmware it reads.
 
 The server is under the MIT licence in LICENSE. The firmware in roms/ is not: it is the machines' own, and it is carried under the permissions Amstrad and Locomotive Software gave emulators in 1999.
 

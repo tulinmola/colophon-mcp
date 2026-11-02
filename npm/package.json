@@ -1,0 +1,38 @@
+{
+  "name": "colophon-mcp",
+  "description": "The Amstrad CPC 464, 664 and 6128 and the ZX Spectrum 48K, with their firmware, handed to an agent over the Model Context Protocol.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "emulator",
+    "amstrad",
+    "cpc",
+    "zx-spectrum",
+    "z80"
+  ],
+  "license": "SEE LICENSE IN NOTICE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tulinmola/colophon-mcp.git"
+  },
+  "mcpName": "io.github.tulinmola/colophon-mcp",
+  "type": "module",
+  "bin": {
+    "colophon-mcp": "colophon-mcp.js"
+  },
+  "files": [
+    "colophon-mcp.js",
+    "servers",
+    "roms",
+    "NOTICE"
+  ],
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

@@ -4,13 +4,14 @@ on:
   push:
     tags: ["v*"]
   pull_request:
-    paths: [".github/workflows/release.yml", "NOTICE"]
+    paths: [".github/workflows/release.yml", "NOTICE", "npm/**", "tests/build-name.sh"]
 
 permissions:
   contents: read
 
 jobs:
-  # One commit of the emulator for every platform, and for failed jobs run again.
+  # One commit of the emulator for every platform, kept when failed jobs are run
+  # again.
   emulator:
     runs-on: ubuntu-24.04
     outputs:
@@ -97,18 +98,13 @@ jobs:
       - id: build
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml)
-          expected="$version+mcp.$(git rev-parse HEAD).emulator.$(git -C ../colophon-emulator rev-parse HEAD)"
-          initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"release","version":"0"}}}'
-          named=$(echo "$initialize" | "target/${{ matrix.target }}/release/colophon-mcp${{ matrix.exe }}" --roms ../colophon-emulator/roms | grep -o '"version":"[^"]*"')
-          if [ "$named" != "\"version\":\"$expected\"" ]; then
-            echo "built as $named, not $expected" >&2
-            exit 1
-          fi
+          name="$version+mcp.$(git rev-parse HEAD).emulator.$(git -C ../colophon-emulator rev-parse HEAD)"
+          sh tests/build-name.sh "$name" "target/${{ matrix.target }}/release/colophon-mcp${{ matrix.exe }}" --roms ../colophon-emulator/roms
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "tagged $GITHUB_REF_NAME, but Cargo.toml names version $version" >&2
             exit 1
           fi
-          echo "name=$expected" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - run: |
           archive=colophon-mcp-${{ matrix.target }}
@@ -125,12 +121,117 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: archive-${{ matrix.target }}
           path: colophon-mcp/colophon-mcp-${{ matrix.target }}.*
           if-no-files-found: error
 
-  publish:
+  npm:
     needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*
+          path: archives
+          merge-multiple: true
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - env:
+          BUILD: ${{ needs.build.outputs.name }}
+        run: |
+          sh npm/assemble.sh "${BUILD%%+*}" archives package
+          npm pack ./package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm
+          path: colophon-mcp-*.tgz
+          if-no-files-found: error
+
+  # The package, as packed, started through npx as a client starts it, on
+  # each of its six platforms, and held to the build's name. Node's own
+  # platform and architecture pick the server, so Node must be built for the
+  # runner's architecture: an x64 Node emulated on ARM would start the x64
+  # server, and the ARM one would pass untried.
+  npm-test:
+    needs: [build, npm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-15
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+          - runner: windows-2025
+            platform: win32-x64
+          - runner: windows-11-arm
+            platform: win32-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+
+      - env:
+          BUILD: ${{ needs.build.outputs.name }}
+        run: |
+          platform=$(node -p 'process.platform + "-" + process.arch')
+          if [ "$platform" != ${{ matrix.platform }} ]; then
+            echo "Node runs as $platform, not ${{ matrix.platform }}; setup-node's architecture input names the runner's" >&2
+            exit 1
+          fi
+          sh tests/build-name.sh "$BUILD" npx --yes --package ./colophon-mcp-*.tgz colophon-mcp
+
+  # npm's trusted publishing, https://docs.npmjs.com/trusted-publishers: the
+  # registry takes a publish from the workflow named in the package's
+  # settings on npmjs.com, this one, so the repository keeps no npm token,
+  # and the registry records where the package was built. It wants npm
+  # 11.5.1 or later and Node 22.14 or later, and package.json's repository
+  # URL to match this repository exactly. A workflow is trusted only with a
+  # package that already exists, and a trusted publisher newly set expires
+  # unless its first publish comes within two days. A trusted publisher
+  # newly set allows npm publish, which this job runs, only when its
+  # settings say so.
+  publish-npm:
+    needs: npm-test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+
+      - run: npm publish ./colophon-mcp-*.tgz
+
+  publish:
+    needs: [build, publish-npm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
@@ -140,6 +241,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
+          pattern: archive-*
           path: archives
           merge-multiple: true
 
@@ -157,6 +259,6 @@ jobs:
           {
             echo "Built as \`$BUILD\`."
             echo
-            echo "Each archive holds the server, the firmware it reads in \`roms/\`, the licence and \`NOTICE\`, which gives the terms the firmware is carried under. \`SHA256SUMS\` holds the archives' hashes, and \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\` checks that one was built by this repository's release workflow. [Installing the server](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/install.en.md) says which archive to take and how a client starts it."
+            echo "\`npx -y colophon-mcp@${BUILD%%+*}\` starts the same build from npm. Each archive holds the server, the firmware it reads in \`roms/\`, the licence and \`NOTICE\`, which gives the terms the firmware is carried under. \`SHA256SUMS\` holds the archives' hashes, and \`gh attestation verify <archive> --repo $GITHUB_REPOSITORY\` checks that one was built by this repository's release workflow. [Installing the server](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/install.en.md) says which archive to take and how a client starts it."
           } > notes.md
           gh release create "$GITHUB_REF_NAME" archives/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md
