@@ -51,8 +51,10 @@ const TOOLS: [&str; 23] = [
     "type",
 ];
 // Long past anything the server does, so that a server that has stopped
-// answering fails a test rather than hanging it.
-const PATIENCE: Duration = Duration::from_secs(10);
+// answering fails a test rather than hanging it. On GitHub's macos-15-intel
+// runner, the slowest the tests run on, a run of 600 frames has taken more
+// than 10 seconds since the emulator gained its five types of 6845.
+const PATIENCE: Duration = Duration::from_secs(60);
 
 // Stand-ins for the firmware, at the sizes the machines read.
 struct Roms(PathBuf);
