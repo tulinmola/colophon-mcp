@@ -305,10 +305,17 @@ static const char *sector_problem(const floppy_t *written, const floppy_sector_t
   return NULL;
 }
 
-/* A track is read and written only once it is formatted:
-   `track->formatted && !track->unreadable` in readable_track, and
-   `!track->formatted` refused in floppy_write_byte and floppy_format_track. */
+/* A format takes any track, formatted or not: it fills the track's room
+   from image_offset, `floppy->image[offset + byte] = filler`, and sets
+   its sectors afresh from `track->sector_count = 0`. Every other use
+   waits for a formatted track: `track->formatted && !track->unreadable`
+   in readable_track, and `!track->formatted` refused in
+   floppy_write_byte and floppy_data_written. */
 static const char *track_problem(const floppy_t *written, const floppy_track_t *track) {
+  if (track->image_offset > written->image_length ||
+      written->image_length - track->image_offset < track->room) {
+    return "a track's room, from its image_offset, runs past image_length";
+  }
   if (!track->formatted) {
     return NULL;
   }
@@ -321,12 +328,6 @@ static const char *track_problem(const floppy_t *written, const floppy_track_t *
   if (track->sector_count > FLOPPY_MAX_SECTORS) {
     return "a formatted track's sector_count is above 29, the most sectors a track holds";
   }
-  /* floppy_format_track fills the track's room from image_offset:
-     `floppy->image[offset + byte] = filler`. */
-  if (track->image_offset > written->image_length ||
-      written->image_length - track->image_offset < track->room) {
-    return "a formatted track's room, from its image_offset, runs past image_length";
-  }
   for (uint8_t index = 0; index < track->sector_count; index++) {
     const char *problem = sector_problem(written, &track->sectors[index]);
     if (problem != NULL) {
@@ -338,7 +339,7 @@ static const char *track_problem(const floppy_t *written, const floppy_track_t *
 
 /* The bounds below are where floppy.c trusts a disc's fields without checking
    them, because no path of its own takes a field outside them: the line
-   quoted beside each is the use. colophon-emulator at 7a23101. */
+   quoted beside each is the use. colophon-emulator at 20f1c15. */
 const char *mcp_floppy_check(const floppy_t *written) {
   /* floppy_format_track's room past the image: `if (needed >
      floppy->image_capacity - floppy->image_length) {`. */

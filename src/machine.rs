@@ -2925,9 +2925,17 @@ mod tests {
         };
         let length = u32::try_from(standing.image_length).unwrap();
         assert_eq!(check(&room(length - 0x200, 0x200)), Ok(()));
-        refused(&room(length - 0x200, 0x201), "a formatted track's room");
+        refused(&room(length - 0x200, 0x201), "a track's room");
         assert_eq!(check(&room(length, 0)), Ok(()));
-        refused(&room(length + 1, 0), "a formatted track's room");
+        refused(&room(length + 1, 0), "a track's room");
+        assert_eq!(
+            check(&|floppy| floppy.tracks[1][0].image_offset = length),
+            Ok(())
+        );
+        refused(
+            &|floppy| floppy.tracks[1][0].image_offset = length + 1,
+            "a track's room",
+        );
         let reading = |offset: u32, recorded: u32, copies: u32, extent: u32| {
             move |floppy: &mut floppy_t| {
                 let sector = &mut floppy.tracks[0][0].sectors[0];
@@ -2948,8 +2956,9 @@ mod tests {
 
     // Every byte of a track read on several revolutions, each sector read at
     // either end of each reading, every byte written, each sector written
-    // whole, and the track formatted again, into its own room and then past
-    // the image, so that wherever a disc's fields send floppy.c, it goes.
+    // whole, and the track formatted, or formatted again, into its own room
+    // and then past the image, so that wherever a disc's fields send
+    // floppy.c, it goes.
     fn every_use_of(disc: &super::Disc, cylinder: u8, side: u8) {
         let floppy = disc.floppy.as_ptr();
         let positions: Vec<u32> = (0..2 * FLOPPY_BYTES_PER_REVOLUTION)
@@ -2997,7 +3006,8 @@ mod tests {
     // the disc made, under the sanitizers: with the track first on the disc
     // and last, where a sector past the track's runs off the medium, and with
     // the image's buffer as the disc was given and as long as the image, where
-    // a read or a write past the image runs off the buffer.
+    // a read or a write past the image runs off the buffer; and with the track
+    // formatted and not, since a format takes a track the disc never had.
     #[test]
     #[ignore = "under the sanitizers: make test-sanitized"]
     fn nothing_the_disc_check_lets_through_runs_out_of_bounds() {
@@ -3035,7 +3045,12 @@ mod tests {
                 let sectors = track["sectors"].as_array().unwrap()[..2].to_vec();
                 track["sectors"] = Value::from(sectors);
                 reached.insert(format!("tracks[{cylinder}][{side}]"), track);
-                let trials = trials(&Value::Object(reached), &[("", &[])]);
+                let unformatted = format!("tracks[{cylinder}][{side}].formatted");
+                let contexts: [(&str, &[(&str, Value)]); 2] = [
+                    ("", &[]),
+                    ("", &[(unformatted.as_str(), Value::from(false))]),
+                ];
+                let trials = trials(&Value::Object(reached), &contexts);
                 let (swept, refused) = sweep(&*standing, &trials, |written| {
                     let Some(written) = written else { return false };
                     let floppy = Handed::new(Box::new(written));
@@ -3052,7 +3067,7 @@ mod tests {
             }
         }
         assert!(
-            ran > 1500 && checked_out > 400,
+            ran > 3200 && checked_out > 600,
             "{ran} ran, {checked_out} checked out"
         );
     }
