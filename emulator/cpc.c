@@ -54,12 +54,7 @@ static held_t held(const cpc_t *cpc, uint16_t address) {
   };
 }
 
-/* The location an address reaches, as cpc_remap pages it: an enabled ROM
-   answers reads, a number with no upper ROM fitted selecting ROM 0's socket,
-   and the rest reach the RAM the configuration pages in (colophon-emulator's
-   cpc.c at 7a23101). */
-static uint32_t locate(const void *machine, uint16_t address, bool writing) {
-  const cpc_t *cpc = machine;
+uint32_t mcp_cpc_locate(const cpc_t *cpc, uint16_t address, bool writing) {
   uint32_t quarter = address >> 14;
   uint32_t offset = address & 0x3FFF;
   if (!writing && quarter == 0 && cpc->gate_array.lower_rom_enabled) {
@@ -71,6 +66,10 @@ static uint32_t locate(const void *machine, uint16_t address, bool writing) {
   }
   const uint8_t *page = writing ? cpc->write_page[quarter] : cpc->read_page[quarter];
   return (uint32_t)(page - cpc->ram) + offset;
+}
+
+static uint32_t locate(const void *machine, uint16_t address, bool writing) {
+  return mcp_cpc_locate(machine, address, writing);
 }
 
 static uint8_t peek(const void *machine, uint16_t address) { return cpc_peek(machine, address); }

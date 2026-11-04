@@ -298,6 +298,12 @@ mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *
 mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit,
                            mcp_watch_t *watch);
 
+/* The location an address reaches, as cpc_remap pages it: an enabled ROM
+ * answers reads, a number with no upper ROM fitted selecting ROM 0's socket,
+ * and the rest reach the RAM the configuration pages in (colophon-emulator's
+ * cpc.c at 7a23101). */
+uint32_t mcp_cpc_locate(const cpc_t *cpc, uint16_t address, bool writing);
+
 /* How many locations a CPC's numbering spans: to the end of the highest upper
  * ROM it has fitted, and at least to the end of ROM 0, which a number with
  * none fitted selects. */

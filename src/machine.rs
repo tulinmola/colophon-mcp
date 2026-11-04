@@ -18,7 +18,7 @@ use crate::emulator::{
     cpc_insert_disc, cpc_peek, cpc_poke, cpc_remap, cpc_set_upper_rom, cpc_snapshot_load,
     cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, floppy_give_room, floppy_t,
     gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
-    mcp_cpc_check, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_floppy_check,
+    mcp_cpc_check, mcp_cpc_locate, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_floppy_check,
     mcp_spectrum_call, mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step,
     mcp_watch_t, mcp_z80_halted_for_good, mcp_z80_start, spectrum_connect_monitor, spectrum_init,
     spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek, spectrum_poke,
@@ -749,6 +749,12 @@ impl Cpc {
         unsafe { mcp_cpc_run(self.machine.as_ptr(), frames, limit, watch) }
     }
 
+    pub fn locate(&self, address: u16, writing: bool) -> u32 {
+        // SAFETY: the machine is only read, and cpc_remap points every page
+        // outside an enabled ROM's quarter into the RAM it was handed.
+        unsafe { mcp_cpc_locate(self.machine.as_ptr(), address, writing) }
+    }
+
     // How many locations the machine has, as mcp_watch_t's counts need.
     pub fn locations(&self) -> u32 {
         // SAFETY: the machine is only read.
@@ -811,7 +817,12 @@ impl Cpc {
     // track again, and puts it in drive 0 or 1 in place of the disc there,
     // which is freed once neither the drive nor any state holds it. A refused
     // image leaves the drive as it was.
-    pub fn insert_disc(&mut self, drive: u8, contents: &[u8]) -> Result<(), String> {
+    pub fn insert_disc(
+        &mut self,
+        drive: u8,
+        contents: &[u8],
+        write_protected: bool,
+    ) -> Result<(), String> {
         assert!(drive < 2, "a CPC has drives 0 and 1, not {drive}");
         let length = contents.len();
         let mut image = vec![0; length + FORMAT_ROOM].into_boxed_slice();
@@ -833,11 +844,12 @@ impl Cpc {
         if !read {
             return Err(problem(sentence));
         }
-        // SAFETY: the room given is as far as the image's buffer reaches, and
-        // the medium is held beside the machine for as long as the drive or a
-        // state holds it.
+        // SAFETY: the room given is as far as the image's buffer reaches, the
+        // medium is in no drive yet as its tab is set, and it is held beside
+        // the machine for as long as the drive or a state holds it.
         unsafe {
             floppy_give_room(floppy.as_ptr(), length + FORMAT_ROOM);
+            (*floppy.as_ptr()).write_protected = write_protected;
             cpc_insert_disc(self.machine.as_ptr(), drive, floppy.as_ptr());
         }
         self.discs[usize::from(drive)] = Some(Rc::new(Disc::new(floppy, image)));
@@ -974,6 +986,12 @@ impl Cpc {
         // SAFETY: as for machine(): the core writes the RAM only in a call
         // that borrows the machine mutably.
         unsafe { &*self.ram.as_ptr() }
+    }
+
+    pub fn ram_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the machine is borrowed mutably, so no call into the core
+        // reads or writes the RAM while this borrow lasts.
+        unsafe { &mut *self.ram.as_ptr() }
     }
 
     pub fn framebuffer(&self) -> &[u8] {
@@ -2030,7 +2048,7 @@ mod tests {
             vec![0; 0x100],
             one_track_image(0xE5),
         ] {
-            let _ = cpc.insert_disc(0, &image);
+            let _ = cpc.insert_disc(0, &image, false);
             cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
         }
         assert!(!cpc.machine().fdc.drive.is_null());
@@ -2071,7 +2089,7 @@ mod tests {
         let (workload, _) = cpc_workload();
         let mut cpc = Cpc::new(sixty_four_k(), rom(&workload, HALT), 0);
         cpc.fit_disc_interface(true);
-        cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        cpc.insert_disc(0, &one_track_image(0xE5), false).unwrap();
         cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
         let state = cpc.state();
         let kept = Rc::clone(cpc.discs[0].as_ref().expect("a disc"));
@@ -2090,7 +2108,7 @@ mod tests {
             (*kept.floppy.as_ptr()).write_protected = !as_kept.0;
             (*kept.image.as_ptr())[0x100] = !as_kept.1;
         }
-        cpc.insert_disc(0, &one_track_image(0x00)).unwrap();
+        cpc.insert_disc(0, &one_track_image(0x00), false).unwrap();
         cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
         cpc.restore(&state);
         drop(state);
@@ -2716,7 +2734,7 @@ mod tests {
             cpc
         };
         let mut kept = build();
-        kept.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        kept.insert_disc(0, &one_track_image(0xE5), false).unwrap();
         kept.run(3, 8 * CPC_STANDARD_FRAME_TICKS, None);
         kept.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 3, None);
         let (fields, bytes) = through_a_file(kept.state().filed());
@@ -2875,7 +2893,7 @@ mod tests {
     fn the_disc_check_holds_a_disc_to_every_bound_floppy_c_trusts() {
         let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.fit_disc_interface(true);
-        cpc.insert_disc(0, &one_track_image(0xE5)).unwrap();
+        cpc.insert_disc(0, &one_track_image(0xE5), false).unwrap();
         let disc = cpc.discs[0].as_ref().expect("a disc");
         // SAFETY: the medium stands beside the machine, which is not running.
         let standing = unsafe { &*disc.floppy.as_ptr() };
@@ -3014,7 +3032,7 @@ mod tests {
         let image = one_track_image(0xE5);
         let mut cpc = Cpc::new(sixty_four_k(), rom(&[], HALT), 0);
         cpc.fit_disc_interface(true);
-        cpc.insert_disc(0, &image).unwrap();
+        cpc.insert_disc(0, &image, false).unwrap();
         let disc = cpc.discs[0].as_ref().expect("a disc");
         // SAFETY: the medium stands beside the machine, which is not running.
         let mut two = Box::new(unsafe { std::ptr::read(disc.floppy.as_ptr()) });

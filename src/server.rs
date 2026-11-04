@@ -1382,6 +1382,13 @@ struct OpenRequest {
     /// A state file that `state_save` wrote, to build the machine as the state was: a path on the server's file system. A relative path starts from the server's working directory. Give `snapshot` or `state`, not both.
     #[schemars(transform = absent_not_null)]
     state: Option<PathBuf>,
+    // The registers at power-on are the emulator's choice, "zeroes here, for
+    // determinism" (colophon-emulator's crtc.h, crtc_init, at 20f1c15). On a
+    // type 0, 1 or 2's monitor a type 4's "image is shifted to the left
+    // because HSYNC occurs 1 µsec later", and a type 3's alike (Compendium
+    // ch. 15.1 and 27.6.1, as colophon-emulator's cpc.c quotes them at
+    // syncs_follow_the_display); the picture is sampled at "the Gate Array's
+    // 16MHz pixel clock" (cpc.h, CPC_FRAMEBUFFER_WIDTH).
     /// The type of a CPC's 6845, its CRTC, numbered as the Amstrad CPC CRTC Compendium numbers them:
     /// - 0: the Hitachi HD6845S or the UMC UM6845, the type of the first CPCs. The type when `crtc_type` is left out.
     /// - 1: the UMC UM6845R.
@@ -1389,7 +1396,7 @@ struct OpenRequest {
     /// - 3: the 6845 that ASIC 40489 emulates in the CPC Plus. The machine has none of the Plus's other hardware. A program that tells the 2 ASICs apart by that hardware finds a low-cost CPC, a type 4.
     /// - 4: the 6845 that ASIC 40226 emulates, in the low-cost CPC.
     ///
-    /// Amstrad fitted 6845s from different manufacturers to the same models, so the type is a choice, not part of the model. A program that times its writes to the 6845, as many demos do, may run and draw differently on each type, and a program can find out which type it runs on. `inspect` reads the type as `crtc.type`, and `set` does not change it. Not given with `state`: a state file opens with the type it was kept with. A Spectrum has no 6845 and takes no `crtc_type`.
+    /// Amstrad fitted 6845s from different manufacturers to the same models, so the type is a choice, not part of the model. A program that times its writes to the 6845, as many demos do, may run and draw differently on each type, and a program can find out which type it runs on. Every type powers on with its registers at 0 and counts in its own way until the firmware sets them, so a program may reach the same instruction at a different tick on another type from its first frames on, and one that takes randomness from timing, such as from the R register, then runs differently. Types 3 and 4 also show the picture a microsecond, 16 of `monitor`'s pixels, further left than types 0 to 2. `inspect` reads the type as `crtc.type`, and `set` does not change it. Not given with `state`: a state file opens with the type it was kept with. A Spectrum has no 6845 and takes no `crtc_type`.
     #[schemars(range(min = 0, max = 4), transform = absent_not_null)]
     crtc_type: Option<u8>,
 }
@@ -1426,7 +1433,7 @@ struct RunRequest {
     /// - `{"read": address}` and `{"write": address}` stop at the end of an instruction that reads the byte there as data, or writes it. An instruction's own bytes are never data.
     /// - `{"in": port, "mask": bits}` and `{"out": port, "mask": bits}` stop at the end of an instruction that reads or writes a port whose address matches `port` on the bits set in `mask`, the bits the device decodes: `{"out": "&7F00", "mask": "&C000"}` is a CPC's Gate Array, `{"out": "&FE", "mask": "&01"}` a Spectrum's ULA.
     /// - `{"psg": register}`, CPC only, 0 to 15, stops at the end of an instruction that writes that PSG register. The emulator writes the selected register at every access to the PPI while port C gives the PSG the function WRITE and `psg.chip_selected` is true. A byte above 15 given with the function SELECT makes it false, as `inspect` says, and then no register is written and no `psg` condition matches.
-    /// - `{"crtc": register}`, CPC only, 0 to 31 (the 6845 has 0 to 17), stops at the end of an instruction that writes that 6845 register. Every access to a port with A14 and A9 low and A8 high, such as &BDxx, writes the selected register, an IN included, which gives it the top half of the port's address.
+    /// - `{"crtc": register}`, CPC only, 0 to 31 (the 6845 has 0 to 17), stops at the end of an instruction that writes that 6845 register. Every access to a port with A14 and A9 low and A8 high, such as &BDxx, writes the selected register, an IN included, which gives it the top half of the port's address. A match is made just after the tick the 6845 takes the write, which on types 3 and 4 is in an `OUT (C),r` or `OUT (C),0`'s 4th microsecond, not its 3rd.
     ///
     /// The options:
     /// - `"to"`: a last address or register, for a range (execute, read, write, psg, crtc).
@@ -1440,7 +1447,7 @@ struct RunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     until: Option<Value>,
     /// Conditions, written like `until`'s, whose matches are listed as the run goes; a match at the instruction the run starts on is included. At most 16.
-    /// - On a CPC a match says which memory held its byte or instruction where the address alone does not: `"rom": "lower"` or `"upper 7"`, or `"ram"`, the RAM's own address. `"pc_rom"` and `"pc_ram"` say the same for the instruction that made an access.
+    /// - On a CPC a match says which memory held its byte or instruction where the address alone does not: `"rom": "lower"` or `"upper 7"`, or `"ram"`, the RAM's own address. An upper ROM selected but not fitted is answered by ROM 0, named `"upper 0"`. `"pc_rom"` and `"pc_ram"` say the same for the instruction that made an access.
     /// - The run stops at the end of the instruction that makes the 128th match, keeping that instruction's other matches. The limit is 32 when one of gather's conditions captures, and 1048576 with `path`, capturing or not. The next run continues from there.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
@@ -1473,7 +1480,7 @@ struct RunRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     count_by: Option<CountBy>,
     /// Keys held down from the start of the run to its end, on top of what the keyboard already holds; afterwards the keyboard goes back to what it held. Names are colophon-player's, as printed on the keys; for example:
-    /// - CPC: "SPACE", "Q", "RETURN", "SHIFT", "CTRL", "COPY", "f5", "↑", and for joystick 0 "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)", "(SPARE)" and "(FIRE 2)", its main button. A CPC key may also be given by its firmware number, 0 to 79: its matrix line times 8 plus its bit.
+    /// - CPC: "SPACE", "Q", "RETURN", "SHIFT", "CTRL", "COPY", "f5", "↑", and for joystick 0 "(UP)", "(DOWN)", "(LEFT)", "(RIGHT)", "(FIRE 1)", "(SPARE)" and "(FIRE 2)", an ordinary joystick's main button; some games read "(FIRE 1)" instead. A CPC key may also be given by its firmware number, 0 to 79: its matrix line times 8 plus its bit.
     /// - Spectrum: "CAPS", "SYM", "ENTER", "SPACE", "Q".
     ///
     /// An unknown key is refused with the list of names. A program that reads the keyboard only now and then can miss a key held for less than the time between its reads. A CPC's firmware scans the keyboard every 1/50 s and marks a key released only when 2 scans in a row find it released, so its key state map still holds a key let go at the end of a run as pressed until its 2nd scan after.
@@ -1503,7 +1510,7 @@ struct CallRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     values: Option<Map<String, Value>>,
-    /// The most frames the call waits for the routine to return, 1 to 1500. Default 1500.
+    /// The most frames the call waits for the routine to return, 1 to 1500, counted as `run` counts them, by monitor retraces: the first may come at any tick after the call starts, so `frames: 1` may stop the routine almost at once. Default 1500.
     #[schemars(range(min = 1, max = MOST_FRAMES))]
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1581,6 +1588,10 @@ struct DiscRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<Drive>,
+    /// `true` puts the disc in with its write-protect tab set: the drive tells the disc controller so, and the controller refuses every write and format on it. Default `false`.
+    #[schemars(transform = absent_not_null)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_protected: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -1701,10 +1712,17 @@ struct PokeRequest {
     /// The handle `machine_open` returned.
     #[serde(skip_serializing)]
     handle: String,
-    /// The first address to write.
+    /// The first address to write, as the processor writes it. Give this or `ram`.
     #[schemars(schema_with = "address_schema")]
-    address: Value,
-    /// The bytes, as pairs of hexadecimal digits: `3E05C9` or `3E 05 C9`. 1 to 4096 bytes, none past &FFFF.
+    #[schemars(transform = absent_not_null)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<Value>,
+    /// The first address to write in a CPC's RAM, by the RAM's own addresses. Give this or `address`.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ram: Option<Value>,
+    /// The bytes, as pairs of hexadecimal digits: `3E05C9` or `3E 05 C9`. 1 to 4096 bytes. From an address, none past &FFFF; with `ram`, none past the end of the RAM.
     bytes: String,
 }
 
@@ -1962,7 +1980,6 @@ enum Stopped {
     /// The processor executed a HALT with interrupts disabled and would wait there forever: IFF1 is clear, so INT is ignored, and neither machine raises an NMI. From here:
     /// - Another run runs as asked, halted throughout, unless `set` has written in an NMI.
     /// - `call` wakes the processor for its routine, and halts it again if the routine returns within the call.
-    /// - `set` takes it past the HALT by writing `cpu.halted` as false, and so does `state_restore` of a state kept before the HALT.
     Halted,
     /// The called routine returned.
     Returned,
@@ -1970,7 +1987,7 @@ enum Stopped {
 
 #[derive(Serialize, JsonSchema)]
 struct Matched {
-    /// The machine's tick: for an `execute` match, just before the instruction begins; for an access, just after the tick that put it on the bus. A `crtc` match is made just after the tick the 6845 takes the write. On types 3 and 4 the 6845 takes an `OUT (C),r` or `OUT (C),0` write in the instruction's 4th microsecond, not its 3rd.
+    /// The machine's tick: for an `execute` match, just before the instruction begins; for an access, just after the tick that put it on the bus. A `crtc` match is made just after the tick the 6845 takes the write.
     tick: u64,
     /// The address of an instruction about to begin, in hexadecimal after &.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2000,7 +2017,7 @@ struct Matched {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     crtc: Option<u16>,
-    /// On a CPC, the ROM that held the instruction or answered the read: `"lower"`, or `"upper N"` for upper ROM N, such as `"upper 7"`. When the selected upper ROM is not fitted, ROM 0 answers, named `"upper 0"`. Not given when the RAM held the byte, nor for a write, which reaches the RAM beneath an enabled ROM.
+    /// On a CPC, the ROM that held the instruction or answered the read: `"lower"`, or `"upper N"` for upper ROM N, such as `"upper 7"`. Not given when the RAM held the byte, nor for a write, which reaches the RAM beneath an enabled ROM.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     rom: Option<String>,
@@ -2622,7 +2639,11 @@ struct Peeked {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     address: Option<Hexadecimal>,
-    /// The first address read in the RAM, in hexadecimal after &. Given with `ram`.
+    /// On a CPC, the ROM that held the first byte read, as a match names it: `"lower"`, or `"upper N"` for upper ROM N. Given with `address` when a ROM held that byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    rom: Option<String>,
+    /// The first byte's address in the RAM, in hexadecimal after &. Given with `ram`, and with `address` when the RAM held that byte at an address other than the one read, as a match gives it.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(transform = absent_not_null)]
     ram: Option<Hexadecimal>,
@@ -2632,8 +2653,14 @@ struct Peeked {
 
 #[derive(Serialize, JsonSchema)]
 struct Poked {
-    /// The first address written, in hexadecimal after &.
-    address: Hexadecimal,
+    /// The first address written, as the processor writes it, in hexadecimal after &. Given with `address`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    address: Option<Hexadecimal>,
+    /// The first byte's address in the RAM, in hexadecimal after &. Given with `ram`, and with `address` when the write reached the RAM at an address other than the one written, as a match gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    ram: Option<Hexadecimal>,
     /// The number of bytes written.
     length: u16,
 }
@@ -2669,7 +2696,6 @@ struct Monitored {
     /// Whether the picture is a whole frame:
     /// - `true`: the beam is at or before the picture's first pixel or past its last, as after a run by frames that ran all its frames.
     /// - `false`: the beam is partway through the picture. The lines above the beam, and the part of its line left of it, are from the frame being painted, and the rest from the frame before.
-    /// - Either way, a line that a frame shorter than the picture never reaches keeps what an earlier frame left there.
     whole: bool,
 }
 
@@ -3073,7 +3099,7 @@ impl Server {
     /// - A frame ends when the monitor's retrace sends the beam to the top-left corner, so a run by frames ends on a whole picture. A CPC's 6845 may never end a frame, so such a run stops after twice a standard frame's ticks for each frame asked.
     /// - A standard frame is 79872 ticks on a CPC (4 MHz) and 69888 on a Spectrum (3.5 MHz).
     /// - A run ends between instructions, a few ticks past the target, or at the first fetch of an interrupt handler if an interrupt is taken there. A run that ends inside a long chain of DD and FD prefixes answers `"settled": false`.
-    /// - A run stops early, answering `"stopped": "halted"`, at a HALT with interrupts disabled, where the processor would wait forever. Unless `set` has written in an NMI, a run that starts on such a HALT runs as asked, halted throughout.
+    /// - A run stops early, answering `"stopped": "halted"`, at a HALT with interrupts disabled, where the processor would wait forever. Unless `set` has written in an NMI, a run that starts on such a HALT runs as asked, halted throughout. Writing `cpu.halted` as false with `set`, or `state_restore` of a state kept before the HALT, takes the processor past it.
     /// - At most 1500 frames, or the ticks of 1500 standard frames, per request; run again to go further.
     /// - A run cannot be cancelled: if the client stops waiting, it still runs to its end.
     #[tool(annotations(
@@ -3191,7 +3217,7 @@ impl Server {
 
     /// Call a routine the way the machine's own CALL would: push the program counter and jump to `address`. The call ends when the routine returns: the processor is back at the pushed address with the stack pointer where it was, and registers and memory are as the routine left them. The answer has the same form as `run`'s.
     /// - `values` are written first, as `set` writes them, to pass arguments; they may move the stack pointer.
-    /// - The routine runs from what the processor reads at `address`: on a CPC, an address below &4000 while the lower ROM is enabled, or from &C000 while the upper ROM is, runs the ROM, not the RAM beneath it.
+    /// - The routine runs from what the processor reads at `address`: on a CPC, an address below &4000 while the lower ROM is enabled, or from &C000 while the upper ROM is, runs the ROM, not the RAM beneath it. On a 6128 it runs whichever RAM the configuration in force pages in: `peek` at `address` names the memory there.
     /// - Interrupts stay as they are. A run by frames leaves either machine's firmware inside its frame interrupt handler with IFF1 clear, so a routine called there runs without interrupts unless it enables them.
     /// - Keys that `set` wrote into the keyboard stay held through the call.
     /// - A processor halted on HALT is woken for the routine, and halted again if the routine returns within the call.
@@ -3316,6 +3342,7 @@ impl Server {
     /// Type text at a machine the way the emulator's command line does with --type: each character's key is held down, with the shift it needs, for 3 standard frames, then released for 3 on a CPC or 6 on a Spectrum. The answer has the same form as `run`'s.
     /// - Type only once the firmware has started: the command line waits 78 frames on a CPC and 128 on a Spectrum.
     /// - Keys are pressed, not characters handed over, so the firmware decides what they mean. On a Spectrum a letter typed at the K cursor is a keyword: "p" at the start of a line is PRINT, and "j" is LOAD.
+    /// - A character that needs a shift is typed with the shift held beside its key: SHIFT on a CPC, CAPS or SYM on a Spectrum. A program that scans the keyboard itself, not through the firmware, sees the shift as one more key down, so type letters to it in lower case.
     /// - A newline is RETURN on a CPC and ENTER on a Spectrum. On a CPC a tab is TAB, \u001b is ESC and \b is DEL. Keys that type no character, such as COPY, the function keys and the joysticks, are held with `run`'s `keys`.
     /// - ASCII only: at most 250 characters on a CPC and 166 on a Spectrum. A text with a character no key types is refused before any key goes down.
     /// - Keys that `set` wrote into the keyboard stay held while typing.
@@ -3377,6 +3404,7 @@ impl Server {
         request.path = machines::absolute(&request.path)?;
         let arguments = journaled(&request);
         let drive = request.drive.unwrap_or(Drive::A);
+        let write_protected = request.write_protected.unwrap_or(false);
         let path = request.path;
         let read = path.clone();
         let (contents, file) = Server::blocking(path.display().to_string(), move || {
@@ -3391,7 +3419,7 @@ impl Server {
         };
         let given = file.clone();
         let tick = Server::ask(&request.handle, orders, move |built| {
-            built.insert_disc(number, &contents)?;
+            built.insert_disc(number, &contents, write_protected)?;
             built.record(built.tick(), "disc_insert", arguments, Some(given), None);
             Ok::<_, String>(built.tick())
         })
@@ -3723,7 +3751,7 @@ impl Server {
         Ok(Json(Written { values: written }))
     }
 
-    /// Read a machine's memory. With `address`, as the processor reads it, through the banking and the ROMs in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. With `ram`, a CPC's RAM itself, by its own addresses, whatever is paged in: &0000 is the RAM under that ROM, and a 6128's second 64K is &10000 to &1FFFF.
+    /// Read a machine's memory. With `address`, as the processor reads it, through the banking and the ROMs in front of the RAM: on a CPC with its lower ROM enabled, &0000 reads the ROM. With `ram`, a CPC's RAM itself, by its own addresses, whatever is paged in: &0000 is the RAM under that ROM, and a 6128's second 64K is &10000 to &1FFFF. With `address` on a CPC, the answer names the memory that held the first byte, as a match does: `rom` for a ROM, or `ram` when the RAM held it at another address, which happens at some addresses under a 6128's RAM configurations 1 to 7. A run stops under whatever configuration the program left in force, so read a program's variables with `ram`. Bytes past the next 16K boundary, &0000 included where a span from `cpu.sp` or `cpu.pc` wraps, may come from another memory than the first byte's.
     #[tool(annotations(read_only_hint = true, open_world_hint = false))]
     async fn peek(
         &self,
@@ -3731,19 +3759,23 @@ impl Server {
     ) -> Result<Json<Peeked>, String> {
         let length = request.length.unwrap_or(1);
         let (_, orders) = self.thread(&request.handle)?;
-        let (address, ram, bytes) = match (&request.address, &request.ram) {
+        let (address, rom, ram, bytes) = match (&request.address, &request.ram) {
             (Some(given), None) => {
                 let (start, address) = start(given)?;
                 let length = match start {
                     START_ADDRESS => span(address, length)?,
                     _ => bytes_asked(length)?,
                 };
-                let (address, bytes) = Server::ask(&request.handle, orders, move |built| {
-                    let address = built.start(start, address);
-                    (address, built.peek(address, length))
-                })
-                .await?;
-                (Some(Hexadecimal::address(address)), None, bytes)
+                let (address, location, bytes) =
+                    Server::ask(&request.handle, orders, move |built| {
+                        let address = built.start(start, address);
+                        let location = built.locate(address, false);
+                        (address, location, built.peek(address, length))
+                    })
+                    .await?;
+                let (rom, ram) =
+                    location.map_or((None, None), |location| holder(location, address));
+                (Some(Hexadecimal::address(address)), rom, ram, bytes)
             }
             (None, Some(given)) => {
                 let ram = ram_address(given).map_err(|problem| format!("ram {problem}"))?;
@@ -3752,7 +3784,7 @@ impl Server {
                     built.peek_ram(ram, length)
                 })
                 .await??;
-                (None, Some(Hexadecimal::ram(ram)), bytes)
+                (None, None, Some(Hexadecimal::ram(ram)), bytes)
             }
             _ => {
                 return Err(
@@ -3765,6 +3797,7 @@ impl Server {
         };
         Ok(Json(Peeked {
             address,
+            rom,
             ram,
             bytes: digit_pairs(&bytes),
         }))
@@ -3856,7 +3889,7 @@ impl Server {
         }))
     }
 
-    /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. After a run by frames that answered `"stopped": "limit"`, the picture may hold lines painted long before the answer's `tick`, as on a CPC whose 6845 has R0 below R2 and so gives no line sync. A machine that has not run yet shows an unpainted picture. The picture's size and crop:
+    /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. Either way, lines that a frame shorter than the picture never reaches keep what an earlier frame left there. After a run by frames that answered `"stopped": "limit"`, the picture may hold lines painted long before the answer's `tick`, as on a CPC whose 6845 has R0 below R2 and so gives no line sync. A machine that has not run yet shows an unpainted picture. The picture's size and crop:
     /// - CPC: 768 by 544, samples 208 to 975 of a line's 1024 and lines 34 to 305 of 312, each line drawn twice.
     /// - Spectrum: 352 by 264, samples 96 to 447 of 448 and lines 20 to 283 of 312.
     #[tool(
@@ -3993,7 +4026,7 @@ impl Server {
         }))
     }
 
-    /// Write a machine's memory as its processor would: a write under a CPC's ROMs goes to the RAM beneath them, and a write into a Spectrum's ROM is lost.
+    /// Write a machine's memory. With `address`, as its processor would: a write under a CPC's ROMs goes to the RAM beneath them, and a write into a Spectrum's ROM is lost. With `ram`, a CPC's RAM itself, by its own addresses, whatever is paged in, as `peek` reads it. With `address` on a CPC, the answer gives `ram` when the first byte went to the RAM at another address, as `peek` names it; bytes past the next 16K boundary may go to another memory.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -4004,21 +4037,52 @@ impl Server {
         &self,
         Parameters(request): Parameters<PokeRequest>,
     ) -> Result<Json<Poked>, String> {
-        let address = address(&request.address)?;
         let bytes = bytes(&request.bytes)?;
-        let length = span(address, i64::try_from(bytes.len()).unwrap_or(i64::MAX))?;
+        let length = bytes.len();
         let (_, orders) = self.thread(&request.handle)?;
         let mut arguments = journaled(&request);
-        arguments["address"] = json!(Hexadecimal::address(address));
-        Server::ask(&request.handle, orders, move |built| {
-            built.poke(address, &bytes);
-            built.record(built.tick(), "poke", arguments, None, None);
-        })
-        .await?;
-        Ok(Json(Poked {
-            address: Hexadecimal::address(address),
-            length,
-        }))
+        match (&request.address, &request.ram) {
+            (Some(given), None) => {
+                let address = address(given)?;
+                let length = span(address, i64::try_from(length).unwrap_or(i64::MAX))?;
+                arguments["address"] = json!(Hexadecimal::address(address));
+                let location = Server::ask(&request.handle, orders, move |built| {
+                    let location = built.locate(address, true);
+                    built.poke(address, &bytes);
+                    built.record(built.tick(), "poke", arguments, None, None);
+                    location
+                })
+                .await?;
+                let (_, ram) = location.map_or((None, None), |location| holder(location, address));
+                Ok(Json(Poked {
+                    address: Some(Hexadecimal::address(address)),
+                    ram,
+                    length,
+                }))
+            }
+            (None, Some(given)) => {
+                let ram = ram_address(given).map_err(|problem| format!("ram {problem}"))?;
+                let length = bytes_asked(i64::try_from(length).unwrap_or(i64::MAX))?;
+                arguments["ram"] = json!(Hexadecimal::ram(ram));
+                Server::ask(&request.handle, orders, move |built| {
+                    built.poke_ram(ram, &bytes)?;
+                    built.record(built.tick(), "poke", arguments, None, None);
+                    Ok::<_, String>(())
+                })
+                .await??;
+                Ok(Json(Poked {
+                    address: None,
+                    ram: Some(Hexadecimal::ram(ram)),
+                    length,
+                }))
+            }
+            _ => Err(
+                "give address or ram, exactly one: {\"address\": \"&C000\"} writes as the \
+                 processor does, through the banking, and {\"ram\": \"&1C000\"} writes a CPC's \
+                 RAM by its own addresses"
+                    .to_owned(),
+            ),
+        }
     }
 }
 

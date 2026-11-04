@@ -2019,7 +2019,7 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
     };
     assert_eq!(
         peek(&mut session, json!({ "address": 0 })),
-        json!({ "address": "&0000", "bytes": "11" })
+        json!({ "address": "&0000", "rom": "lower", "bytes": "11" })
     );
     assert_eq!(
         peek(&mut session, json!({ "ram": 0 })),
@@ -2077,8 +2077,206 @@ fn peek_reads_a_cpcs_ram_by_its_own_addresses() {
     let spectrum = session.open("spectrum48");
     assert_eq!(
         refused(&mut session, &spectrum, json!({ "ram": "&4000" })),
-        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+        "ram names a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
          read it with address"
+    );
+}
+
+// A CPC's RAM written by its own addresses, as peek reads it, whatever is
+// paged in: under the lower ROM at &0000, and across the end of the first 64K
+// into the second's first block, which RAM configuration 4 pages in at &4000
+// among the first's blocks 0, 2 and 3 (cpctech's "Ram management").
+#[test]
+fn poke_writes_a_cpcs_ram_by_its_own_addresses() {
+    let roms = Roms::programmed("cpc6128.rom", &[0x11]);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let poke = |session: &mut Session, handle: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer("poke", arguments)
+    };
+    assert_eq!(
+        poke(&mut session, &handle, json!({ "ram": 0, "bytes": "AA" })),
+        json!({ "ram": "&0000", "length": 1 })
+    );
+    assert_eq!(
+        poke(
+            &mut session,
+            &handle,
+            json!({ "ram": "&FFFF", "bytes": "BB CC DD" })
+        ),
+        json!({ "ram": "&FFFF", "length": 3 })
+    );
+    assert_eq!(session.peek(&handle, json!(0), 1), "11");
+    session.set(
+        &handle,
+        json!({
+            "gate_array.lower_rom_enabled": false,
+            "gate_array.upper_rom_enabled": false,
+            "mmr": 0xC4
+        }),
+    );
+    assert_eq!(session.peek(&handle, json!(0), 1), "AA");
+    assert_eq!(session.peek(&handle, json!("&FFFF"), 1), "BB");
+    assert_eq!(session.peek(&handle, json!("&4000"), 2), "CCDD");
+    let journal = session.answer("journal", json!({ "handle": handle }));
+    assert_eq!(
+        (
+            &journal["entries"][1]["arguments"],
+            &journal["entries"][2]["arguments"]
+        ),
+        (
+            &json!({ "ram": "&0000", "bytes": "AA" }),
+            &json!({ "ram": "&FFFF", "bytes": "BB CC DD" })
+        )
+    );
+    let refused = |session: &mut Session, handle: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.refusal("poke", arguments)
+    };
+    assert_eq!(
+        refused(
+            &mut session,
+            &handle,
+            json!({ "ram": "&1FFFF", "bytes": "0102" })
+        ),
+        "2 bytes from &1FFFF run past &1FFFF, the end of the RAM; give at most 1 from there"
+    );
+    assert_eq!(
+        refused(
+            &mut session,
+            &handle,
+            json!({ "ram": 0, "bytes": "00".repeat(4097) })
+        ),
+        "give 1 to 4096 bytes, not 4097"
+    );
+    let either = "give address or ram, exactly one: {\"address\": \"&C000\"} writes as the \
+                  processor does, through the banking, and {\"ram\": \"&1C000\"} writes a CPC's \
+                  RAM by its own addresses";
+    assert_eq!(
+        refused(&mut session, &handle, json!({ "bytes": "00" })),
+        either
+    );
+    assert_eq!(
+        refused(
+            &mut session,
+            &handle,
+            json!({ "address": 0, "ram": 0, "bytes": "00" })
+        ),
+        either
+    );
+    for (ram, bytes) in [("&0000", "AA"), ("&1FFFF", "00")] {
+        assert_eq!(
+            session.answer("peek", json!({ "handle": handle, "ram": ram }))["bytes"],
+            bytes
+        );
+    }
+    let cpc464 = session.open("cpc464");
+    assert_eq!(
+        refused(
+            &mut session,
+            &cpc464,
+            json!({ "ram": "&10000", "bytes": "00" })
+        ),
+        "ram &10000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
+    );
+    let spectrum = session.open("spectrum48");
+    assert_eq!(
+        refused(
+            &mut session,
+            &spectrum,
+            json!({ "ram": "&4000", "bytes": "00" })
+        ),
+        "ram names a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+         write it with address"
+    );
+}
+
+// A CPC's answer to an address names the memory its first byte was in, as a
+// match names it: the lower ROM at &0000 while it is enabled; at &C000 the
+// upper ROM selected, AMSDOS at 7, or ROM 0 for one not fitted, since "BASIC
+// will be selected if an attempt is made to select a rom which is not
+// connected" (cpctech's "Expansion ROM Selection",
+// https://web.archive.org/web/20190604090025/http://cpctech.cpc-live.com/docs/exprom.html);
+// and at &4000 the second 64K's block 3 under RAM configuration 7, and the
+// first 64K's block 3 under configuration 3 (cpctech's "Ram management"). A
+// write under a ROM reaches the RAM at its own address, and configuration 0
+// holds every block at its own, so neither names one; nor does a Spectrum,
+// whose memory is never paged.
+#[test]
+fn peek_and_poke_at_an_address_name_the_memory_they_reach() {
+    let roms = Roms::programmed("cpc6128.rom", &[0x11]);
+    let mut session = Session::start(&roms);
+    let cpc = session.open("cpc6128");
+    let at = |session: &mut Session, handle: &str, tool: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        session.answer(tool, arguments)
+    };
+    assert_eq!(
+        at(&mut session, &cpc, "peek", json!({ "address": 0 })),
+        json!({ "address": "&0000", "rom": "lower", "bytes": "11" })
+    );
+    assert_eq!(
+        at(
+            &mut session,
+            &cpc,
+            "poke",
+            json!({ "address": 0, "bytes": "AA" })
+        ),
+        json!({ "address": "&0000", "length": 1 })
+    );
+    for (number, rom) in [(0, "upper 0"), (7, "upper 7"), (5, "upper 0")] {
+        session.set(
+            &cpc,
+            json!({ "gate_array.upper_rom_enabled": true, "upper_rom_number": number }),
+        );
+        assert_eq!(
+            at(&mut session, &cpc, "peek", json!({ "address": "&C000" }))["rom"],
+            rom
+        );
+    }
+    session.set(
+        &cpc,
+        json!({
+            "gate_array.lower_rom_enabled": false,
+            "gate_array.upper_rom_enabled": false,
+            "mmr": 0xC7
+        }),
+    );
+    assert_eq!(
+        at(
+            &mut session,
+            &cpc,
+            "poke",
+            json!({ "address": "&421E", "bytes": "5A" })
+        ),
+        json!({ "address": "&421E", "ram": "&1C21E", "length": 1 })
+    );
+    assert_eq!(
+        at(&mut session, &cpc, "peek", json!({ "address": "&421E" })),
+        json!({ "address": "&421E", "ram": "&1C21E", "bytes": "5A" })
+    );
+    session.set(&cpc, json!({ "mmr": 0xC3 }));
+    assert_eq!(
+        at(&mut session, &cpc, "peek", json!({ "address": "&4000" }))["ram"],
+        "&C000"
+    );
+    session.set(&cpc, json!({ "mmr": 0xC0 }));
+    assert_eq!(
+        at(&mut session, &cpc, "peek", json!({ "address": "&421E" })),
+        json!({ "address": "&421E", "bytes": "00" })
+    );
+    let spectrum = session.open("spectrum48");
+    assert_eq!(
+        at(&mut session, &spectrum, "peek", json!({ "address": 0 }))
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["address", "bytes"]
     );
 }
 
@@ -2361,7 +2559,7 @@ fn find_says_what_would_have_worked() {
     );
     assert_eq!(
         refused(json!({ "bytes": "00", "ram": "&4000" })),
-        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+        "ram names a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
          search it with address"
     );
     let found = session.answer(
@@ -3093,7 +3291,10 @@ fn read_back(session: &mut Session, handle: &str, capture: &Value) -> Value {
     for span in capture["memory"].as_array().unwrap() {
         let mut span = span.clone();
         span["handle"] = json!(handle);
-        memory.push(session.answer("peek", span));
+        // A captured span is its address and its bytes, without the memory a
+        // CPC's peek names.
+        let peeked = session.answer("peek", span);
+        memory.push(json!({ "address": peeked["address"], "bytes": peeked["bytes"] }));
     }
     json!({ "values": values, "memory": memory })
 }
@@ -6618,7 +6819,7 @@ fn disassemble_says_what_would_have_worked_with_ram() {
     assert_eq!(refused(&cpc464, json!({ "address": 0, "ram": 0 })), either);
     assert_eq!(
         refused(&spectrum, json!({ "ram": "&4000" })),
-        "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
+        "ram names a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to &FFFF, so \
          disassemble it with address"
     );
     assert_eq!(
@@ -8318,6 +8519,48 @@ fn a_disc_goes_into_a_cpcs_drive_named_by_its_hash() {
         );
     }
     assert_eq!(fs::read(&path).unwrap(), disc);
+}
+
+// A disc put in write-protected is so to the disc controller, which answers
+// SENSE DRIVE STATUS, &04, for unit 0 with ST3, whose bit 6, WP, gives "the
+// status of the Write Protected signal from the FDD"; each byte goes through
+// the data register once RQM, bit 7 of the main status register, says it "is
+// ready to send or receive data" (µPD765A datasheet, NEC, as cpctech
+// transcribes it,
+// https://web.archive.org/web/20250528190912/https://cpctech.cpcwiki.de/docs/upd765a/necfdc.htm).
+// A CPC reads the main status register at &FB7E and the data register at
+// &FB7F ("Floppy disc controller and Floppy disc drives", cpctech,
+// https://web.archive.org/web/20250703015258/https://cpctech.cpcwiki.de/docs/fdc.html).
+#[test]
+fn a_disc_put_in_write_protected_is_so_to_the_disc_controller() {
+    let ready = [LD_C, 0x7E, IN_A_C[0], IN_A_C[1], AND_N, 0x80, JR_Z, 0xFA];
+    let mut program = vec![DI, LD_BC, 0x7E, 0xFB];
+    for byte in [0x04, 0x00] {
+        program.extend(ready);
+        program.extend([LD_C, 0x7F, LD_A, byte, OUT_C_A[0], OUT_C_A[1]]);
+    }
+    program.extend(ready);
+    program.extend([LD_C, 0x7F, IN_A_C[0], IN_A_C[1], LD_TO_A, 0x00, 0x80, HALT]);
+    let roms = Roms::programmed("cpc6128.rom", &program);
+    let disc = roms.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::start(&roms);
+    for (given, protected) in [(None, false), (Some(false), false), (Some(true), true)] {
+        let handle = session.open("cpc6128");
+        let mut arguments = json!({ "handle": handle, "path": disc });
+        if let Some(given) = given {
+            arguments["write_protected"] = json!(given);
+        }
+        session.answer("disc_insert", arguments.clone());
+        assert_eq!(
+            session.run(&handle, json!({ "frames": 1 }))["stopped"],
+            "halted"
+        );
+        let st3 = u8::from_str_radix(&session.peek(&handle, json!("&8000"), 1), 16).unwrap();
+        assert_eq!(st3 & 0x40 != 0, protected, "{given:?}");
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        arguments.as_object_mut().unwrap().remove("handle");
+        assert_eq!(journal["entries"][1]["arguments"], arguments);
+    }
 }
 
 #[test]
@@ -11289,6 +11532,105 @@ fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
         );
         assert_eq!(fs::read(&path).unwrap(), blank);
     }
+}
+
+// Every type of 6845 powers on with its registers at 0 (colophon-emulator's
+// crtc.h, crtc_init) and counts in its own way until the firmware sets them,
+// so the firmware's interrupts at &0038 come at other ticks on types 0, 1 and
+// 2 within its first two frames. On a type 0, 1 or 2's monitor a type 4's
+// "image is shifted to the left because HSYNC occurs 1 µsec later", and a
+// type 3's alike (Compendium ch. 15.1 and 27.6.1, as colophon-emulator's cpc.c
+// quotes them at syncs_follow_the_display): BASIC's opening screen, sampled
+// at "the Gate Array's 16MHz pixel clock" (cpc.h), stands 16 samples further
+// left on either than on a type 0.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_6845s_type_moves_the_firmwares_timing_and_the_asics_the_picture() {
+    let mut session = Session::reading(&firmware());
+    let mut interrupted = Vec::new();
+    let mut pictures = Vec::new();
+    for crtc_type in 0..5 {
+        let opened = session.answer(
+            "machine_open",
+            json!({ "machine": "cpc6128", "crtc_type": crtc_type }),
+        );
+        let handle = opened["handle"].as_str().unwrap().to_owned();
+        let gathered = session.run(
+            &handle,
+            json!({ "ticks": 2 * CPC_FRAME_TICKS, "gather": [{ "execute": "&0038" }] }),
+        );
+        let ticks: Vec<Value> = gathered["gathered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|seen| seen["tick"].clone())
+            .collect();
+        interrupted.push(ticks);
+        session.run(&handle, json!({ "frames": 78 }));
+        pictures.push(session.pictured("monitor", json!({ "handle": handle })).1);
+    }
+    for (one, other) in [(0, 1), (0, 2), (1, 2)] {
+        assert_ne!(interrupted[one], interrupted[other], "{interrupted:?}");
+    }
+    let standard = &pictures[0];
+    for asic in [3, 4] {
+        let shown = &pictures[asic];
+        let shifted = (0..standard.height).all(|line| {
+            let row = line * standard.width;
+            (0..standard.width - 16)
+                .all(|x| shown.indices[row + x] == standard.indices[row + x + 16])
+        });
+        assert!(shifted, "type {asic}");
+        assert_ne!(shown.indices, standard.indices, "type {asic}");
+    }
+}
+
+// A program SAVEd to a disc put in write-protected is refused: AMSDOS takes the
+// controller's "not writeable" flag in ST1 for a write-protected drive and
+// shows its message &12, "Drive <drive>: disc " (message &18), "is ", "write"
+// (message &1C), " protected", and asks "Retry, Ignore or Cancel?" (Kevin
+// Thacker's "Disassembly of AMSDOS ROM",
+// https://web.archive.org/web/20260721051000/https://cpctech.cpcwiki.de/docs/amsdos.asm,
+// at &C90C to &C914, &CA7A and &CAB8, and in its message table). The file
+// given is still blank.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn amsdos_says_a_write_protected_disc_is_write_protected() {
+    let scratch = Roms::new(&[]);
+    let blank = blank_data_disc();
+    let path = scratch.write("blank.dsk", &blank);
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    let font = cpc_font(&mut session, &handle, "cpc6128");
+    session.answer(
+        "disc_insert",
+        json!({ "handle": handle, "path": path, "write_protected": true }),
+    );
+    session.answer(
+        "type",
+        json!({ "handle": handle, "text": "10 PRINT 2+2\nSAVE\"EXAMPLE\"\n" }),
+    );
+    session.run(&handle, json!({ "frames": 250 }));
+    let text = cpc_text(&mut session, &handle, &scratch, &font);
+    let typed = text
+        .iter()
+        .rposition(|line| line == "SAVE\"EXAMPLE\"")
+        .expect("SAVE");
+    let shown: Vec<&str> = text[typed + 1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.is_empty())
+        .collect();
+    // The cursor, which no matrix draws, waits after the question.
+    assert_eq!(
+        shown,
+        [
+            "Drive A: disc is write protected",
+            "Retry, Ignore or Cancel? ?"
+        ]
+    );
+    assert_eq!(fs::read(&path).unwrap(), blank);
 }
 
 // As it starts, AMSDOS calls its "BIOS: SETUP DISC" with its "default BIOS:

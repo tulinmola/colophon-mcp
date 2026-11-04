@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -373,7 +374,7 @@ pub struct Entry {
     pub tick: u64,
     /// The tool called.
     pub tool: String,
-    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute; `crtc_type` in a CPC's `machine_open`, whether given or not.
+    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, `poke`'s `ram`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute; `crtc_type` in a CPC's `machine_open`, whether given or not.
     #[schemars(schema_with = "crate::server::values_schema")]
     pub arguments: Value,
     /// The snapshot, disc or tape the request read, with the SHA-256 of what it held.
@@ -1092,9 +1093,14 @@ impl Built {
 
     // Machine::disc and Machine::tape read a file only for a machine that
     // takes it.
-    pub fn insert_disc(&mut self, drive: u8, contents: &[u8]) -> Result<(), String> {
+    pub fn insert_disc(
+        &mut self,
+        drive: u8,
+        contents: &[u8],
+        write_protected: bool,
+    ) -> Result<(), String> {
         match &mut self.hardware {
-            Hardware::Cpc(cpc) => cpc.insert_disc(drive, contents),
+            Hardware::Cpc(cpc) => cpc.insert_disc(drive, contents, write_protected),
             Hardware::Spectrum(_) => unreachable!("a Spectrum is given no disc"),
         }
     }
@@ -1585,7 +1591,7 @@ impl Built {
         match &self.hardware {
             Hardware::Cpc(cpc) => Ok(cpc.ram()),
             Hardware::Spectrum(_) => Err(format!(
-                "ram reads a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to \
+                "ram names a CPC's RAM by its own addresses; a Spectrum's RAM is at &4000 to \
                  &FFFF, so {verb} it with address"
             )),
         }
@@ -1593,19 +1599,24 @@ impl Built {
 
     pub fn peek_ram(&self, ram: u32, length: u16) -> Result<Vec<u8>, String> {
         let memory = self.cpc_ram("read")?;
-        within(memory, ram, "ram")?;
-        let start = ram as usize;
-        memory
-            .get(start..start + usize::from(length))
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| {
-                format!(
-                    "{length} bytes from &{ram:04X} run past &{:04X}, the end of the RAM; give at \
-                     most {} from there",
-                    memory.len() - 1,
-                    memory.len() - start
-                )
-            })
+        Ok(memory[ram_span(memory, ram, usize::from(length))?].to_vec())
+    }
+
+    pub fn poke_ram(&mut self, ram: u32, bytes: &[u8]) -> Result<(), String> {
+        let span = ram_span(self.cpc_ram("write")?, ram, bytes.len())?;
+        if let Hardware::Cpc(cpc) = &mut self.hardware {
+            cpc.ram_mut()[span].copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    // The location a CPC's processor reaches at an address as it stands. A
+    // Spectrum's memory is never paged, so its address alone says where.
+    pub fn locate(&self, address: u16, writing: bool) -> Option<u32> {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => Some(cpc.locate(address, writing)),
+            Hardware::Spectrum(_) => None,
+        }
     }
 
     // The picture the monitor holds, cut to the window and drawn as the
@@ -1766,6 +1777,22 @@ fn within(memory: &[u8], ram: u32, named: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// The range of `length` bytes from `ram` in the RAM, refused where it runs past
+// the RAM's end.
+fn ram_span(memory: &[u8], ram: u32, length: usize) -> Result<Range<usize>, String> {
+    within(memory, ram, "ram")?;
+    let start = ram as usize;
+    if memory.len() - start < length {
+        return Err(format!(
+            "{length} bytes from &{ram:04X} run past &{:04X}, the end of the RAM; give at most {} \
+             from there",
+            memory.len() - 1,
+            memory.len() - start
+        ));
+    }
+    Ok(start..start + length)
 }
 
 // A refusal of a search whose last address, `to`, is below its first, given
