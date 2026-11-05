@@ -25,8 +25,9 @@ use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 23] = [
+const TOOLS: [&str; 24] = [
     "call",
+    "compare",
     "disassemble",
     "disc_insert",
     "find",
@@ -1323,6 +1324,7 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         let annotations = &listed(&tools, name)["annotations"];
         assert_eq!(annotations["openWorldHint"], false, "{name}: {annotations}");
         let reads = [
+            "compare",
             "disassemble",
             "find",
             "inspect",
@@ -1540,6 +1542,7 @@ fn every_tool_refuses_a_handle_never_given_with_the_handles_there_are() {
         ("screen", json!({})),
         ("disassemble", json!({ "address": 0 })),
         ("find", json!({ "bytes": "00" })),
+        ("compare", json!({ "state": "state-1" })),
         ("machine_close", json!({})),
     ] {
         let mut arguments = arguments;
@@ -1681,6 +1684,57 @@ fn a_machine_put_away_while_it_runs_holds_nothing_else_up() {
             .expect("answered")
     };
     assert!(at(ran) < at(closed), "{order:?}");
+}
+
+// Putting a machine away while a comparison with it waits behind another
+// machine's run holds nothing up, and the comparison then finds it gone.
+#[test]
+fn a_machine_put_away_while_a_comparison_waits_holds_nothing_up() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let running = session.open("cpc6128");
+    let other = session.open("cpc6128");
+    let ran = session.send_call("run", json!({ "handle": running, "frames": 300 }));
+    // Pauses of the test's own, which move no machine: time for the run to
+    // begin, and for the comparison to wait behind it.
+    thread::sleep(Duration::from_millis(100));
+    let compared = session.send_call("compare", json!({ "handle": running, "other": other }));
+    thread::sleep(Duration::from_millis(100));
+    let closed = session.send_call("machine_close", json!({ "handle": other }));
+    let answers: Vec<Value> = (0..3).map(|_| session.receive()).collect();
+    let order: Vec<&Value> = answers.iter().map(|answer| &answer["id"]).collect();
+    assert_eq!(order, [&json!(closed), &json!(ran), &json!(compared)]);
+    assert_eq!(
+        answers[2]["result"]["content"][0]["text"],
+        format!("no machine has the handle {other}; open handles: {running}")
+    );
+}
+
+// Putting a machine away while a disc or a tape for it is read holds nothing
+// up, and the request then finds the machine gone: a file as large as a
+// medium may be, read whole and hashed, takes long enough for that.
+#[test]
+fn a_machine_put_away_while_its_medium_is_read_holds_nothing_up() {
+    let roms = Roms::all();
+    let medium = roms.0.join("medium");
+    fs::write(&medium, vec![0; 16 * 1024 * 1024]).expect("the medium is written");
+    let mut session = Session::start(&roms);
+    for (machine, tool) in [("cpc6128", "disc_insert"), ("spectrum48", "tape_insert")] {
+        let handle = session.open(machine);
+        let inserted = session.send_call(tool, json!({ "handle": handle, "path": medium }));
+        let closed = session.send_call("machine_close", json!({ "handle": handle }));
+        let answers: Vec<Value> = (0..2).map(|_| session.receive()).collect();
+        let order: Vec<&Value> = answers.iter().map(|answer| &answer["id"]).collect();
+        assert_eq!(order, [&json!(closed), &json!(inserted)], "{tool}");
+        assert_eq!(
+            answers[1]["result"]["content"][0]["text"],
+            format!(
+                "no machine has the handle {handle}; no machine is open, and machine_open opens \
+                 one"
+            ),
+            "{tool}"
+        );
+    }
 }
 
 // What a machine holds is read by the path a C expression gives it on the
@@ -2609,6 +2663,335 @@ fn find_says_what_would_have_worked() {
             json!({ "handle": cpc6128, "bytes": "00", "to": "&10000" })
         ),
         format!("{plain}; give ram to search a CPC's RAM by its own addresses")
+    );
+}
+
+const UNCOMPARED: &str = "compare reads a CPC's RAM only; a Spectrum's RAM is at &4000 to &FFFF, so \
+                          peek it there in each machine and compare the bytes, and to compare with \
+                          a state, keep the machine with state_keep, peek it, then state_restore \
+                          the state, peek it again, and state_restore the kept state to go back";
+
+fn compare(session: &mut Session, handle: &str, arguments: Value) -> Value {
+    let mut arguments = arguments;
+    arguments["handle"] = json!(handle);
+    session.answer("compare", arguments)
+}
+
+fn uncompared(session: &mut Session, handle: &str, arguments: Value) -> String {
+    let mut arguments = arguments;
+    arguments["handle"] = json!(handle);
+    session.refusal("compare", arguments)
+}
+
+// A CPC's RAM compared by its own addresses, whatever is paged in: under the
+// lower ROM at &0000, and from the end of the base 64K on into the second
+// 64K's first block, which RAM configuration 4 pages in at &4000 ("Ram
+// management", cpctech).
+#[test]
+fn compare_lists_where_a_cpcs_ram_differs_from_a_state_kept_from_it() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let before = keep(&mut session, &handle);
+    for (ram, bytes) in [("&0000", "AA00BBCC"), ("&FFFF", "11")] {
+        session.answer(
+            "poke",
+            json!({ "handle": handle, "ram": ram, "bytes": bytes }),
+        );
+    }
+    session.set(&handle, json!({ "mmr": 0xC4 }));
+    session.poke(&handle, json!("&4000"), "22");
+    let whole = json!({
+        "differences": [
+            { "ram": "&0000", "bytes": "AA", "against": "00" },
+            { "ram": "&0002", "bytes": "BBCC", "against": "0000" },
+            { "ram": "&FFFF", "bytes": "1122", "against": "0000" },
+        ],
+        "count": 5,
+    });
+    assert_eq!(
+        compare(&mut session, &handle, json!({ "state": before })),
+        whole
+    );
+    session.set(&handle, json!({ "mmr": 0xC0 }));
+    assert_eq!(
+        compare(&mut session, &handle, json!({ "state": before })),
+        whole
+    );
+    assert_eq!(
+        compare(
+            &mut session,
+            &handle,
+            json!({ "state": before, "ram": "&0003", "to": "&FFFF" })
+        ),
+        json!({
+            "differences": [
+                { "ram": "&0003", "bytes": "CC", "against": "00" },
+                { "ram": "&FFFF", "bytes": "11", "against": "00" },
+            ],
+            "count": 2,
+        })
+    );
+    assert_eq!(
+        compare(
+            &mut session,
+            &handle,
+            json!({ "state": before, "ram": "&FFFF", "to": "&1FFFF" })
+        ),
+        json!({
+            "differences": [{ "ram": "&FFFF", "bytes": "1122", "against": "0000" }],
+            "count": 2,
+        })
+    );
+    assert_eq!(
+        compare(
+            &mut session,
+            &handle,
+            json!({ "state": before, "ram": "&1FFFF" })
+        ),
+        json!({ "differences": [], "count": 0 })
+    );
+    let after = keep(&mut session, &handle);
+    assert_eq!(
+        compare(&mut session, &handle, json!({ "state": after })),
+        json!({ "differences": [], "count": 0 })
+    );
+    restore(&mut session, &handle, &before);
+    assert_eq!(
+        compare(&mut session, &handle, json!({ "state": after })),
+        json!({
+            "differences": [
+                { "ram": "&0000", "bytes": "00", "against": "AA" },
+                { "ram": "&0002", "bytes": "0000", "against": "BBCC" },
+                { "ram": "&FFFF", "bytes": "0000", "against": "1122" },
+            ],
+            "count": 5,
+        })
+    );
+}
+
+#[test]
+fn compare_lists_the_first_256_runs_and_2048_bytes_and_says_where_the_rest_begin() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    let before = keep(&mut session, &handle);
+    session.poke(&handle, json!("&4000"), &"FF00".repeat(300));
+    session.poke(&handle, json!("&8000"), &"FF".repeat(3000));
+    session.poke(&handle, json!("&9000"), &"FF".repeat(2048));
+    session.poke(&handle, json!("&9801"), "FF");
+    let runs = |from: u16, runs: u16| -> Vec<Value> {
+        (0..runs)
+            .map(|run| json!({ "ram": ampersand(from + 2 * run), "bytes": "FF", "against": "00" }))
+            .collect()
+    };
+    let filled = |ram: &str, bytes: usize| json!({ "ram": ram, "bytes": "FF".repeat(bytes), "against": "00".repeat(bytes) });
+    let mut compare = |arguments: Value| {
+        let mut arguments = arguments;
+        arguments["state"] = json!(before);
+        compare(&mut session, &handle, arguments)
+    };
+    assert_eq!(
+        compare(json!({})),
+        json!({ "differences": runs(0x4000, 256), "count": 300 + 3000 + 2048 + 1, "next": "&4200" })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&4200", "to": "&7FFF" })),
+        json!({ "differences": runs(0x4200, 44), "count": 44 })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&8000", "to": "&8FFF" })),
+        json!({ "differences": [filled("&8000", 2048)], "count": 3000, "next": "&8800" })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&8800", "to": "&8FFF" })),
+        json!({ "differences": [filled("&8800", 952)], "count": 952 })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&4256", "to": "&8FFF" })),
+        json!({
+            "differences": [
+                { "ram": "&4256", "bytes": "FF", "against": "00" },
+                filled("&8000", 2047),
+            ],
+            "count": 3001,
+            "next": "&87FF",
+        })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&9000" })),
+        json!({ "differences": [filled("&9000", 2048)], "count": 2049, "next": "&9801" })
+    );
+    assert_eq!(
+        compare(json!({ "ram": "&9801", "to": "&FFFF" })),
+        json!({ "differences": [{ "ram": "&9801", "bytes": "FF", "against": "00" }], "count": 1 })
+    );
+}
+
+// Each machine's RAM is read by its own addresses, whatever it has paged in.
+#[test]
+fn compare_lists_where_two_cpcs_rams_differ_as_they_stand() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let first = session.open("cpc6128");
+    let second = session.open("cpc6128");
+    let cpc464 = session.open("cpc464");
+    for (handle, ram, bytes) in [(&first, "&FFFF", "1122"), (&second, "&4100", "33")] {
+        session.answer(
+            "poke",
+            json!({ "handle": handle, "ram": ram, "bytes": bytes }),
+        );
+    }
+    session.set(&second, json!({ "mmr": 0xC4 }));
+    assert_eq!(
+        compare(&mut session, &first, json!({ "other": second })),
+        json!({
+            "differences": [
+                { "ram": "&4100", "bytes": "00", "against": "33" },
+                { "ram": "&FFFF", "bytes": "1122", "against": "0000" },
+            ],
+            "count": 3,
+        })
+    );
+    assert_eq!(
+        compare(&mut session, &second, json!({ "other": first })),
+        json!({
+            "differences": [
+                { "ram": "&4100", "bytes": "33", "against": "00" },
+                { "ram": "&FFFF", "bytes": "0000", "against": "1122" },
+            ],
+            "count": 3,
+        })
+    );
+    assert_eq!(
+        compare(&mut session, &first, json!({ "other": first })),
+        json!({ "differences": [], "count": 0 })
+    );
+    assert_eq!(
+        compare(&mut session, &first, json!({ "other": cpc464 })),
+        json!({ "differences": [{ "ram": "&FFFF", "bytes": "11", "against": "00" }], "count": 1 })
+    );
+    assert_eq!(
+        compare(&mut session, &cpc464, json!({ "other": first })),
+        json!({ "differences": [{ "ram": "&FFFF", "bytes": "00", "against": "11" }], "count": 1 })
+    );
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &first,
+            json!({ "other": cpc464, "to": "&10000" })
+        ),
+        "to &10000 is past &FFFF, the end of the smaller RAM; give a to of &FFFF or below"
+    );
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &cpc464,
+            json!({ "other": first, "ram": "&10000" })
+        ),
+        "ram &10000 is past &FFFF, the end of the smaller RAM; give a ram of &FFFF or below"
+    );
+    let spectrum = session.open("spectrum48");
+    assert_eq!(
+        uncompared(&mut session, &first, json!({ "other": spectrum })),
+        format!("other {spectrum} is a spectrum48; give other a CPC's handle")
+    );
+    assert_eq!(
+        uncompared(&mut session, &spectrum, json!({ "other": first })),
+        UNCOMPARED
+    );
+    assert_eq!(
+        uncompared(&mut session, &first, json!({ "other": "cpc6128-9" })),
+        format!(
+            "no machine has the handle cpc6128-9; open handles: {first}, {second}, {cpc464}, {spectrum}"
+        )
+    );
+}
+
+#[test]
+fn compare_says_what_would_have_worked() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let other = session.open("cpc6128");
+    let either = "give state or other, exactly one: {\"state\": \"state-1\"} compares with a \
+                  state kept from this machine, and {\"other\": \"cpc6128-2\"} with another CPC as \
+                  it stands";
+    assert_eq!(uncompared(&mut session, &handle, json!({})), either);
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &handle,
+            json!({ "state": "state-1", "other": other })
+        ),
+        either
+    );
+    assert_eq!(
+        uncompared(&mut session, &handle, json!({ "state": "state-1" })),
+        format!(
+            "no state is named state-1; there are no states kept from {handle}; state_keep keeps \
+             one"
+        )
+    );
+    let others = keep(&mut session, &other);
+    assert_eq!(
+        uncompared(&mut session, &handle, json!({ "state": others })),
+        format!(
+            "{others} was kept from {other}; restore, save, drop or compare with it through \
+             that machine's handle"
+        )
+    );
+    let state = keep(&mut session, &handle);
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &handle,
+            json!({ "state": state, "ram": "&1000", "to": "&0FFF" })
+        ),
+        "to &0FFF is below ram &1000; give a to of &1000 or above"
+    );
+    assert!(
+        uncompared(
+            &mut session,
+            &handle,
+            json!({ "state": state, "ram": "&20000" })
+        )
+        .starts_with(
+            "ram \"&20000\" is not an address in the RAM; an address in the RAM is a number from \
+             0 to 131071"
+        )
+    );
+    assert!(
+        uncompared(
+            &mut session,
+            &handle,
+            json!({ "state": state, "to": "cpu.pc" })
+        )
+        .starts_with("to \"cpu.pc\" is not an address in the RAM")
+    );
+    let cpc464 = session.open("cpc464");
+    let state = keep(&mut session, &cpc464);
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &cpc464,
+            json!({ "state": state, "ram": "&10000" })
+        ),
+        "ram &10000 is past &FFFF, the end of the RAM; give a ram of &FFFF or below"
+    );
+    assert_eq!(
+        uncompared(
+            &mut session,
+            &cpc464,
+            json!({ "state": state, "to": "&1FFFF" })
+        ),
+        "to &1FFFF is past &FFFF, the end of the RAM; give a to of &FFFF or below"
+    );
+    let spectrum = session.open("spectrum48");
+    let state = keep(&mut session, &spectrum);
+    assert_eq!(
+        uncompared(&mut session, &spectrum, json!({ "state": state })),
+        UNCOMPARED
     );
 }
 
@@ -5531,7 +5914,13 @@ fn only_a_read_offers_sp_and_pc_as_an_address() {
     assert!(!offers("find", &property("find", "address")));
     let ram = &property("peek", "ram")["anyOf"];
     assert!(ram.is_array(), "{ram}");
-    for (tool, name) in [("find", "ram"), ("find", "to"), ("disassemble", "ram")] {
+    for (tool, name) in [
+        ("find", "ram"),
+        ("find", "to"),
+        ("disassemble", "ram"),
+        ("compare", "ram"),
+        ("compare", "to"),
+    ] {
         assert_eq!(&property(tool, name)["anyOf"], ram, "{tool} {name}");
     }
     assert!(!offers("poke", &property("poke", "address")));
@@ -9138,8 +9527,8 @@ fn a_state_is_named_kept_from_its_machine_and_refused_elsewhere() {
     assert_eq!(
         session.refusal("state_restore", json!({ "handle": cpc, "state": first })),
         format!(
-            "{first} was kept from {spectrum}; restore, save or drop it through that machine's \
-             handle"
+            "{first} was kept from {spectrum}; restore, save, drop or compare with it through \
+             that machine's handle"
         )
     );
     session.answer("state_drop", json!({ "handle": spectrum, "state": first }));
@@ -9352,8 +9741,8 @@ fn a_state_file_opens_only_as_written_by_this_build_on_its_firmware() {
     assert_eq!(
         session.refusal("state_save", save(&cpc, &state)),
         format!(
-            "{state} was kept from {spectrum}; restore, save or drop it through that machine's \
-             handle"
+            "{state} was kept from {spectrum}; restore, save, drop or compare with it through \
+             that machine's handle"
         )
     );
     save_state(&mut session, &spectrum, &state, &path);
@@ -10658,6 +11047,110 @@ fn find_finds_what_the_firmwares_listings_say_is_there() {
         json!(["&1394"])
     );
     assert_eq!(find(&cpc, json!({ "text": "Press" })), json!(["&2935"]));
+}
+
+// A foreground pixel is "set to the pen ink" and, "In the default mode,
+// opaque mode, background pixels are set to the paper ink" (SOFT 968,
+// section 4.6). TXT CUR DISABLE, &BB7E, keeps the cursor blob off the screen,
+// TXT SET PEN, &BB90, and TXT SET PAPER, &BB96, set pen 1 and paper 0, TXT
+// SET CURSOR, &BB75, takes "the required logical column" 21 and "the required
+// logical row" 13, where "Row 1, column 1 is the top left corner of the
+// window", the whole screen here, and TXT WR CHAR, &BB5D, prints "at the
+// cursor position of the currently selected stream" (their entries, section
+// 15). With an A's matrix found as cpc_font finds it, and the screen as
+// cpc_text reads it, R12 &30 and R13 0, the A's lines start at &C3E8,
+// 12 * 80 + 20 * 2 past &C000, each &800 below the last, and pen 1 is a
+// mode 1 pixel's low bit, so a line's left four pixels are bits 7 to 4 of
+// its first byte and its right four those of the next. A second machine
+// made alike, but not written to, holds what the first held before.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn compare_lists_the_bytes_a_character_written_on_the_screen_changes() {
+    let rom = fs::read(firmware().join("cpc6128.rom")).expect("the firmware");
+    let mut session = Session::reading(&firmware());
+    let ready = |session: &mut Session| {
+        let handle = session.open("cpc6128");
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+        for (address, values) in [
+            ("&BB7E", json!({})),
+            ("&BB90", json!({ "cpu.a": 1 })),
+            ("&BB96", json!({ "cpu.a": 0 })),
+            ("&BB75", json!({ "cpu.h": 21, "cpu.l": 13 })),
+            ("&BBA5", json!({ "cpu.a": 0x41 })),
+        ] {
+            let called = session.answer(
+                "call",
+                json!({ "handle": handle, "address": address, "values": values }),
+            );
+            assert_eq!(called["stopped"], "returned", "{address}: {called}");
+        }
+        handle
+    };
+    let written = ready(&mut session);
+    let unwritten = ready(&mut session);
+    assert_eq!(session.inspect(&written, "gate_array.mode"), 1);
+    let registers = session.inspect(&written, "crtc.registers");
+    assert_eq!([&registers[12], &registers[13]], [&json!(0x30), &json!(0)]);
+    let cpu = session.inspect(&written, "cpu");
+    assert_eq!(
+        cpu["f"].as_u64().unwrap() & 1,
+        0,
+        "the matrix is in the ROM"
+    );
+    let matrix =
+        usize::try_from(cpu["h"].as_u64().unwrap() * 256 + cpu["l"].as_u64().unwrap()).unwrap();
+    let before = keep(&mut session, &written);
+    let called = session.answer(
+        "call",
+        json!({ "handle": written, "address": "&BB5D", "values": { "cpu.a": 0x41 } }),
+    );
+    assert_eq!(called["stopped"], "returned", "{called}");
+    let mut runs: Vec<(u16, Vec<u8>)> = Vec::new();
+    for (line, row) in (0..).zip(&rom[matrix..matrix + 8]) {
+        for (offset, byte) in (0..).zip([row & 0xF0, (row & 0x0F) << 4]) {
+            let address = 0xC3E8 + 0x800 * line + offset;
+            match runs.last_mut() {
+                _ if byte == 0 => {}
+                Some((start, bytes)) if *start + bytes.len() as u16 == address => bytes.push(byte),
+                _ => runs.push((address, vec![byte])),
+            }
+        }
+    }
+    let count: usize = runs.iter().map(|(_, bytes)| bytes.len()).sum();
+    assert!(count > 0, "an A has pixels");
+    let differences: Vec<Value> = runs
+        .iter()
+        .map(|(ram, bytes)| {
+            json!({
+                "ram": ampersand(*ram),
+                "bytes": bytes.iter().map(|byte| format!("{byte:02X}")).collect::<String>(),
+                "against": "00".repeat(bytes.len()),
+            })
+        })
+        .collect();
+    let screen = json!({ "differences": differences, "count": count });
+    assert_eq!(
+        compare(
+            &mut session,
+            &written,
+            json!({ "state": before, "ram": "&C000", "to": "&FFFF" })
+        ),
+        screen
+    );
+    assert_eq!(
+        compare(
+            &mut session,
+            &written,
+            json!({ "other": unwritten, "ram": "&C000", "to": "&FFFF" })
+        ),
+        screen
+    );
+    let whole = compare(&mut session, &written, json!({ "state": before }));
+    assert!(whole["count"].as_u64().unwrap() > count as u64, "{whole}");
+    assert_eq!(
+        compare(&mut session, &written, json!({ "other": unwritten })),
+        whole
+    );
 }
 
 // The restarts of the firmware's extended jumps and calls (SOFT 968, 18).

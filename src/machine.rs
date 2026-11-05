@@ -618,6 +618,10 @@ fn medium(bytes: &[u8]) -> Box<floppy_t> {
 }
 
 impl CpcState {
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
     pub fn filed(&self) -> Filed<'_> {
         let machine = &*self.machine;
         let drive = machine.fdc.drive;

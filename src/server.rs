@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
@@ -97,6 +98,10 @@ const MOST_FOUND: usize = 256;
 // some 14 milliseconds in a release build where this was written, and some
 // 420 in a debug one.
 const MOST_SOUGHT: usize = 256;
+// A difference takes some 40 characters beside its bytes, each given twice,
+// so these come to some 19000 characters, about twice what MOST_BYTES does.
+const MOST_DIFFERENCES: usize = 256;
+const MOST_DIFFERING: usize = 2048;
 
 // A machine holds raw pointers, a CPC's into itself, so it is not Send, and
 // the server must be. Each is built on a thread of its own, never leaves it,
@@ -161,8 +166,8 @@ impl Threads {
         match self.held.iter().find(|(_, held)| held.state == state) {
             Some((held, _)) if held == handle => Ok(()),
             Some((held, _)) => Err(format!(
-                "{state} was kept from {held}; restore, save or drop it through that machine's \
-                 handle"
+                "{state} was kept from {held}; restore, save, drop or compare with it through \
+                 that machine's handle"
             )),
             None => {
                 let states = self.states_of(handle);
@@ -1756,6 +1761,29 @@ struct FindRequest {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CompareRequest {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The name of a state kept from this machine, as `state_keep` returned it. Give this or `other`.
+    #[schemars(transform = absent_not_null)]
+    state: Option<String>,
+    /// The handle of another CPC, compared as it stands. Give this or `state`.
+    #[schemars(transform = absent_not_null)]
+    other: Option<String>,
+    /// The first address compared, in the RAM by its own addresses. Default &0000.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    ram: Option<Value>,
+    /// The last address compared, in the RAM by its own addresses. Default: the RAM's last address, or with `other` the last address both machines' RAMs hold.
+    #[schemars(schema_with = "ram_address_schema")]
+    #[schemars(transform = absent_not_null)]
+    #[serde(default)]
+    to: Option<Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MonitorRequest {
     /// The handle `machine_open` returned.
     handle: String,
@@ -2678,6 +2706,59 @@ struct Found {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct Compared {
+    /// Each run of neighbouring bytes that differ, lowest first: at most the first 256 runs, holding at most 2048 bytes in all.
+    differences: Vec<Difference>,
+    /// The number of bytes that differ from `ram` to `to`, listed or not.
+    count: usize,
+    /// The address of the first byte that differs and is not listed: compare again with it as `ram`, with the same `state` or `other` and the same `to`, for the rest. Not given when every byte that differs is listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = absent_not_null)]
+    next: Option<Hexadecimal>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Difference {
+    /// The first byte's address in the RAM, in hexadecimal after &.
+    ram: Hexadecimal,
+    /// The machine's bytes, as pairs of hexadecimal digits.
+    bytes: String,
+    /// The bytes the state or the other machine holds at the same addresses, as pairs of hexadecimal digits.
+    against: String,
+}
+
+impl Compared {
+    fn listed(ours: &[u8], theirs: &[u8], runs: &[Range<usize>]) -> Compared {
+        let mut differences = Vec::new();
+        let mut bytes = 0;
+        let mut next = None;
+        for run in runs {
+            let room = MOST_DIFFERING - bytes;
+            if differences.len() == MOST_DIFFERENCES || room == 0 {
+                next = Some(run.start);
+                break;
+            }
+            let end = run.end.min(run.start + room);
+            differences.push(Difference {
+                ram: Hexadecimal::ram(run.start as u32),
+                bytes: digit_pairs(&ours[run.start..end]),
+                against: digit_pairs(&theirs[run.start..end]),
+            });
+            bytes += end - run.start;
+            if end < run.end {
+                next = Some(end);
+                break;
+            }
+        }
+        Compared {
+            differences,
+            count: runs.iter().map(ExactSizeIterator::len).sum(),
+            next: next.map(|address| Hexadecimal::ram(address as u32)),
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
 struct Monitored {
     /// The handle `machine_open` returned.
     handle: String,
@@ -2847,6 +2928,11 @@ fn span(address: u16, length: i64) -> Result<u16, String> {
 }
 
 impl Server {
+    // A sender held across an await keeps its machine's thread from ending,
+    // and so keeps machine_close, which joins that thread on the runtime's one
+    // thread, from returning, and the server from answering again. A sender
+    // taken here goes straight to ask, which sends on it and drops it before
+    // it waits.
     fn thread(&self, handle: &str) -> Result<(&'static Machine, mpsc::Sender<Order>), String> {
         let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         threads
@@ -3400,7 +3486,7 @@ impl Server {
         &self,
         Parameters(mut request): Parameters<DiscRequest>,
     ) -> Result<Json<Inserted>, String> {
-        let (machine, orders) = self.thread(&request.handle)?;
+        let machine = self.thread(&request.handle)?.0;
         request.path = machines::absolute(&request.path)?;
         let arguments = journaled(&request);
         let drive = request.drive.unwrap_or(Drive::A);
@@ -3418,6 +3504,7 @@ impl Server {
             Drive::B => 1,
         };
         let given = file.clone();
+        let (_, orders) = self.thread(&request.handle)?;
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_disc(number, &contents, write_protected)?;
             built.record(built.tick(), "disc_insert", arguments, Some(given), None);
@@ -3444,7 +3531,7 @@ impl Server {
         &self,
         Parameters(mut request): Parameters<TapeRequest>,
     ) -> Result<Json<Inserted>, String> {
-        let (machine, orders) = self.thread(&request.handle)?;
+        let machine = self.thread(&request.handle)?.0;
         request.path = machines::absolute(&request.path)?;
         let arguments = journaled(&request);
         let path = request.path;
@@ -3456,6 +3543,7 @@ impl Server {
         })
         .await?;
         let given = file.clone();
+        let (_, orders) = self.thread(&request.handle)?;
         let tick = Server::ask(&request.handle, orders, move |built| {
             built.insert_tape(&contents)?;
             built.record(built.tick(), "tape_insert", arguments, Some(given), None);
@@ -3887,6 +3975,72 @@ impl Server {
             count,
             next,
         }))
+    }
+
+    /// Compare a CPC's RAM with a state kept from it, or with another CPC's RAM, and list the bytes that differ. The RAM is read by its own addresses, as `peek` reads it with `ram`, whatever is paged in: a 6128's second 64K is &10000 to &1FFFF. No machine runs or changes. A state kept before a run or a call, compared after it, gives the bytes the run or the call changed. A byte written with the value it already held, or changed and changed back, is no difference; a `write` condition finds every write. To compare with a state file, open it with `machine_open` and give its handle as `other`. Only the RAM is compared: `inspect` reads the registers and the chips. Refused on a Spectrum.
+    #[tool(annotations(read_only_hint = true, open_world_hint = false))]
+    async fn compare(
+        &self,
+        Parameters(request): Parameters<CompareRequest>,
+    ) -> Result<Json<Compared>, String> {
+        let (_, orders) = self.thread(&request.handle)?;
+        let first = request
+            .ram
+            .as_ref()
+            .map(ram_address)
+            .transpose()
+            .map_err(|problem| format!("ram {problem}"))?
+            .unwrap_or(0);
+        let last = request
+            .to
+            .as_ref()
+            .map(ram_address)
+            .transpose()
+            .map_err(|problem| format!("to {problem}"))?;
+        let (ours, theirs) = match (request.state, request.other) {
+            (Some(state), None) => {
+                {
+                    let threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+                    threads.held_of(&request.handle, &state)?;
+                }
+                Server::ask(&request.handle, orders, move |built| {
+                    Ok::<_, String>((
+                        built.compared_ram()?.to_vec(),
+                        built.state_ram(&state)?.to_vec(),
+                    ))
+                })
+                .await??
+            }
+            (None, Some(other)) => {
+                let machine = self.thread(&other)?.0;
+                let ours = Server::ask(&request.handle, orders, |built| {
+                    built.compared_ram().map(<[u8]>::to_vec)
+                })
+                .await??;
+                let (_, orders) = self.thread(&other)?;
+                let theirs = Server::ask(&other, orders, |built| {
+                    built.compared_ram().map(<[u8]>::to_vec)
+                })
+                .await?
+                .map_err(|_| {
+                    format!(
+                        "other {other} is a {}; give other a CPC's handle",
+                        machine.name
+                    )
+                })?;
+                (ours, theirs)
+            }
+            _ => {
+                return Err(
+                    "give state or other, exactly one: {\"state\": \"state-1\"} compares with a \
+                     state kept from this machine, and {\"other\": \"cpc6128-2\"} with another \
+                     CPC as it stands"
+                        .to_owned(),
+                );
+            }
+        };
+        let runs = machines::differences(&ours, &theirs, first, last)?;
+        Ok(Json(Compared::listed(&ours, &theirs, &runs)))
     }
 
     /// Show what a machine's monitor shows, as a PNG next to the answer, cropped and drawn as the emulator's command line draws it with --screenshot. Each pixel's palette index is what the machine sent to the monitor: a CPC's hardware colour code, 0 to 31, or a Spectrum's colour, 0 to 15, with bits for brightness, green, red and blue from the highest bit. After a run by frames that ran all its frames the picture is whole. After anything else, the lines above the beam, and the part of the beam's line left of the beam, are from this frame, and the rest from the frame before; the answer's `whole` says whether the beam is partway through the picture. Either way, lines that a frame shorter than the picture never reaches keep what an earlier frame left there. After a run by frames that answered `"stopped": "limit"`, the picture may hold lines painted long before the answer's `tick`, as on a CPC whose 6845 has R0 below R2 and so gives no line sync. A machine that has not run yet shows an unpainted picture. The picture's size and crop:

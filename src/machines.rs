@@ -1602,6 +1602,20 @@ impl Built {
         Ok(memory[ram_span(memory, ram, usize::from(length))?].to_vec())
     }
 
+    pub fn compared_ram(&self) -> Result<&[u8], String> {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => Ok(cpc.ram()),
+            Hardware::Spectrum(_) => Err(UNCOMPARED.to_owned()),
+        }
+    }
+
+    pub fn state_ram(&self, name: &str) -> Result<&[u8], String> {
+        match &self.states.get(name).ok_or_else(|| gone(name))?.hardware {
+            HardwareState::Cpc(state) => Ok(state.ram()),
+            HardwareState::Spectrum(_) => Err(UNCOMPARED.to_owned()),
+        }
+    }
+
     pub fn poke_ram(&mut self, ram: u32, bytes: &[u8]) -> Result<(), String> {
         let span = ram_span(self.cpc_ram("write")?, ram, bytes.len())?;
         if let Hardware::Cpc(cpc) = &mut self.hardware {
@@ -1795,7 +1809,46 @@ fn ram_span(memory: &[u8], ram: u32, length: usize) -> Result<Range<usize>, Stri
     Ok(start..start + length)
 }
 
-// A refusal of a search whose last address, `to`, is below its first, given
+const UNCOMPARED: &str = "compare reads a CPC's RAM only; a Spectrum's RAM is at &4000 to &FFFF, \
+                          so peek it there in each machine and compare the bytes, and to compare \
+                          with a state, keep the machine with state_keep, peek it, then \
+                          state_restore the state, peek it again, and state_restore the kept \
+                          state to go back";
+
+// The runs of neighbouring addresses at which two RAMs differ, lowest first,
+// from `first` to `last`, or to the last address both hold.
+pub fn differences(
+    ours: &[u8],
+    theirs: &[u8],
+    first: u32,
+    last: Option<u32>,
+) -> Result<Vec<Range<usize>>, String> {
+    let held = ours.len().min(theirs.len()) as u32 - 1;
+    let end = if ours.len() == theirs.len() {
+        "the end of the RAM"
+    } else {
+        "the end of the smaller RAM"
+    };
+    for (named, address) in [("ram", Some(first)), ("to", last)] {
+        if let Some(address) = address.filter(|address| *address > held) {
+            return Err(format!(
+                "{named} &{address:04X} is past &{held:04X}, {end}; give a {named} of &{held:04X} \
+                 or below"
+            ));
+        }
+    }
+    let last = last.unwrap_or(held);
+    in_order(first, last, "ram")?;
+    let differing: Vec<usize> = (first as usize..=last as usize)
+        .filter(|&address| ours[address] != theirs[address])
+        .collect();
+    Ok(differing
+        .chunk_by(|address, next| *next == address + 1)
+        .map(|run| run[0]..run[run.len() - 1] + 1)
+        .collect())
+}
+
+// A refusal of a range whose last address, `to`, is below its first, given
 // as `named`.
 fn in_order(first: u32, last: u32, named: &str) -> Result<(), String> {
     if last < first {
