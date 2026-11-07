@@ -252,8 +252,14 @@ typedef struct {
   uint8_t (*peek)(const void *machine, uint16_t address);
   const void *machine;
   /* Whether a condition asks for changes, so that the run reads what a write
-     can change before each tick and after it. */
+     can change before each tick and, where the watch sees the tick, after
+     it. */
   bool compares;
+  /* For each kind, in the order mcp_kind_t gives them, the lists that hold a
+     condition of it, a bit to each list in the order mcp_list_t gives them,
+     the first as bit 0, so that the run looks no further at what no
+     condition can match. */
+  uint8_t lists[MCP_KINDS];
   /* The first of the matches still to capture: those of the instruction
      under way, or of the response to an interrupt, which capture at its
      end. */

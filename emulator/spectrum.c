@@ -41,7 +41,7 @@ static bool tick(spectrum_t *spectrum, mcp_run_t *run, mcp_watch_t *watch) {
   if (spectrum->monitor.frame_retraced && !retraced_before) {
     run->frames++;
   }
-  if (watch != NULL) {
+  if (watch != NULL && mcp_watch_sees(watch, before, pins)) {
     mcp_watch_after(watch, &spectrum->cpu, &spectrum->monitor, before, pins, run->ticks,
                     comparing && spectrum_peek(spectrum, z80_address(before)) != was);
   }
@@ -69,7 +69,7 @@ mcp_run_t mcp_spectrum_run(spectrum_t *spectrum, uint32_t frames, uint64_t limit
     watch->locate = locate;
     watch->peek = peek;
     watch->machine = spectrum;
-    watch->compares = mcp_watch_compares(watch);
+    mcp_watch_set_up(watch);
   }
   bool halting_stops = !mcp_z80_halted_for_good(&spectrum->cpu);
   while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&

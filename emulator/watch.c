@@ -51,6 +51,11 @@ static void count(mcp_watch_t *watch, const mcp_match_t *match) {
    match is counted where it may be gathered. */
 static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp_kind_t kind,
                 uint16_t address, uint8_t value, bool changed, bool may_stop, bool may_gather) {
+  uint8_t allowed = (uint8_t)((may_stop ? 1U << MCP_UNTIL : 0U) |
+                              (may_gather ? 1U << MCP_GATHER | 1U << MCP_COUNT : 0U));
+  if ((watch->lists[kind] & allowed) == 0) {
+    return;
+  }
   bool memory = kind == MCP_EXECUTE || kind == MCP_READ || kind == MCP_WRITE;
   uint32_t location = memory ? watch->locate(watch->machine, address, kind == MCP_WRITE) : address;
   bool stops = false;
@@ -195,17 +200,12 @@ bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const 
   return false;
 }
 
-bool mcp_watch_compares(const mcp_watch_t *watch) {
+void mcp_watch_set_up(mcp_watch_t *watch) {
   for (uint32_t index = 0; index < watch->condition_count; index++) {
-    if (watch->conditions[index].changes) {
-      return true;
-    }
+    const mcp_condition_t *condition = &watch->conditions[index];
+    watch->compares |= condition->changes;
+    watch->lists[condition->kind] |= (uint8_t)(1U << condition->list);
   }
-  return false;
-}
-
-bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request) {
-  return (pins & request) == request && (before & request) != request;
 }
 
 /* A request is seen as it first reaches the bus: a machine whose board holds

@@ -14,17 +14,30 @@
 bool mcp_watch_before(mcp_watch_t *watch, const z80_t *cpu, bool settled, const monitor_t *monitor,
                       uint64_t tick);
 
-/* Whether a condition asks for changes. */
-bool mcp_watch_compares(const mcp_watch_t *watch);
+/* Before a run, reckons from the watch's conditions whether one asks for
+ * changes and, for each kind, the lists that hold a condition of it. */
+void mcp_watch_set_up(mcp_watch_t *watch);
 
 /* Whether a request first reaches the bus on this tick. */
-bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request);
+static inline bool mcp_request_began(uint64_t before, uint64_t pins, uint64_t request) {
+  return (pins & request) == request && (before & request) != request;
+}
 
 /* After a tick, given the bus before it and after it, and whether the tick
  * changed the byte at the address the bus carried before it, as a write there
  * reaches it. */
 void mcp_watch_after(mcp_watch_t *watch, const z80_t *cpu, const monitor_t *monitor,
                      uint64_t before, uint64_t pins, uint64_t tick, bool changed);
+
+/* Whether mcp_watch_after can have anything to see after a tick, given the
+ * bus before it and after it. It has nothing unless a port read it matched
+ * and kept is held, whose byte it follows until the read leaves the bus, or
+ * one of a request's pins rises, as one does where a request first reaches
+ * the bus. */
+static inline bool mcp_watch_sees(const mcp_watch_t *watch, uint64_t before, uint64_t pins) {
+  uint64_t raised = pins & ~before;
+  return watch->port_read_held || (raised & (Z80_MREQ | Z80_IORQ | Z80_RD | Z80_WR)) != 0;
+}
 
 /* After a tick that wrote one of a CPC's PSG or 6845 registers: the kind, the
  * register's number, the byte it was given, and whether the register then

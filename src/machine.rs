@@ -2159,9 +2159,9 @@ mod tests {
     // end. A count past a kind's locations would land in the next kind's
     // counts, where it sees nothing amiss, so each kind is given room for
     // twice the machine's locations, and the second half is to stay zero. A
-    // count of the writes that change what they reach has the run read, before
-    // and after each tick, what a write can change, so that AddressSanitizer
-    // sees those reads too.
+    // count of the writes that change what they reach has the run read what a
+    // write can change before each tick and, where the watch sees the tick,
+    // after it, so that AddressSanitizer checks those reads too.
     fn watching_everything(
         last: bool,
         locations: u32,

@@ -92,7 +92,8 @@ uint32_t mcp_cpc_locations(const cpc_t *cpc) {
    it: the tick its request begins, or, on a type 3 or 4, whose board holds an
    OUT's write to the clock, the first character clock the cycle spans, the
    cycle still on the bus (colophon-emulator's cpc.c, io_write and cpc_tick, at
-   78c56f2). */
+   78c56f2). A write held past the tick its request begins is taken on a tick
+   on which none of a request's pins rises. */
 static void see_tick(cpc_t *cpc, mcp_watch_t *watch, uint64_t before, uint64_t pins, uint64_t ticks,
                      held_t was, bool write_awaited_the_clock) {
   held_t is = watch->compares ? held(cpc, z80_address(before)) : was;
@@ -128,7 +129,7 @@ static bool tick(cpc_t *cpc, mcp_run_t *run, mcp_watch_t *watch) {
   if (cpc->monitor.frame_retraced && !retraced_before) {
     run->frames++;
   }
-  if (watch != NULL) {
+  if (watch != NULL && (write_awaited_the_clock || mcp_watch_sees(watch, before, pins))) {
     see_tick(cpc, watch, before, pins, run->ticks, was, write_awaited_the_clock);
   }
   return true;
@@ -153,7 +154,7 @@ mcp_run_t mcp_cpc_run(cpc_t *cpc, uint32_t frames, uint64_t limit, mcp_watch_t *
     watch->locate = locate;
     watch->peek = peek;
     watch->machine = cpc;
-    watch->compares = mcp_watch_compares(watch);
+    mcp_watch_set_up(watch);
   }
   bool halting_stops = !mcp_z80_halted_for_good(&cpc->cpu);
   while (run.frames < frames && run.ticks < limit && !mcp_watch_stopping(watch) &&
