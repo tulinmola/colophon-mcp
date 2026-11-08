@@ -29,20 +29,29 @@ use crate::emulator::{
 use crate::fields::Fields;
 
 pub use crate::emulator::{
-    mcp_capture_t as Capture, mcp_condition_t as Condition, mcp_kind_t as Kind,
-    mcp_kind_t_MCP_CRTC as CRTC, mcp_kind_t_MCP_EXECUTE as EXECUTE, mcp_kind_t_MCP_IN as IN,
-    mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_PSG as PSG, mcp_kind_t_MCP_READ as READ,
-    mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List, mcp_list_t_MCP_COUNT as COUNT,
-    mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL, mcp_match_t as Match,
-    mcp_memory_t as Memory, mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY, mcp_memory_t_MCP_RAM as RAM,
-    mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place, mcp_run_t as Run, mcp_span_t as Span,
-    mcp_start_t as Start, mcp_start_t_MCP_START_ADDRESS as START_ADDRESS,
-    mcp_start_t_MCP_START_PC as START_PC, mcp_start_t_MCP_START_SP as START_SP,
+    mcp_capture_t as Capture, mcp_condition_t as Condition, mcp_guard_t as Guard,
+    mcp_kind_t as Kind, mcp_kind_t_MCP_CRTC as CRTC, mcp_kind_t_MCP_EXECUTE as EXECUTE,
+    mcp_kind_t_MCP_IN as IN, mcp_kind_t_MCP_OUT as OUT, mcp_kind_t_MCP_PSG as PSG,
+    mcp_kind_t_MCP_READ as READ, mcp_kind_t_MCP_WRITE as WRITE, mcp_list_t as List,
+    mcp_list_t_MCP_COUNT as COUNT, mcp_list_t_MCP_GATHER as GATHER, mcp_list_t_MCP_UNTIL as UNTIL,
+    mcp_match_t as Match, mcp_memory_t as Memory, mcp_memory_t_MCP_ANY_MEMORY as ANY_MEMORY,
+    mcp_memory_t_MCP_RAM as RAM, mcp_memory_t_MCP_ROM as ROM, mcp_place_t as Place,
+    mcp_run_t as Run, mcp_span_t as Span, mcp_start_t as Start,
+    mcp_start_t_MCP_START_ADDRESS as START_ADDRESS, mcp_start_t_MCP_START_PC as START_PC,
+    mcp_start_t_MCP_START_SP as START_SP,
 };
 
 pub use crate::emulator::{
     MCP_CAPTURED_BYTES as CAPTURED_BYTES, MCP_FIRST_ROM_LOCATION as FIRST_ROM_LOCATION,
-    MCP_ROM_BYTES as ROM_BYTES, MCP_SPECTRUM_LOCATIONS as SPECTRUM_LOCATIONS,
+    MCP_GUARD_BYTES as GUARD_BYTES, MCP_ROM_BYTES as ROM_BYTES,
+    MCP_SPECTRUM_LOCATIONS as SPECTRUM_LOCATIONS,
+};
+
+pub const NO_GUARD: Guard = Guard {
+    address: 0,
+    length: 0,
+    bytes: [0; GUARD_BYTES as usize],
+    masks: [0; GUARD_BYTES as usize],
 };
 
 // The kinds in the order mcp_kind_t gives them, which is how a watch's counts
@@ -85,7 +94,8 @@ impl<'a> Watch<'a> {
     // The counts are laid out as mcp_watch_t says, as many to a kind as the
     // machine it runs on has locations or more, and all zero where a
     // condition is in the count list, and empty where none is. A match tells
-    // the conditions it matched by the bits of its agreed, 64 of them.
+    // the conditions it matched by the bits of its agreed, 64 of them. A guard
+    // holds GUARD_BYTES bytes, and the bridge reads as many as its length says.
     pub fn new(
         conditions: &'a [Condition],
         matches: &'a mut [Match],
@@ -103,6 +113,12 @@ impl<'a> Watch<'a> {
              condition"
         );
         assert!(conditions.len() <= 64, "64 conditions at most");
+        assert!(
+            conditions
+                .iter()
+                .all(|condition| u32::from(condition.when.length) <= GUARD_BYTES),
+            "a guard of {GUARD_BYTES} bytes at most"
+        );
         // SAFETY: bindgen renders a watch as integers, bools, pointers and
         // Options of functions, and all-zero bytes are a value of each, an
         // Option's None.
@@ -1612,6 +1628,7 @@ mod tests {
             last_value: 0xFF,
             changes: false,
             memory: ANY_MEMORY,
+            when: NO_GUARD,
             list: UNTIL,
             captures: false,
         }];
@@ -1692,6 +1709,7 @@ mod tests {
                 last_value: 0xFF,
                 changes: false,
                 memory: ANY_MEMORY,
+                when: NO_GUARD,
                 list: GATHER,
                 captures: false,
             });
@@ -1736,6 +1754,7 @@ mod tests {
             last_value: 0xFF,
             changes: false,
             memory: ANY_MEMORY,
+            when: NO_GUARD,
             list: GATHER,
             captures: false,
         }];
@@ -1780,6 +1799,7 @@ mod tests {
             last_value: 0xFF,
             changes: false,
             memory: ANY_MEMORY,
+            when: NO_GUARD,
             list: COUNT,
             captures: false,
         }];
@@ -2164,12 +2184,20 @@ mod tests {
     // twice the machine's locations, and the second half is to stay zero. A
     // count of the writes that change what they reach has the run read what a
     // write can change before each tick and, where the watch sees the tick,
-    // after it, so that AddressSanitizer checks those reads too.
+    // after it, so that AddressSanitizer checks those reads too. Each condition
+    // gathered is guarded by the last bytes below &10000, any bytes at all, so
+    // that it matches as unguarded and the sanitizers check the guard's reads
+    // to the end of its arrays.
     fn watching_everything(
         last: bool,
         locations: u32,
         run: impl FnOnce(Option<&mut Watch>) -> Run,
     ) -> bool {
+        let any_last_bytes = Guard {
+            address: (0x10000 - GUARD_BYTES) as u16,
+            length: GUARD_BYTES as u8,
+            ..NO_GUARD
+        };
         let every = |kind, list| Condition {
             kind,
             first: 0,
@@ -2179,6 +2207,11 @@ mod tests {
             last_value: 0xFF,
             changes: false,
             memory: ANY_MEMORY,
+            when: if list == GATHER {
+                any_last_bytes
+            } else {
+                NO_GUARD
+            },
             list,
             captures: list == GATHER,
         };
@@ -2530,6 +2563,7 @@ mod tests {
             last_value: 0xFF,
             changes: false,
             memory: ANY_MEMORY,
+            when: NO_GUARD,
             list: COUNT,
             captures: false,
         }]
@@ -2547,6 +2581,20 @@ mod tests {
     #[should_panic(expected = "64 conditions at most")]
     fn a_watch_refuses_more_conditions_than_a_match_has_bits_for() {
         let conditions = [counting_everything()[0]; 65];
+        let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
+        Watch::new(&conditions, &mut [], &mut counts, &mut [], 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a guard of 8 bytes at most")]
+    fn a_watch_refuses_a_guard_longer_than_a_guard_holds() {
+        let conditions = [Condition {
+            when: Guard {
+                length: 9,
+                ..NO_GUARD
+            },
+            ..counting_everything()[0]
+        }];
         let mut counts = vec![0; KINDS.len() * SPECTRUM_LOCATIONS as usize];
         Watch::new(&conditions, &mut [], &mut counts, &mut [], 1, 1);
     }

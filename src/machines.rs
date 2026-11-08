@@ -374,7 +374,7 @@ pub struct Entry {
     pub tick: u64,
     /// The tool called.
     pub tool: String,
-    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, `poke`'s `ram`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &; registers as numbers; paths absolute; `crtc_type` in a CPC's `machine_open`, whether given or not.
+    /// The arguments the tool was given, except the handle, as the journal writes them: `address`, `poke`'s `ram`, and the conditions' addresses, ports, masks and bytes, in hexadecimal after &, but for `when`'s bytes, pairs of capital hexadecimal digits with a space between, `??` for any byte; registers as numbers; paths absolute; `crtc_type` in a CPC's `machine_open`, whether given or not.
     #[schemars(schema_with = "crate::server::values_schema")]
     pub arguments: Value,
     /// The snapshot, disc or tape the request read, with the SHA-256 of what it held.

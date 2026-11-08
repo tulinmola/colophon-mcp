@@ -79,6 +79,20 @@ typedef enum {
   MCP_COUNT,
 } mcp_list_t;
 
+/* The most bytes a condition's guard compares. */
+#define MCP_GUARD_BYTES 8
+
+/* Bytes memory must hold, as the processor reads it, for a condition to
+   match: length bytes from address, each equal to its byte in bytes on the
+   bits set in its mask, a byte in bytes holding no bit its mask clears. A
+   guard of no bytes always holds. */
+typedef struct {
+  uint16_t address;
+  uint8_t length;
+  uint8_t bytes[MCP_GUARD_BYTES];
+  uint8_t masks[MCP_GUARD_BYTES];
+} mcp_guard_t;
+
 typedef struct {
   mcp_kind_t kind;
   /* The first address or register of the range, or the port. */
@@ -95,6 +109,9 @@ typedef struct {
      holding other than it held. */
   bool changes;
   mcp_memory_t memory;
+  /* Read as a match is made: before an instruction begins, or once the tick
+     that made an access has run. */
+  mcp_guard_t when;
   mcp_list_t list;
   /* Whether a match of it, in a list that keeps matches, captures the
      machine: an instruction about to begin as it finds the machine, an access

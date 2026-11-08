@@ -21,6 +21,16 @@ static bool agrees(const mcp_condition_t *condition, mcp_kind_t kind, uint16_t a
          (condition->memory == MCP_ROM) == (location >= MCP_FIRST_ROM_LOCATION);
 }
 
+static bool holds(const mcp_watch_t *watch, const mcp_guard_t *guard) {
+  for (uint32_t offset = 0; offset < guard->length; offset++) {
+    uint8_t byte = watch->peek(watch->machine, (uint16_t)(guard->address + offset));
+    if ((byte & guard->masks[offset]) != guard->bytes[offset]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /* Where the match counted as this one is kept, if below room. */
 static uint32_t kept_at(const mcp_watch_t *watch, uint32_t match) {
   return watch->gathers_last ? match % watch->room : match;
@@ -65,7 +75,8 @@ static void see(mcp_watch_t *watch, const monitor_t *monitor, uint64_t tick, mcp
   bool captures = false;
   for (uint32_t index = 0; index < watch->condition_count; index++) {
     const mcp_condition_t *condition = &watch->conditions[index];
-    if (agrees(condition, kind, address, location, value, changed)) {
+    if (agrees(condition, kind, address, location, value, changed) &&
+        holds(watch, &condition->when)) {
       bool stopping = condition->list == MCP_UNTIL && may_stop;
       bool gathering = condition->list == MCP_GATHER && may_gather;
       stops |= stopping;

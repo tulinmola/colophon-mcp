@@ -1129,6 +1129,7 @@ const BIT_0_AT_HL: [u8; 2] = [0xCB, 0x46];
 const CALL: u8 = 0xCD;
 const CALL_NZ: u8 = 0xC4;
 const CP_E: u8 = 0xBB;
+const CP_N: u8 = 0xFE;
 const DI: u8 = 0xF3;
 const EI: u8 = 0xFB;
 const EX_SP_IX: [u8; 2] = [0xDD, 0xE3];
@@ -1153,6 +1154,7 @@ const LD_A: u8 = 0x3E;
 const LD_A_AT_HL: u8 = 0x7E;
 const LD_A_B: u8 = 0x78;
 const LD_A_FROM: u8 = 0x3A;
+const LD_A_H: u8 = 0x7C;
 const LD_AT_HL: u8 = 0x36;
 const LD_AT_HL_A: u8 = 0x77;
 const LD_BC: u8 = 0x01;
@@ -4946,6 +4948,254 @@ fn a_value_and_changes_match_only_the_bytes_they_name() {
     assert_eq!(ran["counted"].as_array().map(Vec::len), Some(1), "{ran}");
 }
 
+// Counts HL from 1 to &0300 at &0004, writes each count to &8000 with LD
+// (nn),HL at &0005, L to nn and H to nn+1 (Z80 CPU User Manual, UM0080), nn's
+// cycle before nn+1's (comp.sys.sinclair FAQ, 16K/48K reference,
+// https://worldofspectrum.org/faq/reference/48kreference.htm), and reads &9000
+// at &0008 after each write.
+const COUNTING: [u8; 17] = [
+    DI, LD_HL, 0x00, 0x00, INC_HL, LD_HL_TO, 0x00, 0x80, LD_A_FROM, 0x00, 0x90, LD_A_H, CP_N, 3,
+    JR_NZ, 0xF4, HALT,
+];
+
+fn reading_when(address: Value, bytes: &str) -> Value {
+    json!({ "read": "&9000", "when": { "address": address, "bytes": bytes } })
+}
+
+fn run_afresh(session: &mut Session, machine: &str, arguments: Value) -> (String, Value) {
+    let handle = session.open(machine);
+    let ran = session.run(&handle, arguments);
+    (handle, ran)
+}
+
+// A client without when stops at every read and peeks, until the count it
+// wants is there.
+#[test]
+fn when_stops_where_a_stop_and_a_peek_would_find_its_bytes() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING);
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let found = loop {
+        let ran = session.run(
+            &handle,
+            json!({ "ticks": 100_000, "until": [{ "read": "&9000" }] }),
+        );
+        assert_eq!(ran["stopped"], "matched", "{ran}");
+        if session.peek(&handle, json!("&8000"), 2) == "3B01" {
+            break ran;
+        }
+    };
+    let (_, ran) = run_afresh(
+        &mut session,
+        "spectrum48",
+        json!({ "ticks": 100_000, "until": [reading_when(json!("&8000"), "3B 01")] }),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["tick"], &ran["pc"], &ran["matched"]),
+        (
+            &found["stopped"],
+            &found["tick"],
+            &found["pc"],
+            &found["matched"]
+        )
+    );
+
+    for (address, bytes, peeked, journaled) in [
+        (json!(32768), "3b01", "3B01", "3B 01"),
+        (json!("&8000"), "3B ??", "3B00", "3B ??"),
+        (json!("#8000"), "??01", "0001", "?? 01"),
+    ] {
+        let (handle, ran) = run_afresh(
+            &mut session,
+            "spectrum48",
+            json!({ "ticks": 100_000, "until": [reading_when(address, bytes)] }),
+        );
+        assert_eq!(ran["stopped"], "matched", "{ran}");
+        assert_eq!(session.peek(&handle, json!("&8000"), 2), peeked);
+        let journal = session.answer("journal", json!({ "handle": handle }));
+        assert_eq!(
+            journal["entries"][1]["arguments"]["until"][0]["when"],
+            json!({ "address": "&8000", "bytes": journaled })
+        );
+    }
+
+    let any_page = reading_when(json!("&8000"), "3B ??");
+    let (_, gathered) = run_afresh(
+        &mut session,
+        "spectrum48",
+        json!({ "ticks": 100_000, "gather": [any_page] }),
+    );
+    assert_eq!(gathered["stopped"], "halted", "{gathered}");
+    let handle = session.open("spectrum48");
+    let mut stops = Vec::new();
+    loop {
+        let ran = session.run(&handle, json!({ "ticks": 100_000, "until": [any_page] }));
+        if ran["stopped"] == "halted" {
+            break;
+        }
+        assert_eq!(ran["stopped"], "matched", "{ran}");
+        stops.extend(ran["matched"].as_array().expect("matches").iter().cloned());
+    }
+    assert_eq!(stops.len(), 3);
+    assert_eq!(gathered["gathered"], json!(stops));
+    let (_, counted) = run_afresh(
+        &mut session,
+        "spectrum48",
+        json!({ "ticks": 100_000, "count": [any_page] }),
+    );
+    assert_eq!(
+        (
+            &counted["counted"][0]["count"],
+            counted["counted"].as_array().map(Vec::len)
+        ),
+        (&json!(3), Some(1)),
+        "{counted}"
+    );
+}
+
+#[test]
+fn when_reads_memory_as_the_match_is_made() {
+    let roms = Roms::programmed("spectrum48.rom", &COUNTING);
+    let mut session = Session::start(&roms);
+    let until = |condition: Value| json!({ "ticks": 100_000, "until": [condition] });
+    let when = |bytes: &str| json!({ "address": "&8000", "bytes": bytes });
+
+    let (handle, ran) = run_afresh(
+        &mut session,
+        "spectrum48",
+        until(json!({ "execute": "&0005", "when": when("3B 01") })),
+    );
+    assert_eq!(
+        (&ran["stopped"], &ran["pc"]),
+        (&json!("matched"), &json!("&0005"))
+    );
+    assert_eq!(
+        (
+            session.inspect(&handle, "cpu.h"),
+            session.inspect(&handle, "cpu.l")
+        ),
+        (json!(0x01), json!(0x3C))
+    );
+
+    let write = |address, value| vec![("write", address, Some(value), Some(0x0005))];
+    for (condition, matched, peeked) in [
+        (
+            json!({ "write": "&8000", "when": when("3B 01") }),
+            write(0x8000, 0x3B),
+            "3B01",
+        ),
+        (
+            json!({ "write": "&8000", "when": when("00 02") }),
+            write(0x8000, 0x00),
+            "0003",
+        ),
+    ] {
+        let (handle, ran) = run_afresh(&mut session, "spectrum48", until(condition));
+        assert_eq!(ran["stopped"], "matched", "{ran}");
+        assert_eq!(seen(&ran["matched"]), matched);
+        assert_eq!(session.peek(&handle, json!("&8000"), 2), peeked);
+    }
+    for (condition, gathered) in [
+        (
+            json!({ "write": "&8001", "when": when("00 02") }),
+            write(0x8001, 0x02),
+        ),
+        (
+            json!({ "write": "&8000", "to": "&8001", "when": when("00 02") }),
+            [write(0x8001, 0x02), write(0x8000, 0x00)].concat(),
+        ),
+        (
+            json!({ "write": "&8000", "to": "&8001", "when": when("3B 02") }),
+            [write(0x8000, 0x3B), write(0x8001, 0x02)].concat(),
+        ),
+    ] {
+        let (_, ran) = run_afresh(
+            &mut session,
+            "spectrum48",
+            json!({ "ticks": 100_000, "gather": [condition] }),
+        );
+        assert_eq!(ran["stopped"], "halted", "{ran}");
+        assert_eq!(seen(&ran["gathered"]), gathered);
+    }
+
+    let roms = Roms::programmed("cpc6128.rom", &COUNTING);
+    let mut session = Session::start(&roms);
+    let (handle, ran) = run_afresh(
+        &mut session,
+        "cpc6128",
+        until(reading_when(json!("&0000"), "F3")),
+    );
+    assert_eq!(ran["stopped"], "matched", "{ran}");
+    assert_eq!(session.peek(&handle, json!("&8000"), 2), "0100");
+    let (_, ran) = run_afresh(
+        &mut session,
+        "cpc6128",
+        until(reading_when(json!("&0000"), "00")),
+    );
+    assert_eq!(ran["stopped"], "halted", "{ran}");
+}
+
+#[test]
+fn what_when_takes_is_said_when_it_is_given_otherwise() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    let guard_forms = "when is {\"address\": address, \"bytes\": bytes}: the bytes memory must \
+                       hold from that address, as pairs of hexadecimal digits with ?? for any \
+                       byte, such as \"3B 02\", 1 to 8 bytes, none past &FFFF";
+    for (when, problem) in [
+        (json!("&8000"), "\"&8000\" is not an object"),
+        (
+            json!({ "bytes": "00" }),
+            "{\"bytes\":\"00\"} has no address",
+        ),
+        (
+            json!({ "address": "&8000" }),
+            "{\"address\":\"&8000\"} has no bytes",
+        ),
+        (
+            json!({ "address": "&8000", "bytes": "00", "mask": "FF" }),
+            "{\"address\":\"&8000\",\"bytes\":\"00\",\"mask\":\"FF\"} has mask; when takes only \
+             address and bytes",
+        ),
+        (
+            json!({ "address": "&8000", "bytes": 0 }),
+            "bytes is 0, which is not a string",
+        ),
+        (
+            json!({ "address": "&8000", "bytes": "" }),
+            "bytes holds 0 bytes; give 1 to 8",
+        ),
+        (
+            json!({ "address": "&8000", "bytes": "00 01 02 03 04 05 06 07 08" }),
+            "bytes holds 9 bytes; give 1 to 8",
+        ),
+        (
+            json!({ "address": "&8000", "bytes": "3B0" }),
+            "3B0 is not bytes; write bytes as pairs of hexadecimal digits, with ?? for any byte, \
+             such as CD ?? 14",
+        ),
+        (
+            json!({ "address": 65536, "bytes": "00" }),
+            "address 65536 is past &FFFF; an address is a number from 0 to 65535, or hexadecimal \
+             from &0000 to &FFFF, written with &, #, $ or 0x before it",
+        ),
+        (
+            json!({ "address": "&FFFF", "bytes": "00 00" }),
+            "2 bytes from &FFFF run past &FFFF, the end of the processor's memory; give at most 1 \
+             from there",
+        ),
+    ] {
+        assert_eq!(
+            session.refusal(
+                "run",
+                json!({ "handle": handle, "frames": 1, "until": [{ "execute": 1, "when": when }] }),
+            ),
+            format!("until[0]: when: {problem}; {guard_forms}; {CONDITION_FORMS}")
+        );
+    }
+}
+
 // The Gate Array's "registers are selected with bit7 to 5 of the 8bit
 // command-code", and "On a real Gate Array (CPC 464,664 and 6128), bit5 of
 // the command have absolutly no effect", so its top two bits name the command:
@@ -5807,8 +6057,9 @@ const CONDITION_FORMS: &str = "a condition is one of {\"execute\": address}, {\"
                                \"to\", the last address or register of a range; execute and read \
                                may add \"memory\": \"ram\" or \"rom\"; all but execute and in may \
                                add \"value\", a byte, and with it \"value_to\", the last byte of a \
-                               range; write, psg and crtc may add \"changes\": true; in until and \
-                               gather, any may add \"capture\"";
+                               range; write, psg and crtc may add \"changes\": true; any may add \
+                               \"when\", bytes memory must hold for a match; in until and gather, \
+                               any may add \"capture\"";
 
 // Clients SHOULD follow $ref resolution "when validating tool inputs and
 // outputs against `inputSchema` and `outputSchema`" (2026-07-28, tools), so
@@ -5847,6 +6098,8 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
             { "address": "cpu.sp", "length": 63 },
             { "address": "cpu.pc" },
         ] } }),
+        json!({ "write": "&AE1D", "to": "&AE1E", "when": { "address": "&AE1D", "bytes": "3B 02" } }),
+        json!({ "in": "&F500", "mask": "&0B00", "when": { "address": 0, "bytes": "??" } }),
     ] {
         if let Err(problem) = fitting(&condition) {
             panic!("{condition}: {problem}");
@@ -5870,6 +6123,10 @@ fn the_schema_of_a_condition_admits_what_the_server_takes() {
         json!({ "execute": 1, "capture": {} }),
         json!({ "execute": 1, "capture": { "values": [], "memory": [] } }),
         json!({ "execute": 1, "capture": { "registers": ["hl"] } }),
+        json!({ "execute": 1, "when": { "address": 1 } }),
+        json!({ "execute": 1, "when": { "bytes": "00" } }),
+        json!({ "execute": 1, "when": { "address": 1, "bytes": 0 } }),
+        json!({ "execute": 1, "when": { "address": 1, "bytes": "00", "mask": "FF" } }),
         json!({ "execute": 1, "capture": { "values": [7] } }),
         json!({ "execute": 1, "capture": { "memory": [{ "address": 0, "length": 65 }] } }),
         json!({ "execute": 1, "capture": { "memory": [{ "length": 1 }] } }),
@@ -10129,7 +10386,18 @@ fn the_journal_made_again_makes_the_machine_again() {
     for (tool, arguments) in [
         ("set", json!({ "values": { "cpu.b": 7 } })),
         ("poke", json!({ "address": "&9800", "bytes": "AABB" })),
-        ("run", json!({ "ticks": 5000, "keys": ["Q", "(FIRE 2)"] })),
+        (
+            "run",
+            json!({
+                "ticks": 5000,
+                "keys": ["Q", "(FIRE 2)"],
+                "until": [{
+                    "write": "&9000",
+                    "to": "&90FF",
+                    "when": { "address": "&9050", "bytes": "01" },
+                }],
+            }),
+        ),
         ("disc_insert", json!({ "path": disc, "drive": "B" })),
         ("type", json!({ "text": "a\n" })),
         (

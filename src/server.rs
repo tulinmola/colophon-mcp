@@ -28,8 +28,8 @@ use crate::fields::{self, Fields, Segment, hexadecimal_number};
 use crate::keys::Key;
 use crate::machine::{
     ANY_MEMORY, CAPTURED_BYTES, COUNT, CRTC, Capture, Condition, EXECUTE, FIRST_ROM_LOCATION,
-    GATHER, IN, Kind, List, Match, Memory, OUT, PSG, Place, RAM, READ, ROM, ROM_BYTES, Run,
-    START_ADDRESS, START_PC, START_SP, Span, Start, UNTIL, WRITE,
+    GATHER, GUARD_BYTES, Guard, IN, Kind, List, Match, Memory, NO_GUARD, OUT, PSG, Place, RAM,
+    READ, ROM, ROM_BYTES, Run, START_ADDRESS, START_PC, START_SP, Span, Start, UNTIL, WRITE,
 };
 use crate::machines::{
     self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
@@ -519,8 +519,13 @@ const CONDITION_FORMS: &str = "a condition is one of {\"execute\": address}, {\"
                                \"to\", the last address or register of a range; execute and read \
                                may add \"memory\": \"ram\" or \"rom\"; all but execute and in may \
                                add \"value\", a byte, and with it \"value_to\", the last byte of a \
-                               range; write, psg and crtc may add \"changes\": true; in until and \
-                               gather, any may add \"capture\"";
+                               range; write, psg and crtc may add \"changes\": true; any may add \
+                               \"when\", bytes memory must hold for a match; in until and gather, \
+                               any may add \"capture\"";
+
+const GUARD_FORMS: &str = "when is {\"address\": address, \"bytes\": bytes}: the bytes memory \
+                           must hold from that address, as pairs of hexadecimal digits with ?? \
+                           for any byte, such as \"3B 02\", 1 to 8 bytes, none past &FFFF";
 
 const CAPTURE_FORMS: &str = "capture is {\"values\": paths, \"memory\": spans}, with at least \
                              one of the two: a path names one of the processor's values under \
@@ -707,6 +712,29 @@ impl JsonSchema for CaptureForms {
     }
 }
 
+// A condition's when, kept once in a tool's $defs and named from each kind of
+// condition.
+struct GuardForms;
+
+impl JsonSchema for GuardForms {
+    fn schema_name() -> Cow<'static, str> {
+        "Guard".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        Schema::try_from(json!({
+            "type": "object",
+            "properties": {
+                "address": generator.subschema_for::<AddressForms>(),
+                "bytes": { "type": "string" },
+            },
+            "required": ["address", "bytes"],
+            "additionalProperties": false,
+        }))
+        .expect("an object is a schema")
+    }
+}
+
 // A condition, kept once in a tool's $defs, as until, gather and count all
 // take lists of them; count's take no capture.
 struct ConditionForms<const CAPTURING: bool>;
@@ -725,10 +753,11 @@ impl<const CAPTURING: bool> JsonSchema for ConditionForms<CAPTURING> {
         let byte = generator.subschema_for::<ByteForms>().to_value();
         let register = |most: u16| json!({ "type": "integer", "minimum": 0, "maximum": most });
         let capture = CAPTURING.then(|| generator.subschema_for::<CaptureForms>().to_value());
+        let when = generator.subschema_for::<GuardForms>().to_value();
         let condition = |kind: &str, other: &str, schema: &Value, required: &[&str]| {
             let mut branch = json!({
                 "type": "object",
-                "properties": { kind: schema, other: schema },
+                "properties": { kind: schema, other: schema, "when": when },
                 "required": required,
                 "additionalProperties": false,
             });
@@ -856,6 +885,7 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         *key != name
             && *key != other
             && *key != "capture"
+            && *key != "when"
             && !(takes_memory && *key == "memory")
             && !(takes_value(kind) && (*key == "value" || *key == "value_to"))
             && !(takes_changes(kind) && *key == "changes")
@@ -897,6 +927,11 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         })
         .transpose()?
         .unwrap_or(false);
+    let when = fields
+        .get("when")
+        .map(|given| guard(given).map_err(|problem| format!("when: {problem}; {GUARD_FORMS}")))
+        .transpose()?
+        .unwrap_or(NO_GUARD);
     let capture = fields
         .get("capture")
         .map(|given| {
@@ -953,10 +988,53 @@ fn condition(value: &Value, list: List) -> Result<(Condition, Option<Capturing>)
         last_value,
         changes,
         memory,
+        when,
         list,
         captures: capture.is_some(),
     };
     Ok((condition, capture))
+}
+
+fn guard(given: &Value) -> Result<Guard, String> {
+    let fields = given
+        .as_object()
+        .ok_or_else(|| format!("{given} is not an object"))?;
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| *key != "address" && *key != "bytes")
+    {
+        return Err(format!(
+            "{given} has {unknown}; when takes only address and bytes"
+        ));
+    }
+    let first = fields
+        .get("address")
+        .ok_or_else(|| format!("{given} has no address"))?;
+    let first = address(first).map_err(|problem| format!("address {problem}"))?;
+    let bytes = fields
+        .get("bytes")
+        .ok_or_else(|| format!("{given} has no bytes"))?;
+    let bytes = bytes
+        .as_str()
+        .ok_or_else(|| format!("bytes is {bytes}, which is not a string"))?;
+    let pattern = pattern(bytes)?;
+    if !(1..=GUARD_BYTES as usize).contains(&pattern.len()) {
+        return Err(format!(
+            "bytes holds {} bytes; give 1 to {GUARD_BYTES}",
+            pattern.len()
+        ));
+    }
+    let length = span(first, pattern.len() as i64)?;
+    let mut guard = Guard {
+        address: first,
+        length: u8::try_from(length).expect("a length of 1 to GUARD_BYTES"),
+        ..NO_GUARD
+    };
+    for (offset, (byte, mask)) in pattern.into_iter().enumerate() {
+        guard.bytes[offset] = byte;
+        guard.masks[offset] = mask;
+    }
+    Ok(guard)
 }
 
 // The conditions of until, gather or count, added to those of the others.
@@ -1169,8 +1247,9 @@ fn journaled<T: Serialize>(request: &T) -> Value {
 // Each list of conditions a request gave, as the journal keeps it, whatever
 // form it was given in: its addresses and its bytes after &, its registers by
 // their numbers, a range of one address, register or byte as that one, the
-// bytes from 0 to &FF as none, changes where it is true, and a capture's spans
-// each with its length.
+// bytes from 0 to &FF as none, changes where it is true, when's bytes as pairs
+// of capital digits, or ??, a space between each, and a capture's spans each
+// with its length.
 fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
     let written = |(condition, capture): (&Condition, &Option<Capturing>)| {
         let (name, _) = KIND_NAMES
@@ -1204,6 +1283,19 @@ fn journal_conditions(arguments: &mut Value, watched_for: &WatchedFor) {
         }
         if condition.changes {
             fields.insert("changes".to_owned(), json!(true));
+        }
+        let when = &condition.when;
+        if when.length > 0 {
+            let bytes: Vec<String> = (0..usize::from(when.length))
+                .map(|offset| match when.masks[offset] {
+                    0 => "??".to_owned(),
+                    _ => format!("{:02X}", when.bytes[offset]),
+                })
+                .collect();
+            fields.insert(
+                "when".to_owned(),
+                json!({ "address": Hexadecimal::address(when.address), "bytes": bytes.join(" ") }),
+            );
         }
         if let Some((name, _)) = MEMORY_NAMES
             .iter()
@@ -1353,13 +1445,12 @@ fn pattern(text: &str) -> Result<Vec<(u8, u8)>, String> {
         }
         _ => None,
     });
-    let pattern = pattern.collect::<Option<Vec<_>>>().ok_or_else(|| {
+    pattern.collect::<Option<Vec<_>>>().ok_or_else(|| {
         format!(
             "{text} is not bytes; write bytes as pairs of hexadecimal digits, with ?? for any \
              byte, such as CD ?? 14"
         )
-    })?;
-    sought(pattern, "bytes", "bytes")
+    })
 }
 
 fn text_pattern(text: &str) -> Result<Vec<(u8, u8)>, String> {
@@ -1445,6 +1536,7 @@ struct RunRequest {
     /// - `"memory": "ram"` or `"rom"` (execute, read): match only bytes the RAM holds, or only bytes a ROM holds. On a CPC the lower ROM covers &0000 to &3FFF and an upper ROM &C000 to &FFFF, each while the Gate Array enables it; on a Spectrum the ROM covers &0000 to &3FFF.
     /// - `"value"`, with `"value_to"` for a range (all but execute and in): match only when the byte read, written or given to the register is in that range. `{"out": "&7F00", "mask": "&C000", "value": "&80", "value_to": "&BF"}` matches the writes that set the Gate Array's mode, ROMs and interrupt counter.
     /// - `"changes": true` (write, psg, crtc): match only a write that changes the byte, or the bits the register keeps. `{"write": "&C7EC", "value": 6, "changes": true}` is the write that makes that byte 6. `changes` leaves out a write to PSG register 13 that writes the shape it already holds, though on the chip every write there restarts the envelope.
+    /// - `"when": {"address": address, "bytes": bytes}` (all kinds): match only while memory holds those bytes from that address, read as the processor reads them, as `peek` does: on a CPC, a ROM's bytes where the ROM is enabled, not the RAM beneath. `bytes` is written as `find`'s: pairs of hexadecimal digits, `??` for any byte, 1 to 8 bytes in memory order, none past &FFFF. Memory is read as the match is made: for an execute, before its instruction runs; for the others, just after the access. A write's own byte is then the new one, unless an enabled ROM covers it, and bytes the same instruction writes after it are not yet written. A stop or a capture on an access comes at the end of its instruction, after those writes, so it can show bytes other than those `when` tested. To match where a word is written with a value, put the condition on the byte written last and `when` on the word. `LD (nn),HL` writes its low byte first and `PUSH` its high byte first, so for the word at &AE1D written as &023B by `LD (nn),HL`: `{"write": "&AE1E", "when": {"address": "&AE1D", "bytes": "3B 02"}}`. This matches each such write, the same value written again included, and no write of the low byte alone. A condition on both bytes also matches a write of the low byte alone, and the first of the 2 writes wherever the new low byte beside the old high byte reads as the value, whatever word is being written: both writes of one `LD (nn),HL` can match, and so can the first write of another word.
     /// - `"capture": {"values": paths, "memory": spans}` (until and gather): each match then has a `captured` field with what the machine held. A path names one of the processor's values under `cpu`, as `inspect` names it: HL is `cpu.h` and `cpu.l`, IX is `cpu.ixh` and `cpu.ixl`, and the alternate set is held in pairs, as `cpu.hl_`. A span is `{"address": address, "length": bytes}`, 1 to 64 bytes (1 if `length` is omitted), none past &FFFF; with `"address": "cpu.sp"` or `"cpu.pc"` it starts where that register points at the capture, and wraps past &FFFF to &0000. An execute captures before its instruction runs. An access captures at the end of the instruction that made it, before any interrupt response there (IFF1 is already clear then); an access made by an interrupt response captures at the response's end. A request's captures may name at most 16 distinct values and spans together, reading at most 64 bytes.
     #[schemars(schema_with = "conditions_schema")]
     #[schemars(transform = absent_not_null)]
@@ -3434,6 +3526,7 @@ impl Server {
     /// - Keys that `set` wrote into the keyboard stay held while typing.
     /// - A HALT with interrupts disabled does not end the typing.
     /// - A program that reads the keyboard only now and then loses keys pressed in between: type one character at a time, with runs between that stop where it reads the keyboard.
+    /// - `type` takes no conditions. To watch what the last character does, type the text before it, then `run` for 3 standard frames, as long as `type` holds a key, with the keys that type that character in `keys` and the conditions in `until`, `gather` or `count`; then run on without `keys`, giving the conditions again. A key held past the firmware's repeat delay is typed again.
     #[tool(
         name = "type",
         annotations(
@@ -3747,7 +3840,7 @@ impl Server {
         }))
     }
 
-    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given), paths absolute, a CPC's `machine_open` with its `crtc_type` whether or not it was given, and each file read or written named by its SHA-256.
+    /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given, `when`'s bytes as pairs of capital hexadecimal digits with a space between, `??` for any byte), paths absolute, a CPC's `machine_open` with its `crtc_type` whether or not it was given, and each file read or written named by its SHA-256.
     /// - Reads are not recorded, nor are states kept, saved or dropped. Restoring a state makes the journal the state's.
     /// - A machine built from a state file takes the state's journal and files: the files the state's machine was built from, as the file names them, not the state file.
     /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
@@ -3900,7 +3993,7 @@ impl Server {
         Parameters(request): Parameters<FindRequest>,
     ) -> Result<Json<Found>, String> {
         let pattern = match (&request.bytes, &request.text) {
-            (Some(bytes), None) => pattern(bytes)?,
+            (Some(bytes), None) => sought(pattern(bytes)?, "bytes", "bytes")?,
             (None, Some(text)) => text_pattern(text)?,
             _ => {
                 return Err(
