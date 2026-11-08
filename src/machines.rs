@@ -731,8 +731,8 @@ impl Machine {
         match self.board {
             Board::Spectrum { .. } => Ok(()),
             Board::Cpc { .. } => Err(format!(
-                "a {} takes no tape here, since no test checks tape loading through a CPC's \
-                 firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs",
+                "a {} takes no tape here, since this server has no test of tape loading through \
+                 a CPC's firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs",
                 self.name
             )),
         }

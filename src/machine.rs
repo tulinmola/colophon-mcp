@@ -2040,7 +2040,8 @@ mod tests {
 
     // Under the sanitizers, a disc or a tape given in place of another, or
     // refused, leaves nothing pointing at what was freed: the machine runs on,
-    // reading the drive or the deck, after each.
+    // reading the drive, or the deck and, past the cassette's leader tape, the
+    // image, after each.
     #[test]
     fn a_disc_or_a_tape_replaced_is_freed_once_nothing_points_at_it() {
         let (workload, _) = cpc_workload();
@@ -2079,15 +2080,16 @@ mod tests {
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         for image in [&tape[..], &tape, &[1, 0], &tape] {
             let _ = spectrum.insert_tape(image);
-            spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+            let past_the_leader_tape = leader_ticks(&spectrum) + 2 * SPECTRUM_FRAME_TICKS;
+            spectrum.run(u32::MAX, past_the_leader_tape, None);
         }
         assert!(!spectrum.machine().tape.is_null());
     }
 
     // Under the sanitizers, a state kept with a disc in the drive, or a tape
     // in the deck, puts it back though another has taken its place since,
-    // and the machine runs on, reading the drive or the deck, once the state
-    // itself is dropped.
+    // and the machine runs on, reading the drive, or the deck and, past the
+    // cassette's leader tape, the image, once the state itself is dropped.
     #[test]
     fn a_state_keeps_its_disc_and_its_tape_through_a_swap() {
         let (workload, _) = cpc_workload();
@@ -2127,7 +2129,8 @@ mod tests {
         );
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         spectrum.insert_tape(&tape).unwrap();
-        spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+        let past_the_leader_tape = leader_ticks(&spectrum) + 2 * SPECTRUM_FRAME_TICKS;
+        spectrum.run(u32::MAX, past_the_leader_tape, None);
         let state = spectrum.state();
         let kept = Rc::clone(spectrum.tape.as_ref().expect("a tape"));
         // SAFETY: the deck stands beside the machine, which is not running.
@@ -2764,19 +2767,37 @@ mod tests {
         }
     }
 
+    // The ticks of the cassette's leader tape, which the reader hands the deck
+    // as its first pulse, before the image's: 5.7s of silence, less the
+    // silence the image keeps before its first edge (colophon-emulator's
+    // tzx.c, tzx_next_pulse, at 920e5d5); 0 once the deck's first tick has
+    // taken it.
+    fn leader_ticks(spectrum: &Spectrum) -> u64 {
+        let tape = spectrum.tape.as_ref().expect("a tape");
+        // SAFETY: the deck stands beside the machine, which is not running.
+        u64::from(unsafe { (*tape.deck.as_ptr()).reader.leader_ticks_left })
+    }
+
     // A Spectrum read from a state file finds its tape where it had played to,
-    // in the leader, in the data and past the tape's end, and runs on as the
-    // machine it was kept from runs on. The block's leader is 3223 pulses of
-    // 2168 T-states (16K/48K reference), its data starting some 6989000
-    // T-states in.
+    // in the cassette's leader tape, in the block's leader, in the data and
+    // past the tape's end, and runs on as the machine it was kept from runs
+    // on. The block's leader is 3223 pulses of 2168 T-states (16K/48K
+    // reference), its data starting some 6989000 T-states past the leader
+    // tape.
     #[test]
     fn a_spectrum_read_from_its_state_file_finds_its_tape_where_it_had_played_to() {
         let build = || Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         let mut kept = build();
         kept.insert_tape(&tape).unwrap();
+        let leader_tape = leader_ticks(&kept);
         let mut ticks = 0;
-        for until in [140_000, 7_000_000, 12_000_000] {
+        for until in [
+            140_000,
+            leader_tape + 140_000,
+            leader_tape + 7_000_000,
+            leader_tape + 12_000_000,
+        ] {
             ticks += kept.run(u32::MAX, until - ticks, None).ticks;
             let (fields, bytes) = through_a_file(kept.state().filed());
             let mut read = build();
@@ -2795,16 +2816,18 @@ mod tests {
     }
 
     // The deck takes its first pulse on its first tick, and each after it as
-    // the last one's ticks run out (tape.c's tape_tick), so a reader T ticks
-    // into a leader of 2168 T-state pulses has taken 1 + (T - 1) / 2168 of
-    // them, and is found in that many pulses and not in one fewer. A reader
-    // no playing of the tape comes to is refused, and so is an image longer
-    // than a tape given.
+    // the last one's ticks run out (tape.c's tape_tick). The first is the
+    // cassette's leader tape, of L ticks, and a block's leader of 2168 T-state
+    // pulses follows it, so a reader T ticks after the tape went in, T greater
+    // than L, has taken 2 + (T - L - 1) / 2168 pulses, and is found in that
+    // many and not in one fewer. A reader no playing of the tape comes to is
+    // refused, and so is an image longer than a tape given.
     #[test]
     fn a_tape_read_from_a_state_file_is_played_to_where_it_stood() {
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
         spectrum.insert_tape(&[3, 0, 0xFF, 0x01, 0xFE]).unwrap();
-        let ticks = spectrum.run(u32::MAX, 140_000, None).ticks;
+        let leader_tape = leader_ticks(&spectrum);
+        let ticks = spectrum.run(u32::MAX, leader_tape + 140_000, None).ticks;
         let (fields, bytes) = through_a_file(spectrum.state().filed());
         let load = |fields: &Map<String, Value>, ticks: u64| {
             let mut read = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
@@ -2817,7 +2840,7 @@ mod tests {
                  pulse a tick"
             ))
         };
-        let pulses = 1 + (ticks - 1) / 2168;
+        let pulses = 2 + (ticks - leader_tape - 1) / 2168;
         assert_eq!(load(&fields, pulses), Ok(()));
         assert_eq!(load(&fields, pulses - 1), refused(pulses - 1));
         let mut nowhere = fields.clone();
@@ -2875,7 +2898,8 @@ mod tests {
         // SAFETY: only the address is taken, of a deck the machine holds
         // throughout.
         let deck = unsafe { &raw mut (*kept.tape.as_ref().unwrap().deck.as_ptr()).tape };
-        let mut ticks = kept.run(u32::MAX, 8_000_000, None).ticks;
+        let leader_tape = leader_ticks(&kept);
+        let mut ticks = kept.run(u32::MAX, leader_tape + 8_000_000, None).ticks;
         // SAFETY: the deck stands beside the machine, which is not running.
         assert!(!unsafe { (*deck).playing });
         for _part in 0..2 {

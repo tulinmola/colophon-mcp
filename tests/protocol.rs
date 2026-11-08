@@ -9078,17 +9078,47 @@ const COUNTING_EDGES: [u8; 23] = [
     JR_Z, 0xF9, LD_E_A, INC_HL, LD_HL_TO, 0x00, 0x80, JR, 0xF2,
 ];
 
+// The cassette's leader tape, 5.7s at 3500 ticks a millisecond
+// (colophon-emulator's tzx.c, LEADER_MILLISECONDS, at 920e5d5). The reader
+// plays it as silence before the image, less the silence the image keeps
+// before its first edge (leader_still_wanted), of which a .tap's first pulse,
+// low, is part; so an image that keeps less than this sounds its first edge
+// this many ticks after PLAY.
+const LEADER_TICKS: u64 = 5700 * 3500;
+
+// The edges COUNTING_EDGES counts over a run of these frames' ticks, and the
+// tick the run ends at.
+fn edges(session: &mut Session, handle: &str, frames: u64) -> (u16, u64) {
+    let before = bytes_of(&session.peek(handle, json!("&8000"), 2));
+    let ran = session.run(handle, json!({ "ticks": frames * SPECTRUM_FRAME_TICKS }));
+    let after = bytes_of(&session.peek(handle, json!("&8000"), 2));
+    let counted = u16::from_le_bytes([after[0], after[1]])
+        .wrapping_sub(u16::from_le_bytes([before[0], before[1]]));
+    (counted, ran["tick"].as_u64().unwrap())
+}
+
+// The edges COUNTING_EDGES counts over the ten frames centred on `centre`,
+// reached by a run from `from`, the tick the machine stands at, and the tick
+// the count ends at.
+fn edges_around(session: &mut Session, handle: &str, from: u64, centre: u64) -> (u16, u64) {
+    let start = centre - 5 * SPECTRUM_FRAME_TICKS;
+    session.run(handle, json!({ "ticks": start - from }));
+    edges(session, handle, 10)
+}
+
 // A header block opens with "a leader consisting of 8063 (for header
 // blocks) or 3223 (data blocks) pulses, each of which has a duration of
-// 2168 tstates" (16K/48K reference), each pulse an edge, so ten frames of
-// PLAY from a tape's start hear 698880 / 2168 of them, 322.4, which is 322
-// or 323 as the first pulse is low or high; the program counts each well
-// inside its pulse. The emulator's reader plays a .tap's blocks as the TZX
-// format's standard block, ID 10, which is followed by a "Pause after this
-// block (ms.) {1000}" ("TZX format" v1.20,
-// https://worldofspectrum.net/TZXformat.html), so 265 frames on, past the
-// header's 250 of leader and its 19 bytes, the tape is silent for ten
-// frames, and a tape put in in its place plays from its own start.
+// 2168 tstates" (16K/48K reference), each pulse after the first an edge. The
+// cassette's leader tape comes first, so ten frames from PLAY hear no edge,
+// and the ten frames centred on the leader tape's end hear the tape's first
+// edge and the 161 in the 349440 ticks after it, 162; the program counts each
+// well inside its pulse. The emulator's reader plays a .tap's blocks as the
+// TZX format's standard block, ID 10, which is followed by a "Pause after
+// this block (ms.) {1000}" ("TZX format" v1.20,
+// https://worldofspectrum.net/TZXformat.html), so 265 frames past the leader
+// tape, with the header's 250 frames of leader and its 19 bytes behind it,
+// the tape is silent for ten frames, and a tape put in in its place plays
+// from its own start.
 #[test]
 fn a_tape_plays_from_the_tick_it_goes_into_the_deck() {
     let roms = Roms::programmed("spectrum48.rom", &COUNTING_EDGES);
@@ -9096,26 +9126,24 @@ fn a_tape_plays_from_the_tick_it_goes_into_the_deck() {
     let path = roms.write("program.tap", &tape);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
-    // The edges counted over a run of these frames, and the tick it ends at.
-    let edges = |session: &mut Session, frames: u64| {
-        let before = bytes_of(&session.peek(&handle, json!("&8000"), 2));
-        let ran = session.run(&handle, json!({ "ticks": frames * SPECTRUM_FRAME_TICKS }));
-        let after = bytes_of(&session.peek(&handle, json!("&8000"), 2));
-        let counted = u16::from_le_bytes([after[0], after[1]])
-            .wrapping_sub(u16::from_le_bytes([before[0], before[1]]));
-        (counted, ran["tick"].clone())
-    };
-    let (counted, tick) = edges(&mut session, 10);
+    let (counted, inserted) = edges(&mut session, &handle, 10);
     assert_eq!(counted, 0);
     assert_eq!(
         session.answer("tape_insert", json!({ "handle": handle, "path": path })),
-        json!({ "handle": handle, "tick": tick, "path": path, "sha256": sha256(&tape) })
+        json!({ "handle": handle, "tick": inserted, "path": path, "sha256": sha256(&tape) })
     );
-    assert!([322, 323].contains(&edges(&mut session, 10).0));
-    edges(&mut session, 255);
-    assert_eq!(edges(&mut session, 10).0, 0);
+    let (counted, tick) = edges(&mut session, &handle, 10);
+    assert_eq!(counted, 0);
+    let first_edge = inserted + LEADER_TICKS;
+    let (counted, tick) = edges_around(&mut session, &handle, tick, first_edge);
+    assert_eq!(counted, 162);
+    let silent = first_edge + 270 * SPECTRUM_FRAME_TICKS;
+    let (counted, inserted) = edges_around(&mut session, &handle, tick, silent);
+    assert_eq!(counted, 0);
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
-    assert!([322, 323].contains(&edges(&mut session, 10).0));
+    let first_edge = inserted + LEADER_TICKS;
+    let (counted, _) = edges_around(&mut session, &handle, inserted, first_edge);
+    assert_eq!(counted, 162);
 }
 
 #[test]
@@ -9127,8 +9155,8 @@ fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
     let spectrum = session.open("spectrum48");
     assert_eq!(
         session.refusal("tape_insert", json!({ "handle": cpc, "path": not_a_tape })),
-        "a cpc6128 takes no tape here, since no test checks tape loading through a CPC's firmware; \
-         use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs"
+        "a cpc6128 takes no tape here, since this server has no test of tape loading through a \
+         CPC's firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs"
     );
     let refused = session.refusal(
         "tape_insert",
@@ -9469,10 +9497,15 @@ fn branches_kept_from_one_machine_stand_apart() {
 }
 
 // A tape put in after a state was kept is taken out again by the restore,
-// and the tape that was in plays on from where it stood then. 265 frames
-// from its start it is silent, between its header and its program
-// (a_tape_plays_from_the_tick_it_goes_into_the_deck); 60 frames on it plays
-// its program's leader, and the tape put in since its own.
+// and the tape that was in plays on from where it stood then. 265 frames past
+// the cassette's leader tape it is silent, between its header and its
+// program (a_tape_plays_from_the_tick_it_goes_into_the_deck), and for ten
+// frames after; 60 frames past the state it plays its program's leader, of
+// whose edges the ten frames from there hear 698880 / 2168, 322.4, so 322 or
+// 323 as the frames fall among them. A tape left where it stood as the other
+// went in would be playing that leader in the first ten frames, and one
+// played from its start, the tape put in since among them, or none, would be
+// silent in the second.
 #[test]
 fn a_tape_comes_back_with_a_state_where_it_had_played_to() {
     let roms = Roms::programmed("spectrum48.rom", &COUNTING_EDGES);
@@ -9483,14 +9516,19 @@ fn a_tape_comes_back_with_a_state_where_it_had_played_to() {
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
-    session.run(&handle, json!({ "ticks": 265 * SPECTRUM_FRAME_TICKS }));
+    let ticks = LEADER_TICKS + 265 * SPECTRUM_FRAME_TICKS;
+    let kept_at = session.run(&handle, json!({ "ticks": ticks }))["tick"]
+        .as_u64()
+        .unwrap();
     let state = keep(&mut session, &handle);
     session.run(&handle, json!({ "ticks": 60 * SPECTRUM_FRAME_TICKS }));
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
     restore(&mut session, &handle, &state);
-    let before = bytes_of(&session.peek(&handle, json!("&8000"), 2));
-    session.run(&handle, json!({ "ticks": 10 * SPECTRUM_FRAME_TICKS }));
-    assert_eq!(bytes_of(&session.peek(&handle, json!("&8000"), 2)), before);
+    let (counted, tick) = edges(&mut session, &handle, 10);
+    assert_eq!(counted, 0);
+    let program = kept_at + 65 * SPECTRUM_FRAME_TICKS;
+    let (counted, _) = edges_around(&mut session, &handle, tick, program);
+    assert!([322, 323].contains(&counted), "{counted}");
 }
 
 #[test]
@@ -12243,9 +12281,9 @@ fn a_run_by_frames_leaves_either_firmware_inside_its_interrupts_handler() {
 // the test writes. LD-BYTES, at &0556, is called for the header, "LOAD
 // seventeen bytes" (https://skoolkid.github.io/rom/asm/0605.html, LD_LOOK_H),
 // as ENTER goes down, inside the typing, and once more, for the program,
-// in the run after; the program stands where PROG, at 23635, the "Address
-// of BASIC program" (ZX Spectrum BASIC programming, ch. 25), points, and has
-// run from its autostart line.
+// in the run after, longer by the cassette's leader tape; the program
+// stands where PROG, at 23635, the "Address of BASIC program" (ZX Spectrum
+// BASIC programming, ch. 25), points, and has run from its autostart line.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn load_reads_a_program_from_a_tape_and_runs_it() {
@@ -12259,7 +12297,10 @@ fn load_reads_a_program_from_a_tape_and_runs_it() {
     session.answer("type", json!({ "handle": handle, "text": "j\"\"\n" }));
     let ran = session.run(
         &handle,
-        json!({ "frames": 600, "gather": [{ "execute": "&0556" }] }),
+        json!({
+            "frames": 600 + LEADER_TICKS.div_ceil(SPECTRUM_FRAME_TICKS),
+            "gather": [{ "execute": "&0556" }],
+        }),
     );
     assert_eq!(ran["gathered"].as_array().unwrap().len(), 1, "{ran}");
     let prog = bytes_of(&session.peek(&handle, json!(23635), 2));
@@ -12376,9 +12417,10 @@ fn a_cpc_kept_while_it_writes_its_disc_runs_on_from_a_restore_and_from_its_state
 }
 
 // A Spectrum kept partway through LOAD "", inside the ROM's LD-BYTES, from
-// &0556 to &0604 (The Complete Spectrum ROM Disassembly), its tape playing,
-// runs on from a restore, and from its state file in another server, to the
-// machine it ran on to, the program loaded and run
+// &0556 to &0604 (The Complete Spectrum ROM Disassembly), its tape past the
+// cassette's leader tape and playing the header's leader, runs on from a
+// restore, and from its state file in another server, to the machine it ran
+// on to, the program loaded and run
 // (load_reads_a_program_from_a_tape_and_runs_it).
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
@@ -12393,7 +12435,10 @@ fn a_spectrum_kept_while_it_loads_runs_on_from_a_restore_and_from_its_state_file
     session.run(&handle, json!({ "ticks": 128 * SPECTRUM_FRAME_TICKS }));
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
     session.answer("type", json!({ "handle": handle, "text": "j\"\"\n" }));
-    let ran = session.run(&handle, json!({ "frames": 200 }));
+    let ran = session.run(
+        &handle,
+        json!({ "frames": 200 + LEADER_TICKS.div_ceil(SPECTRUM_FRAME_TICKS) }),
+    );
     assert!(
         (0x0556..0x0605).contains(&after_ampersand(&ran["pc"], 4)),
         "{ran}"
