@@ -81,8 +81,12 @@ const MOST_CONDITIONS: usize = 16;
 // The values and the spans of memory a request's captures name together,
 // which hold a match that captures to some 750 characters.
 const MOST_CAPTURED: usize = 16;
-// An instruction listed takes some 50 characters, so these come to about half
-// as many again as MOST_BYTES does.
+// An instruction listed takes some 50 characters, and so does the word a CPC
+// firmware restart is listed with, so these come to some 13000 characters,
+// under the 10000 tokens at which Claude Code warns, and to some 26000 where
+// every instruction is such a restart, as in the firmware's main jumpblock:
+// at or past the warning, and under the 50000 characters past which it saves
+// an answer to a file, https://code.claude.com/docs/en/mcp.
 const MOST_INSTRUCTIONS_LISTED: u16 = 256;
 // A state holds the machine's struct, its RAM and its picture, some 450K on a
 // 6128, and a disc's own copy only where the disc changed since it was last
@@ -2949,7 +2953,7 @@ struct Listed {
     ram: Option<Hexadecimal>,
     /// The instruction's bytes, as pairs of hexadecimal digits.
     bytes: String,
-    /// The instruction in Zilog's mnemonics, with addresses, bytes and displacements in hexadecimal after &, such as "LD HL,&1234".
+    /// The instruction in Zilog's mnemonics, with addresses, bytes and displacements in hexadecimal after &, such as "LD HL,&1234"; or, for the 2 bytes after RST &08, &10, &18 or &28 on a CPC, DEFW and the word they hold, such as "DEFW &93FE".
     text: String,
     /// On a CPC, the name SOFT 968 gives the firmware entry the instruction jumps or calls to, for the entries `disassemble`'s description lists. Not given for any other instruction, nor on a Spectrum.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2959,7 +2963,7 @@ struct Listed {
 
 #[derive(Serialize, JsonSchema)]
 struct Disassembled {
-    /// The instructions, in memory order.
+    /// The instructions, in memory order. On a CPC, RST &08, &10, &18 or &28 may be followed by a DEFW entry, as `disassemble`'s description says.
     instructions: Vec<Listed>,
 }
 
@@ -4275,7 +4279,7 @@ impl Server {
         })
     }
 
-    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. With `address`, memory is read as `peek` reads it, wrapping from &FFFF to &0000. With `ram`, it reads a CPC's RAM by its own addresses, in the 64K that holds the first instruction: &0000 to &FFFF, or a 6128's &10000 to &1FFFF. That 64K is listed as `address` lists it when the processor reads that 64K alone, with the ROMs disabled, and the listing wraps from its last byte to its first. Each instruction's `ram` is its address in the RAM. Its `bytes` and `text` are the ones that listing gives, so an address in a text, a relative jump's target among them, is the processor's. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts. On a CPC, an instruction that jumps or calls to an entry of the firmware's jumpblocks has `firmware`, the entry's name in SOFT 968, Amstrad's firmware manual, such as "KM WAIT KEY" for `CALL &BB18`. The name goes with the address, whatever memory holds there now. The entries named, 3 bytes apart:
+    /// Disassemble a machine's memory from an address: each instruction's address, bytes and text, in Zilog's mnemonics with addresses, bytes and displacements in & hexadecimal and relative jump targets worked out. With `address`, memory is read as `peek` reads it, wrapping from &FFFF to &0000. With `ram`, it reads a CPC's RAM by its own addresses, in the 64K that holds the first instruction: &0000 to &FFFF, or a 6128's &10000 to &1FFFF. That 64K is listed as `address` lists it when the processor reads that 64K alone, with the ROMs disabled, and the listing wraps from its last byte to its first. Each instruction's `ram` is its address in the RAM. Its `bytes` and `text` are the ones that listing gives, so an address in a text, a relative jump's target among them, is the processor's. A chain of DD and FD prefixes is one instruction, as `step` runs it. Undocumented instructions use colophon-player's names: IXH, IXL, SLL, RLC (IX+&05),B and the like, IN (C), OUT (C),0, IM 0/1, NOP for ED followed by a byte that starts no instruction, and BRK for ED FF. It does not tell code from data: bytes are decoded from wherever the listing starts. On a CPC, RST &08, &10, &18 and &28 (the firmware's LOW JUMP, SIDE CALL, FAR CALL and FIRM JUMP) are each followed by an entry whose text is DEFW and the word in the next 2 bytes. That entry does not count toward the `instructions` asked for. This applies to each restart only while the 3 bytes at its own address (&0008, &0010, &0018 or &0028), read as the listing reads memory, equal the lower ROM's there; otherwise the restart is listed alone. On a CPC, an instruction that jumps or calls to an entry of the firmware's jumpblocks has `firmware`, the entry's name in SOFT 968, Amstrad's firmware manual, such as "KM WAIT KEY" for `CALL &BB18`. The name goes with the address, whatever memory holds there now. The entries named, 3 bytes apart:
     /// - The main jumpblock: &BB00 to &BD5B on a cpc6128, to &BD58 on a cpc664, to &BD37 on a cpc464.
     /// - The high kernel jumpblock: &B900 to &B921, and &B92A on a cpc664 or a cpc6128.
     /// - The indirections: &BDCD to &BDF4 on a cpc664 or a cpc6128, to &BDF1 on a cpc464.

@@ -732,7 +732,7 @@ pub struct Cpc {
     machine: Handed<cpc_t>,
     upper_roms: BTreeMap<u8, Handed<[u8; 0x4000]>>,
     ram: Handed<[u8]>,
-    _lower_rom: Handed<[u8; 0x4000]>,
+    lower_rom: Handed<[u8; 0x4000]>,
     framebuffer: Handed<[u8]>,
     discs: [Option<Rc<Disc>>; 2],
     tape: Option<Rc<Tape>>,
@@ -774,7 +774,7 @@ impl Cpc {
             machine,
             upper_roms: BTreeMap::new(),
             ram,
-            _lower_rom: lower_rom,
+            lower_rom,
             framebuffer,
             discs: [None, None],
             tape: None,
@@ -1111,6 +1111,11 @@ impl Cpc {
         // SAFETY: as for machine(): the core writes the RAM only in a call
         // that borrows the machine mutably.
         unsafe { &*self.ram.as_ptr() }
+    }
+
+    pub fn lower_rom(&self) -> &[u8; 0x4000] {
+        // SAFETY: the core takes the lower ROM as const and never writes it.
+        unsafe { &*self.lower_rom.as_ptr() }
     }
 
     pub fn ram_mut(&mut self) -> &mut [u8] {

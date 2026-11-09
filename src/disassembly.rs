@@ -329,6 +329,18 @@ pub fn instruction(read: &dyn Fn(u16) -> u8, address: u16, most: usize) -> Optio
     })
 }
 
+// Two bytes as the word they hold, written as SOFT 968 writes the address
+// after a FAR CALL: "RST 3 ;Far CALL / DEFW CMD_FAR_ADDRESS" (10.7,
+// https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual).
+pub fn word_of_data(read: &dyn Fn(u16) -> u8, address: u16) -> Instruction {
+    let value = u16::from_le_bytes([read(address), read(address.wrapping_add(1))]);
+    Instruction {
+        length: 2,
+        text: format!("DEFW {}", word(value)),
+        target: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

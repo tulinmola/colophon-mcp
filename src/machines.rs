@@ -1757,7 +1757,8 @@ impl Built {
         most_bytes: usize,
     ) -> Result<Vec<(u32, Vec<u8>, disassembly::Instruction)>, String> {
         let read = |address| self.read(address);
-        listing(&read, None, address, instructions, most_bytes)
+        let rom = self.lower_rom();
+        listing(&read, rom, None, address, instructions, most_bytes)
     }
 
     // The same in a CPC's RAM by its own addresses: the 64K that holds `ram`,
@@ -1775,7 +1776,15 @@ impl Built {
         let base = ram & !0xFFFF;
         let window = &memory[base as usize..][..0x10000];
         let read = |address: u16| window[usize::from(address)];
-        listing(&read, Some(base), ram as u16, instructions, most_bytes)
+        let rom = self.lower_rom();
+        listing(&read, rom, Some(base), ram as u16, instructions, most_bytes)
+    }
+
+    fn lower_rom(&self) -> Option<&[u8; 0x4000]> {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => Some(cpc.lower_rom()),
+            Hardware::Spectrum(_) => None,
+        }
     }
 
     pub fn poke(&mut self, address: u16, bytes: &[u8]) {
@@ -1885,11 +1894,15 @@ fn matching<'a>(memory: &'a [u8], pattern: &'a [(u8, u8)]) -> impl Iterator<Item
 
 // Instructions from `address` on, read through `read`, a 64K that wraps
 // past &FFFF as the processor's view does, each with its address and its
-// bytes: as many as were asked, or as fit in most_bytes. A listing of a CPC's
-// RAM gives `ram_base`, where its 64K starts in the RAM: its addresses count
-// from there, and its refusals speak of the RAM.
+// bytes: as many as were asked, or as fit in most_bytes. A CPC gives its
+// `lower_rom`, and a firmware restart that takes an address is listed with
+// the word after it, the two or neither, the word not counted among the
+// instructions. A listing of a CPC's RAM gives `ram_base`, where its 64K
+// starts in the RAM: its addresses count from there, and its refusals speak
+// of the RAM.
 fn listing(
     read: &dyn Fn(u16) -> u8,
+    lower_rom: Option<&[u8; 0x4000]>,
     ram_base: Option<u32>,
     address: u16,
     instructions: u16,
@@ -1902,16 +1915,23 @@ fn listing(
         let Some(instruction) = disassembly::instruction(read, at, most_bytes - used) else {
             break;
         };
-        if used + instruction.length > most_bytes {
+        let after = at.wrapping_add(instruction.length as u16);
+        let word = lower_rom
+            .filter(|rom| takes_an_address(read, rom, &instruction))
+            .map(|_| disassembly::word_of_data(read, after));
+        let length = instruction.length + word.as_ref().map_or(0, |word| word.length);
+        if used + length > most_bytes {
             break;
         }
-        let length = instruction.length;
-        let bytes = (0..length as u16)
-            .map(|offset| read(at.wrapping_add(offset)))
-            .collect();
-        listed.push((base + u32::from(at), bytes, instruction));
+        for entry in std::iter::once(instruction).chain(word) {
+            let bytes = (0..entry.length as u16)
+                .map(|offset| read(at.wrapping_add(offset)))
+                .collect();
+            let next = at.wrapping_add(entry.length as u16);
+            listed.push((base + u32::from(at), bytes, entry));
+            at = next;
+        }
         used += length;
-        at = at.wrapping_add(length as u16);
     }
     if listed.is_empty() {
         let prefixed = (0..=u16::MAX)
@@ -1942,6 +1962,26 @@ fn listing(
         });
     }
     Ok(listed)
+}
+
+// Whether an instruction is a restart that takes the two bytes after it as
+// an address, as the CPC firmware's LOW JUMP, SIDE CALL, FAR CALL and FIRM
+// JUMP do (SOFT 968, 2.3, https://archive.org/details/SOFT968TheAmstrad6128FirmwareManual):
+// only while the first three bytes at the restart, read through `read`, are
+// the lower ROM's JP, which the RAM beneath the ROM holds too, the area being
+// "set up so that the restarts operate whatever the current ROM state is". A
+// program that disables the ROM may put its own restart there, as Aliens
+// makes RST &28 its key test.
+fn takes_an_address(
+    read: &dyn Fn(u16) -> u8,
+    lower_rom: &[u8; 0x4000],
+    instruction: &disassembly::Instruction,
+) -> bool {
+    let Some(restart @ (0x08 | 0x10 | 0x18 | 0x28)) = instruction.target else {
+        return false;
+    };
+    instruction.text.starts_with("RST ")
+        && (restart..restart + 3).all(|address| read(address) == lower_rom[usize::from(address)])
 }
 
 #[cfg(test)]

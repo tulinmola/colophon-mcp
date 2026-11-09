@@ -7268,7 +7268,7 @@ fn a_call_or_a_jump_to_a_firmware_entry_is_named_for_it() {
         ("CDF4BD", from_the_664("KM SCAN KEYS")),
         ("CDF7BD", [None; 3]),
         ("CD3800", [None; 3]),
-        ("CF", [None; 3]),
+        ("F7", [None; 3]),
         ("2118BB", [None; 3]),
         ("1800", [None; 3]),
     ];
@@ -7447,6 +7447,162 @@ fn a_listing_of_the_ram_is_the_processors_with_that_64k_alone() {
             );
         }
     }
+}
+
+// The two bytes after a CPC firmware restart that takes an address are
+// listed with it as the word they hold, as SOFT 968 writes a FAR CALL's:
+// "RST 3 ;Far CALL / DEFW CMD_FAR_ADDRESS" (10.7). The word is not counted
+// among the instructions asked for. LOW JUMP, SIDE CALL, FAR CALL and FIRM
+// JUMP take one, RAM LAM and the rest none (2.3). A restart is the
+// firmware's while its first three bytes are the lower ROM's JP, here the
+// 6128's four, written into the test's ROM, in the memory the listing reads:
+// the ROM, or the RAM beneath it, which may hold a program's own restart, as
+// Aliens' RAM holds JP &00C2 at &0028, or a 6128's second 64K, where the
+// firmware keeps none. RST &00 and RST &38, whose RAM holds what the ROM does
+// here, take none; a restart behind DD, which `step` runs with it as one
+// instruction, takes one too. A restart wraps past &FFFF to its word, and the
+// two are listed only where both fit in the bytes a listing reads, or
+// neither is. A Spectrum's restarts are listed alone.
+#[test]
+fn a_cpc_firmware_restart_is_listed_with_the_address_it_takes() {
+    let firmware_jumps = [
+        (0x0008, "C38AB9"),
+        (0x0010, "C31DBA"),
+        (0x0018, "C3C7B9"),
+        (0x0028, "C335BA"),
+    ];
+    let roms = Roms::all();
+    for (offset, jump) in firmware_jumps {
+        roms.write_at("cpc6128.rom", offset, &bytes_of(jump));
+    }
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    let program = "CFFE93D700C0DF3412E7EF35BAF7CD1800";
+    session.poke(&handle, json!("&4000"), program);
+    let texts = |session: &mut Session, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["handle"] = json!(handle);
+        if arguments.get("instructions").is_none() {
+            arguments["instructions"] = json!(8);
+        }
+        let listed = session.answer("disassemble", arguments)["instructions"].clone();
+        let texts: Vec<String> = listed
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .map(|instruction| instruction["text"].as_str().expect("a text").to_owned())
+            .collect();
+        (listed, texts)
+    };
+    let every_word = [
+        "RST &08",
+        "DEFW &93FE",
+        "RST &10",
+        "DEFW &C000",
+        "RST &18",
+        "DEFW &1234",
+        "RST &20",
+        "RST &28",
+        "DEFW &BA35",
+        "RST &30",
+        "CALL &0018",
+        "NOP",
+    ];
+    let (listed, through_the_rom) = texts(&mut session, json!({ "address": "&4000" }));
+    assert_eq!(through_the_rom, every_word);
+    assert_eq!(
+        listed.as_array().expect("a listing")[..2],
+        [
+            json!({ "address": "&4000", "bytes": "CF", "text": "RST &08" }),
+            json!({ "address": "&4001", "bytes": "FE93", "text": "DEFW &93FE" }),
+        ]
+    );
+    let one = json!({ "address": "&4000", "instructions": 1 });
+    assert_eq!(texts(&mut session, one).1, ["RST &08", "DEFW &93FE"]);
+    let no_word = [
+        "RST &08",
+        "CP &93",
+        "RST &10",
+        "NOP",
+        "RET NZ",
+        "RST &18",
+        "INC (HL)",
+        "LD (DE),A",
+    ];
+    assert_eq!(texts(&mut session, json!({ "ram": "&4000" })).1, no_word);
+    session.poke(&handle, json!("&0008"), firmware_jumps[0].1);
+    session.poke(&handle, json!("&0010"), "C31DBB");
+    session.poke(&handle, json!("&0018"), firmware_jumps[2].1);
+    session.poke(&handle, json!("&0028"), "C3C200");
+    session.set(&handle, json!({ "gate_array.lower_rom_enabled": false }));
+    let programs_own = [
+        "RST &08",
+        "DEFW &93FE",
+        "RST &10",
+        "NOP",
+        "RET NZ",
+        "RST &18",
+        "DEFW &1234",
+        "RST &20",
+        "RST &28",
+        "DEC (HL)",
+    ];
+    assert_eq!(
+        texts(&mut session, json!({ "address": "&4000" })).1,
+        programs_own
+    );
+    let (listed, by_ram) = texts(&mut session, json!({ "ram": "&4000" }));
+    assert_eq!(by_ram, programs_own);
+    assert_eq!(listed[1]["ram"], "&4001");
+    session.poke(&handle, json!("&5000"), "C7FFDDCFFE93");
+    let listed = texts(
+        &mut session,
+        json!({ "address": "&5000", "instructions": 3 }),
+    )
+    .0;
+    assert_eq!(
+        listed,
+        json!([
+            { "address": "&5000", "bytes": "C7", "text": "RST &00" },
+            { "address": "&5001", "bytes": "FF", "text": "RST &38" },
+            { "address": "&5002", "bytes": "DDCF", "text": "RST &08" },
+            { "address": "&5004", "bytes": "FE93", "text": "DEFW &93FE" },
+        ])
+    );
+    session.set(&handle, json!({ "gate_array.upper_rom_enabled": false }));
+    session.poke(&handle, json!("&FFFF"), "CF");
+    session.poke(&handle, json!("&0000"), "FE93");
+    let listed = texts(
+        &mut session,
+        json!({ "address": "&FFFF", "instructions": 1 }),
+    )
+    .0;
+    assert_eq!(
+        listed[1],
+        json!({ "address": "&0000", "bytes": "FE93", "text": "DEFW &93FE" })
+    );
+    session.poke(&handle, json!("&6000"), &"DD".repeat(4093));
+    session.poke(&handle, json!("&6FFD"), "00CFFE93");
+    let listed = texts(
+        &mut session,
+        json!({ "address": "&6000", "instructions": 2 }),
+    )
+    .1;
+    assert_eq!(listed, ["NOP"]);
+    session.answer(
+        "poke",
+        json!({ "handle": handle, "ram": "&14000", "bytes": program }),
+    );
+    assert_eq!(texts(&mut session, json!({ "ram": "&14000" })).1, no_word);
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let handle = session.open("spectrum48");
+    session.poke(&handle, json!("&8000"), "CF0100");
+    let listed = session.answer(
+        "disassemble",
+        json!({ "handle": handle, "address": "&8000", "instructions": 2 }),
+    );
+    assert_eq!(listed["instructions"][1]["text"], "LD BC,&0000");
 }
 
 #[test]
@@ -11812,6 +11968,55 @@ fn a_listing_names_the_jumpblock_entries_each_cpcs_firmware_sets_up() {
         }
         let entries: BTreeSet<u64> = entries.into_iter().map(u64::from).collect();
         assert_eq!(named, entries, "{machine}");
+    }
+}
+
+// Each CPC's main jumpblock is a run of LOW JUMPs and FAR CALLs three bytes
+// apart, as the test above finds it, and the firmware's restarts stand in the
+// RAM beneath the lower ROM as in the ROM, so a listing of as many
+// instructions as the jumpblock has entries keeps to them all, through the
+// ROM and beneath it alike: each restart, then the word after it.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_listing_keeps_to_the_entries_of_each_cpcs_main_jumpblock() {
+    let mut session = Session::reading(&firmware());
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "frames": 100 }));
+        let jumpblock = bytes_of(&session.peek(&handle, json!("&BB00"), 0x300));
+        let entries = jumpblock
+            .iter()
+            .step_by(3)
+            .take_while(|restart| matches!(**restart, LOW_JUMP | FAR_CALL))
+            .count();
+        for (lower_rom_enabled, form) in [(true, "address"), (false, "address"), (true, "ram")] {
+            session.set(
+                &handle,
+                json!({ "gate_array.lower_rom_enabled": lower_rom_enabled }),
+            );
+            let mut arguments = json!({ "handle": handle, "instructions": entries });
+            arguments[form] = json!("&BB00");
+            let listed = session.answer("disassemble", arguments);
+            let listed = listed["instructions"].as_array().unwrap();
+            assert_eq!(listed.len(), 2 * entries, "{machine}");
+            for (number, instruction) in listed.iter().enumerate() {
+                let entry = number / 2 * 3;
+                let (offset, text) = match (number % 2, jumpblock[entry]) {
+                    (0, LOW_JUMP) => (entry, "RST &08".to_owned()),
+                    (0, FAR_CALL) => (entry, "RST &18".to_owned()),
+                    (0, restart) => panic!("{machine}: &{restart:02X} at &BB{entry:02X}"),
+                    _ => {
+                        let word = u16::from_le_bytes([jumpblock[entry + 1], jumpblock[entry + 2]]);
+                        (entry + 1, format!("DEFW &{word:04X}"))
+                    }
+                };
+                assert_eq!(
+                    (&instruction[form], &instruction["text"]),
+                    (&json!(format!("&{:04X}", 0xBB00 + offset)), &json!(text)),
+                    "{machine}, lower ROM enabled {lower_rom_enabled}, {form}"
+                );
+            }
+        }
     }
 }
 
