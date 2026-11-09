@@ -11,20 +11,21 @@ use std::sync::{PoisonError, RwLock};
 use serde_json::{Map, Value, json};
 
 use crate::emulator::{
-    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, FLOPPY_BYTES_PER_REVOLUTION,
-    FLOPPY_MAX_CYLINDERS, FLOPPY_MAX_SIDES, MCP_KINDS, SPECTRUM_FRAMEBUFFER_HEIGHT,
-    SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K, SPECTRUM_ROM_SIZE,
-    SPECTRUM_TICKS_PER_MILLISECOND, cpc_connect_monitor, cpc_fit_disc_interface, cpc_init,
-    cpc_insert_disc, cpc_peek, cpc_poke, cpc_remap, cpc_set_upper_rom, cpc_snapshot_load,
-    cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, floppy_give_room, floppy_t,
-    gate_array_rgb as core_gate_array_rgb, keyboard_key, keyboard_press, keyboard_t, mcp_cpc_call,
-    mcp_cpc_check, mcp_cpc_locate, mcp_cpc_locations, mcp_cpc_run, mcp_cpc_step, mcp_floppy_check,
-    mcp_spectrum_call, mcp_spectrum_check, mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step,
-    mcp_watch_t, mcp_z80_halted_for_good, mcp_z80_start, spectrum_connect_monitor, spectrum_init,
-    spectrum_insert_tape, spectrum_instruction_complete, spectrum_peek, spectrum_poke,
-    spectrum_snapshot_load, spectrum_snapshot_save, spectrum_snapshot_size, spectrum_t, tape_init,
-    tape_insert, tape_play, tape_pulse_t, tape_t, tzx_machine_TZX_SPECTRUM, tzx_next_pulse,
-    tzx_open, tzx_t, ula_rgb as core_ula_rgb, z80_instruction_complete, z80_t,
+    CPC_FRAMEBUFFER_HEIGHT, CPC_FRAMEBUFFER_WIDTH, CPC_TICKS_PER_MILLISECOND,
+    FLOPPY_BYTES_PER_REVOLUTION, FLOPPY_MAX_CYLINDERS, FLOPPY_MAX_SIDES, MCP_KINDS,
+    SPECTRUM_FRAMEBUFFER_HEIGHT, SPECTRUM_FRAMEBUFFER_WIDTH, SPECTRUM_RAM_16K, SPECTRUM_RAM_48K,
+    SPECTRUM_ROM_SIZE, SPECTRUM_TICKS_PER_MILLISECOND, cpc_connect_monitor, cpc_fit_disc_interface,
+    cpc_init, cpc_insert_disc, cpc_insert_tape, cpc_peek, cpc_poke, cpc_remap, cpc_set_upper_rom,
+    cpc_snapshot_load, cpc_snapshot_save, cpc_snapshot_size, cpc_t, dsk_read, dsk_write,
+    floppy_give_room, floppy_t, gate_array_rgb as core_gate_array_rgb, keyboard_key,
+    keyboard_press, keyboard_t, mcp_cpc_call, mcp_cpc_check, mcp_cpc_locate, mcp_cpc_locations,
+    mcp_cpc_run, mcp_cpc_step, mcp_floppy_check, mcp_spectrum_call, mcp_spectrum_check,
+    mcp_spectrum_run, mcp_spectrum_seek, mcp_spectrum_step, mcp_watch_t, mcp_z80_halted_for_good,
+    mcp_z80_start, spectrum_connect_monitor, spectrum_init, spectrum_insert_tape,
+    spectrum_instruction_complete, spectrum_peek, spectrum_poke, spectrum_snapshot_load,
+    spectrum_snapshot_save, spectrum_snapshot_size, spectrum_t, tape_init, tape_insert, tape_play,
+    tape_pulse_t, tape_t, tzx_machine, tzx_machine_TZX_AMSTRAD, tzx_machine_TZX_SPECTRUM,
+    tzx_next_pulse, tzx_open, tzx_t, ula_rgb as core_ula_rgb, z80_instruction_complete, z80_t,
 };
 use crate::fields::Fields;
 
@@ -418,7 +419,7 @@ impl DiscState {
     }
 }
 
-// The deck a Spectrum plays, and the reader it points at and asks for
+// The deck a machine plays, and the reader it points at and asks for
 // pulses, as colophon-player's emulator/deck.h holds them
 // (https://github.com/tulinmola/colophon-player).
 #[derive(Clone, Copy)]
@@ -428,10 +429,12 @@ struct Deck {
 }
 
 // The most pulses a tape read from a state file is played to find its
-// reader: a tape of 90 minutes at the ROM's own timings, "a reset bit is
-// encoded as two pulses of 855 tstates each, a set bit as two pulses of 1710
-// tstates each" (comp.sys.sinclair FAQ, 16K/48K reference), holds at most
-// some 22 million, and these are some 12 times as many.
+// reader: a tape of 90 minutes at the Spectrum ROM's own timings, "a reset
+// bit is encoded as two pulses of 855 tstates each, a set bit as two pulses
+// of 1710 tstates each" (comp.sys.sinclair FAQ, 16K/48K reference), holds at
+// most some 22 million, and these are some 12 times as many; at a CPC
+// firmware's fastest, whose "half zero length must lie between 130 and 480
+// microseconds" (SOFT 968, CAS SET SPEED), it holds some 42 million.
 const MOST_PULSES: u64 = 1 << 28;
 
 // A deck, and the image its reader borrows, held as a disc is.
@@ -441,9 +444,14 @@ struct Tape {
 }
 
 impl Tape {
-    // Opens the image as a Spectrum's tape, in a deck of its own, with its
+    // Opens the image as a tape for the machine named, whose ticks are
+    // ticks_per_millisecond to the millisecond, in a deck of its own, with its
     // reader at the tape's start and the deck stopped.
-    fn open(contents: &[u8]) -> Result<Tape, String> {
+    fn open(
+        contents: &[u8],
+        ticks_per_millisecond: u32,
+        machine: tzx_machine,
+    ) -> Result<Tape, String> {
         let length = u32::try_from(contents.len()).expect("a tape of less than 4GB");
         let image = Handed::new(contents.to_vec().into_boxed_slice());
         // SAFETY: all-zero bytes are a value of every field of the deck and
@@ -458,8 +466,8 @@ impl Tape {
                 &raw mut (*deck_at).reader,
                 image.as_ptr().cast(),
                 length,
-                SPECTRUM_TICKS_PER_MILLISECOND,
-                tzx_machine_TZX_SPECTRUM,
+                ticks_per_millisecond,
+                machine,
                 &mut sentence,
             )
         };
@@ -478,16 +486,18 @@ impl Tape {
         Ok(Tape { deck, image })
     }
 
-    // A tape as a state file holds it: its image opened again, the reader
-    // played from the tape's start to where the file's stood, and the deck's
-    // own fields. The deck takes a pulse at most once a tick, so a reader
-    // the machine played to in `ticks` stands there within as many pulses;
-    // one past MOST_PULSES is refused.
+    // A tape as a state file holds it: its image opened again as open()
+    // opens it, the reader played from the tape's start to where the file's
+    // stood, and the deck's own fields. The deck takes a pulse at most once a
+    // tick, so a reader the machine played to in `ticks` stands there within
+    // as many pulses; one past MOST_PULSES is refused.
     fn filed(
         deck: &Value,
         reader: &Value,
         ticks: u64,
         buffers: &mut Buffers,
+        ticks_per_millisecond: u32,
+        machine: tzx_machine,
     ) -> Result<Tape, String> {
         // SAFETY: as for a deck's.
         let mut kept = unsafe { Box::<tzx_t>::new_zeroed().assume_init() };
@@ -498,7 +508,11 @@ impl Tape {
                 "reader.image_length is {length}, larger than the {MOST_MEDIUM_BYTES} bytes a tape holds"
             ));
         }
-        let tape = Tape::open(buffers.take(length, "the tape's image")?)?;
+        let tape = Tape::open(
+            buffers.take(length, "the tape's image")?,
+            ticks_per_millisecond,
+            machine,
+        )?;
         let wanted = kept.encode();
         // SAFETY: the deck is this tape's alone, and its reader borrows the
         // image held beside it.
@@ -541,6 +555,20 @@ impl Tape {
         // SAFETY: the image is written only as it is opened.
         unsafe { &*self.image.as_ptr() }
     }
+
+    // The tape and its deck as they stand, for a state to keep.
+    fn kept(self: &Rc<Tape>) -> (Rc<Tape>, Deck) {
+        // SAFETY: the deck stands beside the machine, which is not running.
+        (Rc::clone(self), unsafe { *self.deck.as_ptr() })
+    }
+
+    // The tape kept, its deck written back as it was kept.
+    fn restored((tape, deck): &(Rc<Tape>, Deck)) -> Rc<Tape> {
+        // SAFETY: as for kept(); the deck's pointers are into itself and at
+        // the image held beside it.
+        unsafe { *tape.deck.as_ptr() = *deck };
+        Rc::clone(tape)
+    }
 }
 
 // A CPC as a state keeps it, to be restored into the machine it was kept
@@ -551,6 +579,7 @@ pub struct CpcState {
     ram: Box<[u8]>,
     framebuffer: Box<[u8]>,
     discs: [Option<DiscState>; 2],
+    tape: Option<(Rc<Tape>, Deck)>,
 }
 
 // A Spectrum as a state keeps it, likewise.
@@ -661,24 +690,36 @@ impl CpcState {
                 }
             });
         }
+        let (tape, reader) = filed_tape(self.tape.as_ref(), &mut buffers);
         let mut fields = Map::new();
         fields.insert("cpc_t".to_owned(), machine.encode());
         fields.insert("fdc.drive".to_owned(), json!(unit));
         fields.insert("discs".to_owned(), Value::from(discs));
+        fields.insert("tape".to_owned(), tape);
+        fields.insert("reader".to_owned(), reader);
         Filed { fields, buffers }
+    }
+}
+
+// What a state file holds of a tape: the deck's fields and the reader's,
+// the image among the buffers; nulls for an empty deck.
+fn filed_tape<'a>(
+    tape: Option<&'a (Rc<Tape>, Deck)>,
+    buffers: &mut Vec<&'a [u8]>,
+) -> (Value, Value) {
+    match tape {
+        None => (Value::Null, Value::Null),
+        Some((tape, deck)) => {
+            buffers.push(tape.image());
+            (deck.tape.encode(), deck.reader.encode())
+        }
     }
 }
 
 impl SpectrumState {
     pub fn filed(&self) -> Filed<'_> {
         let mut buffers: Vec<&[u8]> = vec![&self.ram, &self.framebuffer];
-        let (tape, reader) = match &self.tape {
-            None => (Value::Null, Value::Null),
-            Some((tape, deck)) => {
-                buffers.push(tape.image());
-                (deck.tape.encode(), deck.reader.encode())
-            }
-        };
+        let (tape, reader) = filed_tape(self.tape.as_ref(), &mut buffers);
         let mut fields = Map::new();
         fields.insert("spectrum_t".to_owned(), self.machine.encode());
         fields.insert("tape".to_owned(), tape);
@@ -694,6 +735,7 @@ pub struct Cpc {
     _lower_rom: Handed<[u8; 0x4000]>,
     framebuffer: Handed<[u8]>,
     discs: [Option<Rc<Disc>>; 2],
+    tape: Option<Rc<Tape>>,
 }
 
 impl Cpc {
@@ -735,6 +777,7 @@ impl Cpc {
             _lower_rom: lower_rom,
             framebuffer,
             discs: [None, None],
+            tape: None,
         }
     }
 
@@ -876,8 +919,49 @@ impl Cpc {
         Ok(())
     }
 
+    // The disc in drive 0 or 1 as the emulator's command line writes it with
+    // --save-disc, in the extended layout, and whether the machine has
+    // written to it since it went in.
+    pub fn disc_save(&self, drive: u8) -> Result<(Vec<u8>, bool), String> {
+        let disc = self.discs[usize::from(drive)]
+            .as_ref()
+            .ok_or_else(|| "holds no disc; put one in with disc_insert".to_owned())?;
+        let floppy = disc.floppy.as_ptr();
+        // SAFETY: the medium stands beside the machine, which is not running,
+        // and is only read; a call given no room only measures.
+        let size = unsafe { dsk_write(floppy, std::ptr::null_mut(), 0) };
+        if size == 0 {
+            return Err(
+                "holds a track the extended layout cannot describe; state_keep, then state_save, \
+                 writes the whole disc to a state file, which only this build opens"
+                    .to_owned(),
+            );
+        }
+        let mut bytes = vec![0; size];
+        // SAFETY: as above, and the bytes are as many as it says it needs.
+        unsafe { dsk_write(floppy, bytes.as_mut_ptr(), size) };
+        // SAFETY: as above.
+        Ok((bytes, unsafe { (*floppy).modified }))
+    }
+
+    // Opens the image as a CPC's tape and puts it in the deck in place of the
+    // tape there, which is freed once neither the deck nor any state holds
+    // it; the machine's motor line turns the reel. A refused image leaves the
+    // deck as it was.
+    pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
+        let tape = Tape::open(contents, CPC_TICKS_PER_MILLISECOND, tzx_machine_TZX_AMSTRAD)?;
+        // SAFETY: the machine points at the deck, which is held beside the
+        // machine for as long as it or a state holds it.
+        unsafe {
+            cpc_insert_tape(self.machine.as_ptr(), &raw mut (*tape.deck.as_ptr()).tape);
+        }
+        self.tape = Some(Rc::new(tape));
+        Ok(())
+    }
+
     // The machine as it stands: inside an instruction if it stands there,
-    // with its picture and each disc as it has been written.
+    // with its picture, each disc as it has been written and its tape where
+    // it has played to.
     pub fn state(&self) -> CpcState {
         CpcState {
             // SAFETY: as for a copy set writes to: the struct owns nothing,
@@ -889,18 +973,21 @@ impl Cpc {
                 .discs
                 .each_ref()
                 .map(|disc| disc.as_ref().map(Disc::kept)),
+            tape: self.tape.as_ref().map(Tape::kept),
         }
     }
 
     // Puts the machine back as a state of its own kept it, with the discs it
-    // held then, as they were, whatever the drives have held since.
+    // held then, as they were, and the tape, where it had played to,
+    // whatever the drives and the deck have held since.
     pub fn restore(&mut self, state: &CpcState) {
         for (disc, kept) in self.discs.iter_mut().zip(&state.discs) {
             *disc = kept.as_ref().map(DiscState::restored);
         }
+        self.tape = state.tape.as_ref().map(Tape::restored);
         // SAFETY: as for state(); every pointer in it is one the machine held
-        // when it was kept, at buffers held beside it since, its discs among
-        // them.
+        // when it was kept, at buffers held beside it since, its discs and
+        // its deck among them.
         *self.machine_mut() = unsafe { std::ptr::read(&*state.machine) };
         // SAFETY: as for ram() and framebuffer(), mutably.
         unsafe {
@@ -911,11 +998,13 @@ impl Cpc {
     }
 
     // Stands the machine as a state file holds it, every pointer its own or
-    // worked out again. Refused, the machine left as it stood, where the core
-    // could not run from what the file holds.
+    // worked out again, its tape played to where the file's stood, which the
+    // machine came to in `ticks`. Refused, the machine left as it stood,
+    // where the core could not run from what the file holds.
     pub fn state_file_load(
         &mut self,
         fields: &Map<String, Value>,
+        ticks: u64,
         buffers: &mut Buffers,
     ) -> Result<(), String> {
         // SAFETY: as for a copy set writes to.
@@ -949,6 +1038,21 @@ impl Cpc {
                 written.drives[drive].floppy = std::ptr::null_mut();
             }
         }
+        let tape = match field(fields, "tape")? {
+            Value::Null => None,
+            deck => Some(Rc::new(Tape::filed(
+                deck,
+                field(fields, "reader")?,
+                ticks,
+                buffers,
+                CPC_TICKS_PER_MILLISECOND,
+                tzx_machine_TZX_AMSTRAD,
+            )?)),
+        };
+        written.tape = tape.as_ref().map_or(std::ptr::null_mut(), |tape| {
+            // SAFETY: only the address is taken.
+            unsafe { &raw mut (*tape.deck.as_ptr()).tape }
+        });
         self.check(&written)?;
         *self.machine_mut() = written;
         // SAFETY: as for ram() and framebuffer(), mutably.
@@ -957,6 +1061,7 @@ impl Cpc {
             (*self.framebuffer.as_ptr()).copy_from_slice(framebuffer);
         }
         self.discs = discs;
+        self.tape = tape;
         self.remap();
         Ok(())
     }
@@ -1072,7 +1177,11 @@ impl Spectrum {
     // the tape there, which is freed once neither the deck nor any state
     // holds it, and presses PLAY. A refused image leaves the deck as it was.
     pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
-        let tape = Tape::open(contents)?;
+        let tape = Tape::open(
+            contents,
+            SPECTRUM_TICKS_PER_MILLISECOND,
+            tzx_machine_TZX_SPECTRUM,
+        )?;
         // SAFETY: the machine points at the deck, which is held beside the
         // machine for as long as it or a state holds it.
         unsafe {
@@ -1091,22 +1200,13 @@ impl Spectrum {
             machine: Box::new(unsafe { std::ptr::read(self.machine()) }),
             ram: self.ram().into(),
             framebuffer: self.framebuffer().into(),
-            tape: self.tape.as_ref().map(|tape| {
-                // SAFETY: the deck stands beside the machine, which is not
-                // running.
-                (Rc::clone(tape), unsafe { *tape.deck.as_ptr() })
-            }),
+            tape: self.tape.as_ref().map(Tape::kept),
         }
     }
 
     // As a CPC's: the machine and the tape it held, where it had played to.
     pub fn restore(&mut self, state: &SpectrumState) {
-        self.tape = state.tape.as_ref().map(|(tape, deck)| {
-            // SAFETY: as for state(); the deck's pointers are into itself and
-            // at the image held beside it.
-            unsafe { *tape.deck.as_ptr() = *deck };
-            Rc::clone(tape)
-        });
+        self.tape = state.tape.as_ref().map(Tape::restored);
         // SAFETY: as for a CPC's.
         *self.machine_mut() = unsafe { std::ptr::read(&*state.machine) };
         // SAFETY: as for a CPC's.
@@ -1116,8 +1216,7 @@ impl Spectrum {
         }
     }
 
-    // As a CPC's, its tape played to where the file's stood, which the
-    // machine came to in `ticks`.
+    // As a CPC's.
     pub fn state_file_load(
         &mut self,
         fields: &Map<String, Value>,
@@ -1136,6 +1235,8 @@ impl Spectrum {
                 field(fields, "reader")?,
                 ticks,
                 buffers,
+                SPECTRUM_TICKS_PER_MILLISECOND,
+                tzx_machine_TZX_SPECTRUM,
             )?)),
         };
         written.tape = tape.as_ref().map_or(std::ptr::null_mut(), |tape| {
@@ -2100,10 +2201,21 @@ mod tests {
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         for image in [&tape[..], &tape, &[1, 0], &tape] {
             let _ = spectrum.insert_tape(image);
-            let past_the_leader_tape = leader_ticks(&spectrum) + 2 * SPECTRUM_FRAME_TICKS;
+            let past_the_leader_tape =
+                leader_ticks(spectrum.tape.as_ref()) + 2 * SPECTRUM_FRAME_TICKS;
             spectrum.run(u32::MAX, past_the_leader_tape, None);
         }
         assert!(!spectrum.machine().tape.is_null());
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&MOTOR_ON, HALT), 0);
+        let cdt = standard_block_tape();
+        for image in [&cdt[..], &cdt, &tape, &cdt] {
+            let _ = cpc.insert_tape(image);
+            let past_the_leader_tape =
+                CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
+            let ran = cpc.run(u32::MAX, past_the_leader_tape, None);
+            assert!(ran.ticks >= past_the_leader_tape);
+        }
+        assert!(!cpc.machine().tape.is_null());
     }
 
     // Under the sanitizers, a state kept with a disc in the drive, or a tape
@@ -2149,7 +2261,7 @@ mod tests {
         );
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         spectrum.insert_tape(&tape).unwrap();
-        let past_the_leader_tape = leader_ticks(&spectrum) + 2 * SPECTRUM_FRAME_TICKS;
+        let past_the_leader_tape = leader_ticks(spectrum.tape.as_ref()) + 2 * SPECTRUM_FRAME_TICKS;
         spectrum.run(u32::MAX, past_the_leader_tape, None);
         let state = spectrum.state();
         let kept = Rc::clone(spectrum.tape.as_ref().expect("a tape"));
@@ -2168,6 +2280,32 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { (*kept.deck.as_ptr()).tape.ticks_left }, played);
         spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
+        let mut cpc = Cpc::new(sixty_four_k(), rom(&MOTOR_ON, HALT), 0);
+        let cdt = standard_block_tape();
+        cpc.insert_tape(&cdt).unwrap();
+        let past_the_leader_tape =
+            CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
+        let ran = cpc.run(u32::MAX, past_the_leader_tape, None);
+        assert!(ran.ticks >= past_the_leader_tape);
+        let state = cpc.state();
+        let kept = Rc::clone(cpc.tape.as_ref().expect("a tape"));
+        // SAFETY: the deck stands beside the machine, which is not running.
+        let played = unsafe { (*kept.deck.as_ptr()).tape.ticks_left };
+        cpc.insert_tape(&cdt).unwrap();
+        let past_the_leader_tape =
+            CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
+        cpc.run(u32::MAX, past_the_leader_tape, None);
+        // SAFETY: as above.
+        unsafe { (*kept.deck.as_ptr()).tape.ticks_left = played + 1 };
+        cpc.restore(&state);
+        drop(state);
+        assert!(Rc::ptr_eq(cpc.tape.as_ref().expect("a tape"), &kept));
+        // SAFETY: only the address is taken.
+        let deck = unsafe { &raw mut (*kept.deck.as_ptr()).tape };
+        assert_eq!(cpc.machine().tape, deck);
+        // SAFETY: as above.
+        assert_eq!(unsafe { (*kept.deck.as_ptr()).tape.ticks_left }, played);
+        cpc.run(2, 4 * CPC_STANDARD_FRAME_TICKS, None);
     }
 
     // Runs with a watch on every instruction, every access and every port,
@@ -2735,12 +2873,11 @@ mod tests {
     // comes by it, since the file holds none. A pointer the core gains fails
     // this until a state file comes by it too.
     const POINTED_AGAIN: [&str; 18] = [
-        // The machine's own, as it was built: a CPC's deck is never filled,
-        // cpc_tick points the 6845 at its rooms on every tick, and the chip
-        // points a room at them before it takes the room back.
+        // The machine's own, as it was built: cpc_tick points the 6845 at its
+        // rooms on every tick, and the chip points a room at them before it
+        // takes the room back.
         "cpc_t.lower_rom",
         "cpc_t.ram",
-        "cpc_t.tape",
         "cpc_t.upper_roms",
         "crtc_t.line_end_rooms",
         "monitor_t.framebuffer",
@@ -2752,6 +2889,7 @@ mod tests {
         "cpc_t.write_page",
         // Set as the file says: Cpc::state_file_load and
         // Spectrum::state_file_load.
+        "cpc_t.tape",
         "drive_t.floppy",
         "spectrum_t.tape",
         "upd765_t.drive",
@@ -2790,12 +2928,12 @@ mod tests {
         };
         let mut kept = build();
         kept.insert_disc(0, &one_track_image(0xE5), false).unwrap();
-        kept.run(3, 8 * CPC_STANDARD_FRAME_TICKS, None);
-        kept.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 3, None);
+        let ticks = kept.run(3, 8 * CPC_STANDARD_FRAME_TICKS, None).ticks
+            + kept.run(u32::MAX, CPC_STANDARD_FRAME_TICKS / 3, None).ticks;
         let (fields, bytes) = through_a_file(kept.state().filed());
         assert_eq!(fields["fdc.drive"], 0);
         let mut read = build();
-        read.state_file_load(&fields, &mut Buffers::new(&bytes))
+        read.state_file_load(&fields, ticks, &mut Buffers::new(&bytes))
             .unwrap();
         assert!(through_a_file(read.state().filed()) == (fields, bytes));
         let disc = read.discs[0].as_ref().expect("a disc");
@@ -2818,12 +2956,75 @@ mod tests {
     // The ticks of the cassette's leader tape, which the reader hands the deck
     // as its first pulse, before the image's: 5.7s of silence, less the
     // silence the image keeps before its first edge (colophon-emulator's
-    // tzx.c, tzx_next_pulse, at 920e5d5); 0 once the deck's first tick has
-    // taken it.
-    fn leader_ticks(spectrum: &Spectrum) -> u64 {
-        let tape = spectrum.tape.as_ref().expect("a tape");
+    // tzx.c, tzx_next_pulse, at 920e5d5); 0 once the deck's first tick of play
+    // has taken it.
+    fn leader_ticks(tape: Option<&Rc<Tape>>) -> u64 {
+        let tape = tape.expect("a tape");
         // SAFETY: the deck stands beside the machine, which is not running.
         u64::from(unsafe { (*tape.deck.as_ptr()).reader.leader_ticks_left })
+    }
+
+    // A CPC's reel follows its motor line 50ms late, from rest when a tape
+    // goes in (colophon-emulator's cpc.c, REEL_LAG_TICKS, at ddf77d2).
+    const CPC_REEL_LAG_TICKS: u64 = 50 * CPC_TICKS_PER_MILLISECOND as u64;
+
+    // Turns a CPC's cassette motor on, bit 4 of port C, once the PPI's mode
+    // word &82 has made port C an output ("8255 PPI", Kevin Thacker's
+    // cpctech, as colophon-emulator's cpc.h reads it), and loops, since a run
+    // ends at a HALT that holds for good.
+    const MOTOR_ON: [u8; 13] = [
+        DI, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_BC, 0x10, 0xF6, OUT_C_C[0], OUT_C_C[1],
+        JR, 0xFE,
+    ];
+
+    // A .tzx of one standard block, ID 10, after the signature and the
+    // version ("TZX format" v1.20, https://worldofspectrum.net/TZXformat.html):
+    // no pause after it, and its 3 bytes, a flag, a byte and their checksum.
+    fn standard_block_tape() -> Vec<u8> {
+        [
+            &b"ZXTape!\x1A\x01\x14"[..],
+            &[0x10, 0, 0, 3, 0, 0xFF, 0x01, 0xFE],
+        ]
+        .concat()
+    }
+
+    // A CPC read from a state file finds its reel and its tape where they
+    // stood: the reel coming up to speed, the tape in the cassette's leader
+    // tape, in the block's leader, in its data and past its end; and it runs
+    // on as the machine it was kept from runs on. A data block's leader is
+    // 3223 pulses of 2168 T-states (16K/48K reference), at 3.5MHz ("TZX
+    // format" v1.20), 2477.7 of a CPC's ticks, so with its two syncs its data
+    // starts some 7987000 ticks past the leader tape.
+    #[test]
+    fn a_cpc_read_from_its_state_file_finds_its_tape_where_it_had_played_to() {
+        let build = || Cpc::new(sixty_four_k(), rom(&MOTOR_ON, HALT), 0);
+        let mut kept = build();
+        kept.insert_tape(&standard_block_tape()).unwrap();
+        let leader_tape = CPC_REEL_LAG_TICKS + leader_ticks(kept.tape.as_ref());
+        let mut ticks = 0;
+        for until in [
+            100_000,
+            leader_tape - 1_000_000,
+            leader_tape + 160_000,
+            leader_tape + 7_990_000,
+            leader_tape + 14_000_000,
+        ] {
+            ticks += kept.run(u32::MAX, until - ticks, None).ticks;
+            assert!(ticks >= until);
+            let (fields, bytes) = through_a_file(kept.state().filed());
+            let mut read = build();
+            read.state_file_load(&fields, ticks, &mut Buffers::new(&bytes))
+                .unwrap();
+            assert!(through_a_file(read.state().filed()) == (fields, bytes));
+            let tape = read.tape.as_ref().expect("a tape");
+            // SAFETY: only the address is taken.
+            assert_eq!(read.machine().tape, unsafe {
+                &raw mut (*tape.deck.as_ptr()).tape
+            });
+            ticks += kept.run(1, 2 * CPC_STANDARD_FRAME_TICKS, None).ticks;
+            read.run(1, 2 * CPC_STANDARD_FRAME_TICKS, None);
+            assert!(through_a_file(kept.state().filed()) == through_a_file(read.state().filed()));
+        }
     }
 
     // A Spectrum read from a state file finds its tape where it had played to,
@@ -2838,7 +3039,7 @@ mod tests {
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         let mut kept = build();
         kept.insert_tape(&tape).unwrap();
-        let leader_tape = leader_ticks(&kept);
+        let leader_tape = leader_ticks(kept.tape.as_ref());
         let mut ticks = 0;
         for until in [
             140_000,
@@ -2874,7 +3075,7 @@ mod tests {
     fn a_tape_read_from_a_state_file_is_played_to_where_it_stood() {
         let mut spectrum = Spectrum::new(forty_eight_k(), rom(&spectrum_workload(), HALT));
         spectrum.insert_tape(&[3, 0, 0xFF, 0x01, 0xFE]).unwrap();
-        let leader_tape = leader_ticks(&spectrum);
+        let leader_tape = leader_ticks(spectrum.tape.as_ref());
         let ticks = spectrum.run(u32::MAX, leader_tape + 140_000, None).ticks;
         let (fields, bytes) = through_a_file(spectrum.state().filed());
         let load = |fields: &Map<String, Value>, ticks: u64| {
@@ -2946,7 +3147,7 @@ mod tests {
         // SAFETY: only the address is taken, of a deck the machine holds
         // throughout.
         let deck = unsafe { &raw mut (*kept.tape.as_ref().unwrap().deck.as_ptr()).tape };
-        let leader_tape = leader_ticks(&kept);
+        let leader_tape = leader_ticks(kept.tape.as_ref());
         let mut ticks = kept.run(u32::MAX, leader_tape + 8_000_000, None).ticks;
         // SAFETY: the deck stands beside the machine, which is not running.
         assert!(!unsafe { (*deck).playing });

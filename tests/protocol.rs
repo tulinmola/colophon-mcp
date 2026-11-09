@@ -25,11 +25,12 @@ use sha2::Digest;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: [&str; 2] = ["2025-06-18", "2025-11-25"];
-const TOOLS: [&str; 24] = [
+const TOOLS: [&str; 25] = [
     "call",
     "compare",
     "disassemble",
     "disc_insert",
+    "disc_save",
     "find",
     "inspect",
     "journal",
@@ -1339,17 +1340,24 @@ fn every_tool_says_what_it_does_to_the_machines_and_that_nothing_else_is_reached
         .contains(&name);
         assert_eq!(annotations["readOnlyHint"], reads, "{name}: {annotations}");
         if !reads {
-            let destroys =
-                !["machine_open", "snapshot_save", "state_keep", "state_save"].contains(&name);
+            let destroys = ![
+                "disc_save",
+                "machine_open",
+                "snapshot_save",
+                "state_keep",
+                "state_save",
+            ]
+            .contains(&name);
             // A machine stood up again is another machine, and a state kept
             // again another state; every other request that changes a
             // machine, save a restore, is entered in its journal, which a
             // repeat lengthens. A handle put away names nothing again, so
             // putting it away again changes nothing, and so does a state
             // dropped; a state restored again makes the same machine and the
-            // same journal; a snapshot or a state file asked for again at
-            // its path is refused, since a file is there.
+            // same journal; a snapshot, a disc's image or a state file asked
+            // for again at its path is refused, since a file is there.
             let repeats = [
+                "disc_save",
                 "machine_close",
                 "snapshot_save",
                 "state_restore",
@@ -9209,6 +9217,44 @@ fn a_disc_put_in_write_protected_is_so_to_the_disc_controller() {
     }
 }
 
+// A disc put in while the drive's motor turns is ready at the third index
+// pulse after it goes in, 600 ms, which colophon-emulator's drive.h, at
+// ddf77d2, takes for the CPC6128 service manual's "2 revolutions". SENSE
+// DRIVE STATUS answers ST3, whose bit 5, RY, gives "the status of the Ready
+// signal from the FDD" (the datasheet, as above), so a program asking it over
+// and over finds RY low 29 frames after the disc goes in and high 31 frames
+// after. The motor is "active" while bit 0 of &FA7E "is "1"" (cpctech, as
+// above).
+#[test]
+fn a_disc_put_in_while_the_motor_turns_is_ready_600_ms_later() {
+    let ready = [LD_C, 0x7E, IN_A_C[0], IN_A_C[1], AND_N, 0x80, JR_Z, 0xFA];
+    let mut program = vec![
+        DI, LD_BC, 0x7E, 0xFA, LD_A, 1, OUT_C_A[0], OUT_C_A[1], LD_B, 0xFB,
+    ];
+    let asking = program.len();
+    for byte in [0x04, 0x00] {
+        program.extend(ready);
+        program.extend([LD_C, 0x7F, LD_A, byte, OUT_C_A[0], OUT_C_A[1]]);
+    }
+    program.extend(ready);
+    program.extend([LD_C, 0x7F, IN_A_C[0], IN_A_C[1], LD_TO_A, 0x00, 0x80]);
+    let back = i8::try_from(asking as isize - (program.len() + 2) as isize).unwrap();
+    program.extend([JR, back.to_le_bytes()[0]]);
+    let roms = Roms::programmed("cpc6128.rom", &program);
+    let disc = roms.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.run(&handle, json!({ "frames": 1 }));
+    session.answer("disc_insert", json!({ "handle": handle, "path": disc }));
+    let st3 = |session: &mut Session| {
+        u8::from_str_radix(&session.peek(&handle, json!("&8000"), 1), 16).unwrap()
+    };
+    session.run(&handle, json!({ "ticks": 29 * CPC_FRAME_TICKS }));
+    assert_eq!(st3(&mut session) & 0x20, 0);
+    session.run(&handle, json!({ "ticks": 2 * CPC_FRAME_TICKS }));
+    assert_eq!(st3(&mut session) & 0x20, 0x20);
+}
+
 #[test]
 fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
     let roms = Roms::all();
@@ -9232,7 +9278,7 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
     assert_eq!(
         refusal(&mut session, &cpc464, &not_a_disc, "A"),
         "a cpc464 is built without a disc interface, as the emulator's command line builds one \
-         given no disc; use a cpc664 or a cpc6128 for discs"
+         given no disc; use a cpc664 or a cpc6128 for discs, or tape_insert for its tapes"
     );
     assert_eq!(
         refusal(&mut session, &cpc6128, &not_a_disc, "B"),
@@ -9265,6 +9311,93 @@ fn a_disc_is_refused_where_it_cannot_go_with_what_would_take_it() {
         refused.contains("`A`") && refused.contains("`B`"),
         "{refused}"
     );
+}
+
+// A disc is saved as the emulator writes an image, in the extended layout,
+// naming itself its creator, "Colophon", and recording where each sector
+// lies after an "Offset-Info" tag (its dsk.c, at ddf77d2), so a disc nothing
+// wrote to comes out other than the file it went in from, and comes out the
+// same again once that image is put in.
+#[test]
+fn a_disc_is_saved_to_a_new_file_as_its_drive_holds_it() {
+    let roms = Roms::all();
+    let blank = roms.write("blank.dsk", &blank_data_disc());
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc6128");
+    session.answer("disc_insert", json!({ "handle": handle, "path": blank }));
+    let tick = session.run(&handle, json!({ "ticks": 100 }))["tick"].clone();
+    let first = roms.0.join("first.dsk");
+    let saved = session.answer("disc_save", json!({ "handle": handle, "path": first }));
+    let image = fs::read(&first).unwrap();
+    assert_eq!(
+        saved,
+        json!({
+            "handle": handle,
+            "drive": "A",
+            "tick": tick,
+            "path": first,
+            "sha256": sha256(&image),
+            "modified": false,
+        })
+    );
+    assert!(image.starts_with(b"EXTENDED CPC DSK File\r\nDisk-Info\r\n"));
+    assert_eq!(&image[0x22..0x2A], b"Colophon");
+    assert!(image.windows(13).any(|tag| tag == b"Offset-Info\r\n"));
+    assert_ne!(image, blank_data_disc());
+    let into_b = json!({ "handle": handle, "path": first, "drive": "B" });
+    session.answer("disc_insert", into_b);
+    let second = roms.0.join("second.dsk");
+    let again = json!({ "handle": handle, "path": second, "drive": "B" });
+    assert_eq!(session.answer("disc_save", again)["modified"], false);
+    assert_eq!(fs::read(&second).unwrap(), image);
+}
+
+#[test]
+fn a_disc_is_saved_only_from_a_drive_that_holds_one_and_to_no_file_there_is() {
+    let roms = Roms::all();
+    let blank = roms.write("blank.dsk", &blank_data_disc());
+    let taken = roms.write("taken.dsk", b"kept");
+    let fresh = roms.0.join("fresh.dsk");
+    let mut session = Session::start(&roms);
+    let spectrum = session.open("spectrum48");
+    let cpc464 = session.open("cpc464");
+    let cpc6128 = session.open("cpc6128");
+    let refusal = |session: &mut Session, handle: &str, path: &Path, drive: &str| {
+        session.refusal(
+            "disc_save",
+            json!({ "handle": handle, "path": path, "drive": drive }),
+        )
+    };
+    assert_eq!(
+        refusal(&mut session, &spectrum, &fresh, "A"),
+        "a spectrum48 has no disc drive; use a cpc664 or a cpc6128 for discs, and tape_insert for \
+         a Spectrum's tapes"
+    );
+    assert_eq!(
+        refusal(&mut session, &cpc464, &fresh, "A"),
+        "a cpc464 is built without a disc interface, as the emulator's command line builds one \
+         given no disc; use a cpc664 or a cpc6128 for discs, or tape_insert for its tapes"
+    );
+    session.answer("disc_insert", json!({ "handle": cpc6128, "path": blank }));
+    assert_eq!(
+        refusal(&mut session, &cpc6128, &fresh, "B"),
+        format!("{cpc6128}'s drive B holds no disc; put one in with disc_insert")
+    );
+    assert_eq!(
+        refusal(&mut session, &cpc6128, &taken, "A"),
+        format!(
+            "{} already exists, and files are never overwritten; give a path that names nothing \
+             yet",
+            taken.display()
+        )
+    );
+    let refused = refusal(&mut session, &cpc6128, &fresh, "C");
+    assert!(
+        refused.contains("`A`") && refused.contains("`B`"),
+        "{refused}"
+    );
+    assert!(!fresh.exists());
+    assert_eq!(fs::read(&taken).unwrap(), b"kept");
 }
 
 // A tape of one BASIC program, as the 48K's SAVE leaves it: "two blocks on
@@ -9343,24 +9476,29 @@ const COUNTING_EDGES: [u8; 23] = [
 // this many ticks after PLAY.
 const LEADER_TICKS: u64 = 5700 * 3500;
 
-// The edges COUNTING_EDGES counts over a run of these frames' ticks, and the
-// tick the run ends at.
-fn edges(session: &mut Session, handle: &str, frames: u64) -> (u16, u64) {
+// The edges a counting program counts into &8000 over a run of these ticks,
+// and the tick the run ends at.
+fn edges(session: &mut Session, handle: &str, ticks: u64) -> (u16, u64) {
     let before = bytes_of(&session.peek(handle, json!("&8000"), 2));
-    let ran = session.run(handle, json!({ "ticks": frames * SPECTRUM_FRAME_TICKS }));
+    let ran = session.run(handle, json!({ "ticks": ticks }));
     let after = bytes_of(&session.peek(handle, json!("&8000"), 2));
     let counted = u16::from_le_bytes([after[0], after[1]])
         .wrapping_sub(u16::from_le_bytes([before[0], before[1]]));
     (counted, ran["tick"].as_u64().unwrap())
 }
 
-// The edges COUNTING_EDGES counts over the ten frames centred on `centre`,
-// reached by a run from `from`, the tick the machine stands at, and the tick
-// the count ends at.
-fn edges_around(session: &mut Session, handle: &str, from: u64, centre: u64) -> (u16, u64) {
-    let start = centre - 5 * SPECTRUM_FRAME_TICKS;
-    session.run(handle, json!({ "ticks": start - from }));
-    edges(session, handle, 10)
+// The edges a counting program counts over the ticks within `half` of
+// `centre`, reached by a run from `from`, the tick the machine stands at, and
+// the tick the count ends at.
+fn edges_around(
+    session: &mut Session,
+    handle: &str,
+    from: u64,
+    centre: u64,
+    half: u64,
+) -> (u16, u64) {
+    session.run(handle, json!({ "ticks": centre - half - from }));
+    edges(session, handle, 2 * half)
 }
 
 // A header block opens with "a leader consisting of 8063 (for header
@@ -9383,37 +9521,174 @@ fn a_tape_plays_from_the_tick_it_goes_into_the_deck() {
     let path = roms.write("program.tap", &tape);
     let mut session = Session::start(&roms);
     let handle = session.open("spectrum48");
-    let (counted, inserted) = edges(&mut session, &handle, 10);
+    let (ten, half) = (10 * SPECTRUM_FRAME_TICKS, 5 * SPECTRUM_FRAME_TICKS);
+    let (counted, inserted) = edges(&mut session, &handle, ten);
     assert_eq!(counted, 0);
     assert_eq!(
         session.answer("tape_insert", json!({ "handle": handle, "path": path })),
         json!({ "handle": handle, "tick": inserted, "path": path, "sha256": sha256(&tape) })
     );
-    let (counted, tick) = edges(&mut session, &handle, 10);
+    let (counted, tick) = edges(&mut session, &handle, ten);
     assert_eq!(counted, 0);
     let first_edge = inserted + LEADER_TICKS;
-    let (counted, tick) = edges_around(&mut session, &handle, tick, first_edge);
+    let (counted, tick) = edges_around(&mut session, &handle, tick, first_edge, half);
     assert_eq!(counted, 162);
     let silent = first_edge + 270 * SPECTRUM_FRAME_TICKS;
-    let (counted, inserted) = edges_around(&mut session, &handle, tick, silent);
+    let (counted, inserted) = edges_around(&mut session, &handle, tick, silent, half);
     assert_eq!(counted, 0);
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
     let first_edge = inserted + LEADER_TICKS;
-    let (counted, _) = edges_around(&mut session, &handle, inserted, first_edge);
+    let (counted, _) = edges_around(&mut session, &handle, inserted, first_edge, half);
     assert_eq!(counted, 162);
+}
+
+// A record as a CPC's cassette manager writes it: "a leader", of "2048 one
+// bits", a "Zero bit" and a "Sync byte", "#2C" for a header and "#16" for
+// data; then segments of "256 data bytes", the last "padded out to 256 bytes
+// with zeros", each followed by "the logical NOT of the CRC calculated for
+// the 256 bytes in the segment", "the more significant byte" first, "with an
+// initial seed of #FFFF", by the polynomial X^16+X^12+X^5+1, which the scan
+// reads as X15; then "an extra 32 one bits". "A bit is written to the tape as
+// a period of low level followed by an equal period of high level", a one's
+// "twice as long" (SOFT 968, The Amstrad 6128 Firmware Manual, 8.2 and 8.3).
+// It is written as a TZX block of ID 11, "Turbo speed data block", whose
+// pilot is the leader's one bits, whose two syncs are its zero bit, and whose
+// data is the rest ("TZX format" v1.20), every length in the Spectrum's
+// T-states, 3.5 to the microsecond: "All timings are in Spectrum T-States"
+// ("Tape-Image (.CDT) file format", Kevin Thacker's cpctech,
+// https://web.archive.org/web/20260721052615/https://cpctech.cpcwiki.de/docs/cdtcpc.html).
+// A zero's period is 1166 of them, 333µs, "The default half zero length"
+// "(1000 baud)" (SOFT 968, CAS SET SPEED). The pause after a record stands for
+// the gap the cassette manager leaves before the next, short after a header
+// and long after a file, as colophon-emulator's test/cpc_firmware_test.c
+// writes them; the firmware reads past the first, and the second ends the
+// tape.
+fn cassette_record(sync: u8, payload: &[u8], pause_milliseconds: u16) -> Vec<u8> {
+    const ZERO: u16 = 1166;
+    let mut data = vec![sync];
+    for segment in payload.chunks(256) {
+        let mut bytes = segment.to_vec();
+        bytes.resize(256, 0);
+        let mut crc: u16 = 0xFFFF;
+        for byte in &bytes {
+            crc ^= u16::from(*byte) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 == 0 {
+                    crc << 1
+                } else {
+                    crc << 1 ^ 0x1021
+                };
+            }
+        }
+        data.extend(bytes);
+        data.extend((!crc).to_be_bytes());
+    }
+    data.extend([0xFF; 4]);
+    let mut block = vec![0x11];
+    for word in [2 * ZERO, ZERO, ZERO, ZERO, 2 * ZERO, 2 * 2048] {
+        block.extend(word.to_le_bytes());
+    }
+    block.push(8);
+    block.extend(pause_milliseconds.to_le_bytes());
+    block.extend(&u32::try_from(data.len()).unwrap().to_le_bytes()[..3]);
+    block.extend(data);
+    block
+}
+
+// A CPC's tape of one file of one block, a binary program to be loaded at
+// `address` and run from there: its header record, then its data record. The
+// header lays out SOFT 968's fields (8.4): the "Filename", "Padded to 16
+// bytes with nulls"; "Block number" 1; "Last block" and "First block", each
+// "A non-zero value"; the "File type", whose bits 1 to 3 give "File
+// contents", "1 = Binary"; the "Data length", the "Data location", the
+// "Logical length" and the "Entry address". The tape opens with the TZX
+// signature, "ZXTape!", &1A, and the version, 1.20 ("TZX format" v1.20).
+fn binary_tape(name: &[u8], address: u16, program: &[u8]) -> Vec<u8> {
+    let length = u16::try_from(program.len()).unwrap().to_le_bytes();
+    let mut header = vec![0; 64];
+    header[..name.len()].copy_from_slice(name);
+    header[16] = 1;
+    header[17] = 0xFF;
+    header[18] = 1 << 1;
+    header[19..21].copy_from_slice(&length);
+    header[21..23].copy_from_slice(&address.to_le_bytes());
+    header[23] = 0xFF;
+    header[24..26].copy_from_slice(&length);
+    header[26..28].copy_from_slice(&address.to_le_bytes());
+    [
+        b"ZXTape!\x1A\x01\x14".as_slice(),
+        &cassette_record(0x2C, &header, 15),
+        &cassette_record(0x16, program, 2000),
+    ]
+    .concat()
+}
+
+// LD A,&2A; LD (&4100),A; JR $: loaded at &4000, it writes a byte it holds.
+const WRITING_A_BYTE: [u8; 7] = [LD_A, 0x2A, LD_TO_A, 0x00, 0x41, JR, 0xFE];
+
+// Counts each change of the PPI's port B's bit 7, &F5xx, "Cassette read
+// data", into &8000, once it has written the PPI the mode word &82, as
+// WRITING_THROUGH_THE_PPI does. A mode word clears port C (OKI's datasheet,
+// as cited there), and with it bit 4, "Cassette Motor Control", "set bit to
+// "1" for motor on" ("8255 PPI", Kevin Thacker's cpctech,
+// https://web.archive.org/web/20260721051759/https://cpctech.cpcwiki.de/docs/8255cpc.html).
+const COUNTING_CPC_EDGES: [u8; 27] = [
+    DI, LD_BC, 0x82, 0xF7, OUT_C_C[0], OUT_C_C[1], LD_HL, 0x00, 0x00, LD_E, 0x00, LD_B, 0xF5,
+    IN_A_C[0], IN_A_C[1], AND_N, 0x80, CP_E, JR_Z, 0xF9, LD_E_A, INC_HL, LD_HL_TO, 0x00, 0x80, JR,
+    0xF2,
+];
+
+// A CPC's reel follows its motor line 50ms late, from rest when a tape goes
+// in, at 4000 ticks a millisecond (colophon-emulator's cpc.c, REEL_LAG_TICKS,
+// at ddf77d2).
+const REEL_LAG_TICKS: u64 = 50 * 4000;
+
+// The cassette's leader tape, as LEADER_TICKS, at a CPC's 4000 ticks a
+// millisecond.
+const CPC_LEADER_TICKS: u64 = 5700 * 4000;
+
+// A CPC's tape stands while bit 4 of port C, the motor, is 0, for longer
+// than the cassette's leader tape and its first record. Once the test writes
+// the bit with `set`, the tape's first edge comes the reel's lag and the leader
+// tape after, and the record's leader follows in pulses of 2332 T-states at
+// 3.5MHz, 2665.1 of the CPC's ticks, so the ten frames centred on the first
+// edge hear it and the 149 that follow within 399360 ticks: 150.
+#[test]
+fn a_cpcs_tape_moves_only_while_its_motor_turns() {
+    let roms = Roms::programmed("cpc464.rom", &COUNTING_CPC_EDGES);
+    let tape = binary_tape(b"WRITING", 0x4000, &WRITING_A_BYTE);
+    let path = roms.write("program.cdt", &tape);
+    let mut session = Session::start(&roms);
+    let handle = session.open("cpc464");
+    assert_eq!(
+        session.answer("tape_insert", json!({ "handle": handle, "path": path })),
+        json!({ "handle": handle, "tick": 0, "path": path, "sha256": sha256(&tape) })
+    );
+    let standing = REEL_LAG_TICKS + CPC_LEADER_TICKS + 300 * CPC_FRAME_TICKS;
+    let (counted, tick) = edges(&mut session, &handle, standing);
+    assert_eq!(counted, 0);
+    session.set(&handle, json!({ "ppi.output[2]": 0x10 }));
+    let first_edge = tick + REEL_LAG_TICKS + CPC_LEADER_TICKS;
+    let half = 5 * CPC_FRAME_TICKS;
+    let (counted, _) = edges_around(&mut session, &handle, tick, first_edge, half);
+    assert_eq!(counted, 150);
 }
 
 #[test]
 fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
     let roms = Roms::all();
     let not_a_tape = roms.write("not.tap", &[5, 0, 0xFF, 1]);
+    let bare_tap = roms.write("program.tap", &program_tape(b"TEST      ", 10, &[]));
     let mut session = Session::start(&roms);
     let cpc = session.open("cpc6128");
     let spectrum = session.open("spectrum48");
     assert_eq!(
-        session.refusal("tape_insert", json!({ "handle": cpc, "path": not_a_tape })),
-        "a cpc6128 takes no tape here, since this server has no test of tape loading through a \
-         CPC's firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs"
+        session.refusal("tape_insert", json!({ "handle": cpc, "path": bare_tap })),
+        format!(
+            "{} carries no .cdt signature, and a bare .tap is a Spectrum's alone; a CPC's tape is \
+             a .cdt or a .tzx",
+            bare_tap.display()
+        )
     );
     let refused = session.refusal(
         "tape_insert",
@@ -9421,8 +9696,9 @@ fn a_tape_is_refused_where_it_cannot_go_with_what_would_take_it() {
     );
     assert!(
         refused.starts_with(&format!("{} ", not_a_tape.display()))
-            && refused
-                .ends_with("; a tape is a .tap of bare blocks at the ROM's own timings, or a .tzx"),
+            && refused.ends_with(
+                "; a Spectrum's tape is a .tap of bare blocks at the ROM's own timings, or a .tzx"
+            ),
         "{refused}"
     );
 }
@@ -9781,10 +10057,11 @@ fn a_tape_comes_back_with_a_state_where_it_had_played_to() {
     session.run(&handle, json!({ "ticks": 60 * SPECTRUM_FRAME_TICKS }));
     session.answer("tape_insert", json!({ "handle": handle, "path": path }));
     restore(&mut session, &handle, &state);
-    let (counted, tick) = edges(&mut session, &handle, 10);
+    let (counted, tick) = edges(&mut session, &handle, 10 * SPECTRUM_FRAME_TICKS);
     assert_eq!(counted, 0);
     let program = kept_at + 65 * SPECTRUM_FRAME_TICKS;
-    let (counted, _) = edges_around(&mut session, &handle, tick, program);
+    let half = 5 * SPECTRUM_FRAME_TICKS;
+    let (counted, _) = edges_around(&mut session, &handle, tick, program, half);
     assert!([322, 323].contains(&counted), "{counted}");
 }
 
@@ -12273,8 +12550,15 @@ fn a_spectrum_held_at_break_breaks_into_its_program() {
 // The 6128 reads drive A, and the 664 drive B, as |B makes it: "Set default
 // drive to Drive B" (ch. 5), whose heading names B where the manual's names
 // A. What was written is the machine's: an image the emulator cannot read is
-// refused and the disc stays in the drive, and the file given, put in again,
-// is the blank disc it was.
+// refused and the disc stays in the drive, the file given, put in again, is
+// the blank disc it was, and the image disc_save wrote, put in after it, is
+// the disc the program was saved to. AMSDOS leaves the motor turning after
+// it reads, for its "motor off time in 20ms units", &FA, 5 seconds (Kevin
+// Thacker's disassembly, at &C5D6), and a disc that goes in meanwhile is not
+// ready until the third index pulse, 600 ms, which colophon-emulator's
+// drive.h takes for the CPC6128 service manual's "2 revolutions"
+// (a_disc_put_in_while_the_motor_turns_is_ready_600_ms_later), so the
+// test waits that out before it asks.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
@@ -12321,16 +12605,55 @@ fn amsdos_catalogues_what_is_saved_to_a_disc_and_the_file_is_never_written() {
         let heading = format!("Drive{drive}:user0");
         let saved = [heading.as_str(), "EXAMPLE.BAS1K", "177Kfree", "Ready"];
         assert_eq!(catalogue(&mut session), saved, "{machine}");
+        let image = scratch.0.join(format!("{machine}.dsk"));
+        let save = json!({ "handle": handle, "path": image, "drive": drive });
+        assert_eq!(session.answer("disc_save", save)["modified"], true);
         session.refusal("disc_insert", given(&not_a_disc));
         assert_eq!(catalogue(&mut session), saved, "{machine}");
-        session.answer("disc_insert", given(&path));
-        assert_eq!(
-            catalogue(&mut session),
-            [heading.as_str(), "178Kfree", "Ready"],
-            "{machine}"
-        );
+        let empty = [heading.as_str(), "178Kfree", "Ready"];
+        for (disc, shown) in [(&path, &empty[..]), (&image, &saved[..])] {
+            session.answer("disc_insert", given(disc));
+            session.run(&handle, json!({ "frames": 31 }));
+            assert_eq!(catalogue(&mut session), shown, "{machine}");
+        }
         assert_eq!(fs::read(&path).unwrap(), blank);
     }
+}
+
+// A program saved to a disc leaves the image the emulator's command line
+// writes with --save-disc after the same typing, on the same firmware.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_disc_saved_is_the_command_lines() {
+    let scratch = Roms::new(&[]);
+    let blank = scratch.write("blank.dsk", &blank_data_disc());
+    let theirs = scratch.0.join("theirs.dsk");
+    let text = "10 PRINT 2+2\nSAVE\"EXAMPLE\"\n";
+    command_line([
+        OsStr::new("boot"),
+        OsStr::new("--machine"),
+        OsStr::new("cpc6128"),
+        OsStr::new("--disc"),
+        blank.as_os_str(),
+        OsStr::new("--frames"),
+        OsStr::new("78"),
+        OsStr::new("--type"),
+        OsStr::new(&text.replace('\n', "\\n")),
+        OsStr::new("--wait"),
+        OsStr::new("250"),
+        OsStr::new("--save-disc"),
+        theirs.as_os_str(),
+    ]);
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc6128");
+    session.answer("disc_insert", json!({ "handle": handle, "path": blank }));
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.answer("type", json!({ "handle": handle, "text": text }));
+    session.run(&handle, json!({ "ticks": 250 * CPC_FRAME_TICKS }));
+    let ours = scratch.0.join("ours.dsk");
+    let saved = session.answer("disc_save", json!({ "handle": handle, "path": ours }));
+    assert_eq!(saved["modified"], true);
+    assert_eq!(fs::read(&ours).unwrap(), fs::read(&theirs).unwrap());
 }
 
 // Every type of 6845 powers on with its registers at 0 (colophon-emulator's
@@ -12578,6 +12901,91 @@ fn load_reads_a_program_from_a_tape_and_runs_it() {
         program
     );
     assert_eq!(session.peek(&handle, json!(30000), 1), "2A");
+}
+
+// RUN" reads a tape on a cpc464 as it stands, and on a cpc664 or a cpc6128
+// once |TAPE has redirected "cassette routines to cassette", as "V1.1
+// machines" need (SOFT 968, 8, and 9.1's list of AMSDOS's commands). The
+// cassette manager asks "Press PLAY then any key:" (8.11), a key goes down,
+// and the binary it loads runs from its "Entry address" (8.4). The tape goes
+// in at power-on and stands until the cassette manager runs the motor, so a
+// wait longer than the cassette's leader tape and the header's record before
+// RUN" leaves it where it went in (a_cpcs_tape_moves_only_while_its_motor_turns).
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn run_loads_a_binary_from_a_tape_on_every_cpc() {
+    let scratch = Roms::new(&[]);
+    let tape = binary_tape(b"WRITING", 0x4000, &WRITING_A_BYTE);
+    let path = scratch.write("program.cdt", &tape);
+    let mut session = Session::reading(&firmware());
+    for (machine, redirect) in [
+        ("cpc464", None),
+        ("cpc664", Some("|TAPE\n")),
+        ("cpc6128", Some("|TAPE\n")),
+    ] {
+        let handle = session.open(machine);
+        session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+        let standing = REEL_LAG_TICKS + CPC_LEADER_TICKS + 300 * CPC_FRAME_TICKS;
+        session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS + standing }));
+        if let Some(redirect) = redirect {
+            session.answer("type", json!({ "handle": handle, "text": redirect }));
+            session.run(&handle, json!({ "frames": 50 }));
+        }
+        session.answer("type", json!({ "handle": handle, "text": "RUN\"\n" }));
+        session.answer("type", json!({ "handle": handle, "text": " " }));
+        let ran = session.run(
+            &handle,
+            json!({ "frames": 1500, "until": [{ "execute": "&4000" }] }),
+        );
+        assert_eq!(ran["stopped"], "matched", "{machine}: {ran}");
+        assert_eq!(
+            bytes_of(&session.peek(&handle, json!("&4000"), 7)),
+            WRITING_A_BYTE,
+            "{machine}"
+        );
+    }
+}
+
+// A CPC kept partway through RUN", its reel turning, runs on from a restore,
+// and from its state file in another server, to the machine it ran on to,
+// the program loaded and run (run_loads_a_binary_from_a_tape_on_every_cpc).
+// It is kept a second past the reel's lag and the cassette's leader tape
+// after the key goes down, which by the tape's timings falls inside the
+// header's leader if the firmware starts the motor at the key.
+#[test]
+#[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
+fn a_cpc_kept_while_it_loads_runs_on_from_a_restore_and_from_its_state_file_alike() {
+    let scratch = Roms::new(&[]);
+    let tape = binary_tape(b"WRITING", 0x4000, &WRITING_A_BYTE);
+    let path = scratch.write("program.cdt", &tape);
+    let mut session = Session::reading(&firmware());
+    let handle = session.open("cpc464");
+    session.run(&handle, json!({ "ticks": 78 * CPC_FRAME_TICKS }));
+    session.answer("tape_insert", json!({ "handle": handle, "path": path }));
+    session.answer("type", json!({ "handle": handle, "text": "RUN\"\n" }));
+    session.answer("type", json!({ "handle": handle, "text": " " }));
+    let into_the_leader = REEL_LAG_TICKS + CPC_LEADER_TICKS + 50 * CPC_FRAME_TICKS;
+    session.run(&handle, json!({ "ticks": into_the_leader }));
+    assert_eq!(session.inspect(&handle, "reel_turning"), true);
+    let loading = keep(&mut session, &handle);
+    let kept = everything(&mut session, &handle);
+    let filed = scratch.0.join("loading.state");
+    save_state(&mut session, &handle, &loading, &filed);
+    session.run(&handle, json!({ "frames": 600 }));
+    let loaded = everything(&mut session, &handle);
+    assert_eq!(session.peek(&handle, json!("&4100"), 1), "2A");
+    restore(&mut session, &handle, &loading);
+    assert!(everything(&mut session, &handle) == kept);
+    session.run(&handle, json!({ "frames": 600 }));
+    assert!(everything(&mut session, &handle) == loaded);
+    let mut another = Session::reading(&firmware());
+    let read = open_state(&mut another, "cpc464", &filed)["handle"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(everything(&mut another, &read) == kept);
+    another.run(&read, json!({ "frames": 600 }));
+    assert!(everything(&mut another, &read) == loaded);
 }
 
 // A snapshot the server saves is the one the command line saves of the

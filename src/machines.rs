@@ -167,7 +167,6 @@ impl FileRead {
 }
 
 pub const DISCS: &str = "a disc is a DSK image, of the original or the extended layout";
-pub const TAPES: &str = "a tape is a .tap of bare blocks at the ROM's own timings, or a .tzx";
 
 // Where a relative path is taken from, said beside a file that could not be
 // reached by it.
@@ -633,13 +632,24 @@ impl Machine {
     }
 
     // A tape is held whole for as long as it is in the deck. 90 minutes of
-    // tape at the ROM's own timings, where "a reset bit is encoded as two
-    // pulses of 855 tstates each, a set bit as two pulses of 1710 tstates
+    // tape at the Spectrum ROM's own timings, where "a reset bit is encoded as
+    // two pulses of 855 tstates each, a set bit as two pulses of 1710 tstates
     // each" (comp.sys.sinclair FAQ, 16K/48K reference), hold under 1.4MB at
-    // 3.5MHz, and the bound stands far past them.
+    // 3.5MHz, and at a CPC firmware's fastest, whose "half zero length must
+    // lie between 130 and 480 microseconds" (SOFT 968, CAS SET SPEED), under
+    // 3MB; the bound stands far past them.
     pub fn tape(&self, path: &Path) -> Result<Vec<u8>, String> {
-        self.takes_tapes()?;
-        read_whole(path, MOST_MEDIUM_BYTES as u64, "a tape", TAPES)
+        read_whole(path, MOST_MEDIUM_BYTES as u64, "a tape", self.tapes())
+    }
+
+    // What the machine's deck plays, said beside a tape refused.
+    pub fn tapes(&self) -> &'static str {
+        match self.board {
+            Board::Cpc { .. } => "a CPC's tape is a .cdt or a .tzx",
+            Board::Spectrum { .. } => {
+                "a Spectrum's tape is a .tap of bare blocks at the ROM's own timings, or a .tzx"
+            }
+        }
     }
 
     // How many characters one request may type: as many as are held and let
@@ -696,7 +706,8 @@ impl Machine {
             } => Ok(()),
             Board::Cpc { .. } => Err(format!(
                 "a {} is built without a disc interface, as the emulator's command line builds one \
-                 given no disc; use a cpc664 or a cpc6128 for discs",
+                 given no disc; use a cpc664 or a cpc6128 for discs, or tape_insert for its \
+                 tapes",
                 self.name
             )),
             Board::Spectrum { .. } => Err(format!(
@@ -721,18 +732,6 @@ impl Machine {
             Board::Spectrum { .. } => Err(format!(
                 "a {} has no 6845, so it takes no crtc_type; leave crtc_type out, or open a \
                  cpc464, a cpc664 or a cpc6128",
-                self.name
-            )),
-        }
-    }
-
-    // Whether the machine takes a tape, and what does if it does not.
-    pub fn takes_tapes(&self) -> Result<(), String> {
-        match self.board {
-            Board::Spectrum { .. } => Ok(()),
-            Board::Cpc { .. } => Err(format!(
-                "a {} takes no tape here, since this server has no test of tape loading through \
-                 a CPC's firmware; use a spectrum48 for tapes, or a cpc664 or a cpc6128 for discs",
                 self.name
             )),
         }
@@ -1091,8 +1090,7 @@ impl Built {
         }
     }
 
-    // Machine::disc and Machine::tape read a file only for a machine that
-    // takes it.
+    // Machine::disc reads a file only for a machine that takes discs.
     pub fn insert_disc(
         &mut self,
         drive: u8,
@@ -1105,10 +1103,18 @@ impl Built {
         }
     }
 
+    // The server asks Machine::takes_discs before it saves a disc.
+    pub fn disc_save(&self, drive: u8) -> Result<(Vec<u8>, bool), String> {
+        match &self.hardware {
+            Hardware::Cpc(cpc) => cpc.disc_save(drive),
+            Hardware::Spectrum(_) => unreachable!("a Spectrum is given no disc"),
+        }
+    }
+
     pub fn insert_tape(&mut self, contents: &[u8]) -> Result<(), String> {
         match &mut self.hardware {
+            Hardware::Cpc(cpc) => cpc.insert_tape(contents),
             Hardware::Spectrum(spectrum) => spectrum.insert_tape(contents),
-            Hardware::Cpc(_) => unreachable!("a CPC is given no tape"),
         }
     }
 
@@ -1502,7 +1508,9 @@ impl Built {
         }
         let mut buffers = Buffers::new(&state.bytes[state.buffers_at..]);
         match &mut self.hardware {
-            Hardware::Cpc(cpc) => cpc.state_file_load(&heading.hardware, &mut buffers),
+            Hardware::Cpc(cpc) => {
+                cpc.state_file_load(&heading.hardware, heading.tick, &mut buffers)
+            }
             Hardware::Spectrum(spectrum) => {
                 spectrum.state_file_load(&heading.hardware, heading.tick, &mut buffers)
             }

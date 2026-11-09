@@ -32,7 +32,7 @@ use crate::machine::{
     READ, ROM, ROM_BYTES, Run, START_ADDRESS, START_PC, START_SP, Span, Start, UNTIL, WRITE,
 };
 use crate::machines::{
-    self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, TAPES, Watched, Watching,
+    self, Built, DISCS, Entry, FileRead, MACHINES, Machine, NewFile, Watched, Watching,
 };
 use crate::picture;
 use crate::screen::{Asked, MOST_HEIGHT, MOST_RASTERS, MOST_WIDTH, Reading};
@@ -1665,12 +1665,21 @@ enum CountBy {
 }
 
 // A CPC's two drives, as AMSDOS names them.
-#[derive(Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 enum Drive {
     /// The machine's own drive, single-headed.
     A,
     /// A second drive, double-headed.
     B,
+}
+
+impl Drive {
+    fn number(self) -> u8 {
+        match self {
+            Drive::A => 0,
+            Drive::B => 1,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -1689,6 +1698,18 @@ struct DiscRequest {
     #[schemars(transform = absent_not_null)]
     #[serde(skip_serializing_if = "Option::is_none")]
     write_protected: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DiscSaveRequest {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The drive. Default A.
+    #[schemars(transform = absent_not_null)]
+    drive: Option<Drive>,
+    /// Where to write the image: a path on the server's file system that names no file yet. A relative path starts from the server's working directory.
+    path: PathBuf,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -1990,6 +2011,20 @@ struct Inserted {
     tick: u64,
     #[serde(flatten)]
     file: FileRead,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct DiscSaved {
+    /// The handle `machine_open` returned.
+    handle: String,
+    /// The drive the disc was saved from.
+    drive: Drive,
+    /// The machine's tick when the disc was saved.
+    tick: u64,
+    #[serde(flatten)]
+    file: FileRead,
+    /// `true` if the machine has written to or formatted the disc since it went in.
+    modified: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -3568,7 +3603,7 @@ impl Server {
         Ok(Json(ran))
     }
 
-    /// Put a disc in a CPC's drive: a DSK image, original or extended layout, read whole and copied into the machine, as the emulator's command line does with --disc. The machine writes to its copy, never to the file, and what it wrote is lost when another disc replaces it, except in states kept while it was in the drive. The new disc replaces whatever the drive held, as when a game asks for its second side. Only a cpc664 or a cpc6128 takes discs: a cpc464 is built without the disc interface. An image the emulator cannot read is refused with the reason, and the drive keeps its disc. On a machine opened from a snapshot, AMSDOS reads no disc until `set` writes the disc controller's fields that `machine_open` lists. The answer gives the file's SHA-256 and the machine's tick at insertion.
+    /// Put a disc in a CPC's drive: a DSK image, original or extended layout, read whole and copied into the machine, as the emulator's command line does with --disc. The machine writes to its copy, never to the file, and what it wrote is lost when another disc replaces it, unless `disc_save` wrote it out or a state kept it. The new disc replaces whatever the drive held, as when a game asks for its second side. While the motor turns, the drive reports the new disc ready 0.6 seconds after it goes in: run 31 frames before the program reads it. Only a cpc664 or a cpc6128 takes discs: a cpc464 is built without the disc interface. An image the emulator cannot read is refused with the reason, and the drive keeps its disc. On a machine opened from a snapshot, AMSDOS reads no disc until `set` writes the disc controller's fields that `machine_open` lists. The answer gives the file's SHA-256 and the machine's tick at insertion.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3592,14 +3627,10 @@ impl Server {
             Ok((contents, file))
         })
         .await?;
-        let number = match drive {
-            Drive::A => 0,
-            Drive::B => 1,
-        };
         let given = file.clone();
         let (_, orders) = self.thread(&request.handle)?;
         let tick = Server::ask(&request.handle, orders, move |built| {
-            built.insert_disc(number, &contents, write_protected)?;
+            built.insert_disc(drive.number(), &contents, write_protected)?;
             built.record(built.tick(), "disc_insert", arguments, Some(given), None);
             Ok::<_, String>(built.tick())
         })
@@ -3613,7 +3644,45 @@ impl Server {
         }))
     }
 
-    /// Put a .tap or .tzx tape in a Spectrum's deck and press PLAY; the file is read whole and copied into the machine, as the emulator's command line does with --tape. A Spectrum has no motor control, so the tape plays from now on whatever the machine does: insert it just before the program asks for it, as LOAD "" does. The tape starts with 5.7 seconds (about 285 frames) of silence, the cassette's leader tape, less any silence the image already has before its first edge. A tape that stops itself, as a multiload does between parts, waits there; no tool presses PLAY again. A tape is refused, and the deck keeps the tape it had, if it holds a block the emulator cannot play: a waveform recorded sample by sample, data built from a symbol table, a jump, loop, call or menu (which visit blocks out of order), or a block with an unknown ID. A CPC takes no tape. The answer gives the file's SHA-256 and the machine's tick at insertion.
+    /// Write the disc in a CPC's drive to a new file as an extended DSK image, as the emulator's command line does with --save-disc. The file holds the disc as it stands at this tick, so a save the program has not finished may be missing or partial. The emulator writes its own image, so its SHA-256 may differ from the file put in even when nothing was written: `modified` says whether the machine wrote to or formatted the disc. Only a cpc664 or a cpc6128 has drives. Refused if the drive is empty, the file exists, or the disc holds a track the extended layout cannot describe.
+    #[tool(annotations(
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn disc_save(
+        &self,
+        Parameters(request): Parameters<DiscSaveRequest>,
+    ) -> Result<Json<DiscSaved>, String> {
+        let (machine, orders) = self.thread(&request.handle)?;
+        machine.takes_discs()?;
+        let path = machines::absolute(&request.path)?;
+        let drive = request.drive.unwrap_or(Drive::A);
+        let handle = request.handle.clone();
+        let (bytes, modified, tick) = Server::ask(&request.handle, orders, move |built| {
+            let (bytes, modified) = built.disc_save(drive.number())?;
+            Ok::<_, String>((bytes, modified, built.tick()))
+        })
+        .await?
+        .map_err(|problem| format!("{handle}'s drive {drive:?} {problem}"))?;
+        let file = Server::blocking(path.display().to_string(), move || {
+            machines::write_new(&path, &bytes)
+        })
+        .await?;
+        Ok(Json(DiscSaved {
+            handle: request.handle,
+            drive,
+            tick,
+            file,
+            modified,
+        }))
+    }
+
+    /// Put a tape in a machine's deck: a .tzx on either machine, a .cdt on a CPC, or a .tap on a Spectrum, read whole and copied into the machine, as the emulator's command line does with --tape. The tape starts with 5.7 seconds (about 285 frames) of silence, the cassette's leader tape, less any silence the image already has before its first edge. What the machine writes to tape goes nowhere. The answer gives the file's SHA-256 and the machine's tick at insertion.
+    /// - Spectrum: PLAY is pressed now, and the tape plays whatever the machine does: insert it just before the program asks for it, as LOAD "" does. A tape that stops itself, as a multiload does between parts, waits there; no tool presses PLAY again.
+    /// - CPC: the tape moves only while the cassette motor runs, 50 ms behind it, so insert it any time before RUN". A cpc664 or cpc6128 reads tapes after |TAPE. The firmware prints "Press PLAY then any key:" and waits for a key.
+    /// - Refused, the deck keeping its tape, if a block cannot be played: a waveform recorded sample by sample, data built from a symbol table, a jump, call or menu (which visit blocks out of order), a malformed loop, or an unknown block ID.
     #[tool(annotations(
         read_only_hint = false,
         destructive_hint = true,
@@ -3643,7 +3712,7 @@ impl Server {
             Ok::<_, String>(built.tick())
         })
         .await?
-        .map_err(|problem| format!("{} {problem}; {TAPES}", path.display()))?;
+        .map_err(|problem| format!("{} {problem}; {}", path.display(), machine.tapes()))?;
         Ok(Json(Inserted {
             handle: request.handle,
             drive: None,
@@ -3654,7 +3723,7 @@ impl Server {
 
     /// Write a machine to a new file as a snapshot, as the emulator's command line does with --save and `machine_open` reads: an SNA of version 1 for a CPC, a 48K .sna for a Spectrum. Refused if the file exists, inside a chain of prefixes, or on a Spectrum with a stack pointer below &4002. The file holds the whole RAM: a CPC's after its 256-byte header, by the RAM's own addresses as `peek`'s `ram` counts them; a Spectrum's &4000 to &FFFF after its 27-byte header. A CPC whose `psg.chip_selected` is false is written with `psg.selected` plus 16 at &5A, outside the 0 to 15 the format asks for there; `machine_open` reads it back the same way. The answer gives the file's SHA-256 and the machine's tick. `state_keep` keeps all of the machine in memory, and `state_save` writes it to a file that only this build opens. A snapshot holds less than the machine:
     /// - Neither format records a HALT, so a machine saved on HALT runs past it once loaded.
-    /// - A CPC snapshot holds no disc, no disc controller, no 6845 counters and no CRTC type; see `machine_open`.
+    /// - A CPC snapshot holds no disc, no tape, no disc controller, no 6845 counters and no CRTC type; see `machine_open`.
     /// - A Spectrum snapshot holds no beam position and no tape, and stores the program counter in the 2 bytes below the stack pointer, in the file only, so a machine loaded from it has lost what those bytes held.
     #[tool(annotations(
         read_only_hint = false,
@@ -3742,7 +3811,7 @@ impl Server {
 
     /// Write a kept state to a new file. `machine_open` with `state` builds a new machine from it, exactly as the state was: everything it holds, its picture, its discs as written, its tape's position, its tick and its journal. Refused if the file exists. The answer gives the file's SHA-256 and the state's tick.
     /// - Only the build that wrote the file opens it, the build `serverInfo.version` names, on firmware with the same SHA-256.
-    /// - The file's first line is JSON: the build, the machine, the tick, the files the machine was built from, the journal, the machine's fields by `inspect`'s names, and its discs' or tape's fields by the names the emulator's headers give them. The machine's RAM, its picture and its disc or tape images follow, as bytes.
+    /// - The file's first line is JSON: the build, the machine, the tick, the files the machine was built from, the journal, the machine's fields by `inspect`'s names, and its discs' and tape's fields by the names the emulator's headers give them. The machine's RAM, its picture and its disc and tape images follow, as bytes.
     /// - On another build, the journal's requests, made again in order from the same files, rebuild the machine.
     /// - A tape is found again by playing it from its start, so a state whose tape had played more than 268435456 pulses is refused when opened.
     #[tool(annotations(
@@ -3841,7 +3910,7 @@ impl Server {
     }
 
     /// List what has been done to a machine: the build running it, the files it was built from (by SHA-256), and every request that built it or changed it on the way to where it stands, in order. Each entry has the machine's tick when the request began and its arguments, with condition addresses, ports and bytes in & hexadecimal (a capture's `cpu.sp` or `cpu.pc` as given, `when`'s bytes as pairs of capital hexadecimal digits with a space between, `??` for any byte), paths absolute, a CPC's `machine_open` with its `crtc_type` whether or not it was given, and each file read or written named by its SHA-256.
-    /// - Reads are not recorded, nor are states kept, saved or dropped. Restoring a state makes the journal the state's.
+    /// - Reads are not recorded, nor are snapshots and discs written out, nor states kept, saved or dropped. Restoring a state makes the journal the state's.
     /// - A machine built from a state file takes the state's journal and files: the files the state's machine was built from, as the file names them, not the state file.
     /// - The same requests in the same order, on the same build and with the same files, rebuild a machine in the same state: this is how a finding is reproduced.
     /// - Entries are returned from `from` on, as many as fit in 8192 characters, and at least one while any remain; `next` gives where the next page starts.
