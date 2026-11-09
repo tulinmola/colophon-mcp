@@ -555,6 +555,52 @@ fn discovery_names_the_server_its_build_and_the_revisions_it_speaks() {
     assert_eq!(identity["version"], env!("COLOPHON_MCP_BUILD"));
 }
 
+// The instructions are "guidance describing the server and its features",
+// which server/discover answers (2026-07-28, DiscoverResult), and initialize
+// in a revision before it. Claude Code cuts them, and a tool's description
+// loaded upfront, past 4096 characters, and its tool search reads no
+// further; before v2.1.296 both were 2048
+// (https://code.claude.com/docs/en/mcp), so each is held to 2048. A firmware
+// entry they name by its address is the one a listing names there.
+#[test]
+fn the_instructions_and_every_description_reach_a_client_whole() {
+    let roms = Roms::all();
+    let mut session = Session::start(&roms);
+    let discovered = session.result("server/discover", json!({}));
+    let instructions = discovered["instructions"].as_str().expect("instructions");
+    for revision in LEGACY {
+        let (_session, answer) = Session::legacy(&roms, revision);
+        assert_eq!(answer["result"]["instructions"], instructions, "{answer}");
+    }
+    let tools = tools(&mut session);
+    let descriptions = tools
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|tool| tool["description"].as_str().expect("a description"));
+    for text in descriptions.chain([instructions]) {
+        assert!(text.chars().count() <= 2048, "{text}");
+    }
+    let handle = session.open("cpc6128");
+    let pieces: Vec<&str> = instructions.split(" (&").collect();
+    for (before, after) in pieces.iter().zip(&pieces[1..]) {
+        let name = before
+            .rsplit(|character: char| !character.is_ascii_uppercase() && character != ' ')
+            .next()
+            .expect("a name")
+            .trim();
+        let address = u16::from_str_radix(&after[..4], 16).expect("an address");
+        let [low, high] = address.to_le_bytes();
+        session.poke(&handle, json!("&8000"), &format!("CD{low:02X}{high:02X}"));
+        let listed = session.answer(
+            "disassemble",
+            json!({ "handle": handle, "address": "&8000", "instructions": 1 }),
+        );
+        assert_eq!(listed["instructions"][0]["firmware"], name, "{listed}");
+    }
+    assert_eq!(pieces.len(), 8, "{instructions}");
+}
+
 // Whether the files were committed is graded in build_name's own tests;
 // here, that the commits are the ones the checkouts stand at.
 #[test]
@@ -6028,7 +6074,8 @@ fn no_schema_names_a_format() {
 }
 
 // An argument of the wrong kind is named, with the kind serde takes for it,
-// and one missing is named as serde names it, with no path before it.
+// and one missing is named as serde names it, with no path before it, and
+// with every argument the tool requires where it requires more than one.
 #[test]
 fn an_argument_of_the_wrong_kind_is_named() {
     let roms = Roms::all();
@@ -6037,6 +6084,13 @@ fn an_argument_of_the_wrong_kind_is_named() {
     assert_eq!(
         session.refusal("run", json!({ "frames": 1 })),
         "failed to deserialize parameters: missing field `handle`"
+    );
+    assert_eq!(
+        session.refusal(
+            "state_save",
+            json!({ "handle": handle, "state": "state-1" })
+        ),
+        "failed to deserialize parameters: missing field `path`; give `handle`, `state` and `path`"
     );
     assert_eq!(
         session.refusal(
@@ -12629,6 +12683,151 @@ fn text_typed_leaves_the_screen_the_command_lines_typing_leaves() {
     }
 }
 
+// What the instructions say a program prints is read where they say: a
+// CPC's TXT OUTPUT takes "the character to send" in A (SOFT 968), and a
+// Spectrum's PRINT-A-2 at &15F2 the character RST &10 hands it and the
+// digits OUT-CODE hands it, which never pass through RST &10 (The Complete
+// Spectrum ROM Disassembly). The instructions' own gathering is run, at
+// either entry. Each machine prints 7 and its prompt after
+// PRINT 7 and RETURN or ENTER, the key held 3 frames as type holds one.
+#[test]
+#[ignore = "needs the emulator's fetched firmware: make test-firmware"]
+fn what_either_machine_prints_is_read_where_the_instructions_say() {
+    let mut session = Session::reading(&firmware());
+    let discovered = session.result("server/discover", json!({}));
+    let instructions = discovered["instructions"].as_str().expect("instructions");
+    for named in ["TXT OUTPUT (&BB5A)", "PRINT-A-2 at &15F2"] {
+        assert!(instructions.contains(named), "{named}");
+    }
+    let example = instructions
+        .split("`gather` `")
+        .nth(1)
+        .and_then(|after| after.split('`').next())
+        .expect("a gathering");
+    for (machine, frames, text, key, entries) in [
+        ("cpc6128", 78, "PRINT 7", "RETURN", &["&BB5A"][..]),
+        ("spectrum48", 128, "p7", "ENTER", &["&15F2", "&0010"]),
+    ] {
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "frames": frames }));
+        session.answer("type", json!({ "handle": handle, "text": text }));
+        let gather: Vec<Value> = entries
+            .iter()
+            .map(|entry| serde_json::from_str(&example.replace("&BB5A", entry)))
+            .collect::<Result<Vec<Vec<Value>>, _>>()
+            .expect("the gathering is JSON")
+            .concat();
+        let mut printed: BTreeMap<String, String> = BTreeMap::new();
+        for run in 0..10 {
+            let keys = if run == 0 { json!([key]) } else { json!([]) };
+            let ran = session.run(
+                &handle,
+                json!({ "frames": 3, "keys": keys, "gather": gather }),
+            );
+            for matched in ran["gathered"].as_array().expect("the matches") {
+                let code = matched["captured"]["values"]["cpu.a"].as_u64().expect("A");
+                let entry = matched["execute"].as_str().expect("an entry");
+                let character = char::from(u8::try_from(code).expect("a byte"));
+                printed.entry(entry.to_owned()).or_default().push(character);
+            }
+        }
+        let read = |entry: &str| printed.get(entry).cloned().unwrap_or_default();
+        if machine == "cpc6128" {
+            assert!(read("&BB5A").contains(" 7 \r\nReady"), "{printed:?}");
+        } else {
+            assert!(read("&15F2").contains("7\r0 OK, 0:1"), "{printed:?}");
+            assert!(read("&0010").contains(" OK, "), "{printed:?}");
+            let digit = |character: char| character.is_ascii_digit();
+            assert!(!read("&0010").contains(digit), "{printed:?}");
+        }
+    }
+}
+
+// The instructions name the main jumpblock's entries a program asks the
+// firmware for a key through, as SOFT 968 names them, and say BASIC's INPUT
+// and Ready prompt call none. On each CPC, each program, run from RETURN on,
+// stops on entry to the one its keyword calls; and INPUT and the Ready
+// prompt, each given a key while watched, so that it asks afresh, stop at
+// none, the screen showing the key taken, the a it types beside the cursor.
+#[test]
+#[ignore = "needs the emulator's fetched firmware: make test-firmware"]
+fn a_cpc_program_asking_for_a_key_stops_where_the_instructions_say() {
+    let scratch = Roms::new(&[]);
+    let mut session = Session::reading(&firmware());
+    let discovered = session.result("server/discover", json!({}));
+    let instructions = discovered["instructions"]
+        .as_str()
+        .expect("instructions")
+        .to_owned();
+    let entries = ["&BB06", "&BB09", "&BB18", "&BB1B", "&BB1E", "&BB24"];
+    for entry in entries {
+        assert!(instructions.contains(&format!("({entry})")), "{entry}");
+    }
+    let none = "BASIC's INPUT and Ready prompt call none of them";
+    assert!(instructions.contains(none), "{instructions}");
+    let until: Vec<Value> = entries
+        .iter()
+        .map(|entry| json!({ "execute": entry }))
+        .collect();
+    // A run of 3 frames holding the key, and if it stops at none, 20 more.
+    let watched = |session: &mut Session, handle: &str, key: &str| {
+        let ran = session.run(
+            handle,
+            json!({ "frames": 3, "keys": [key], "until": until }),
+        );
+        if ran["stopped"] == "matched" {
+            return ran;
+        }
+        session.run(handle, json!({ "frames": 20, "until": until }))
+    };
+    for machine in ["cpc464", "cpc664", "cpc6128"] {
+        let reader = session.open(machine);
+        session.run(&reader, json!({ "frames": 78 }));
+        let font = cpc_font(&mut session, &reader, machine);
+        let handle = session.open(machine);
+        session.run(&handle, json!({ "frames": 78 }));
+        let ready = keep(&mut session, &handle);
+        let ran = watched(&mut session, &handle, "A");
+        assert_eq!(ran["stopped"], "frames", "{machine}: {ran}");
+        let text = cpc_text(&mut session, &handle, &scratch, &font);
+        let prompt = text
+            .iter()
+            .rposition(|line| line == "Ready")
+            .expect("Ready");
+        assert!(text[prompt + 1].starts_with('a'), "{machine}: {text:#?}");
+        for (program, entry, then) in [
+            ("10 INPUT A", None, "? a"),
+            ("10 A$=INKEY$:GOTO 10", Some("&BB09"), ""),
+            ("10 A=INKEY(47):GOTO 10", Some("&BB1E"), ""),
+            ("10 A=JOY(0):GOTO 10", Some("&BB24"), ""),
+        ] {
+            restore(&mut session, &handle, &ready);
+            let text = format!("{program}\nRUN");
+            session.answer("type", json!({ "handle": handle, "text": text }));
+            let ran = watched(&mut session, &handle, "RETURN");
+            match entry {
+                Some(entry) => {
+                    assert_eq!(ran["stopped"], "matched", "{machine} {program}: {ran}");
+                    assert_eq!(ran["pc"], entry, "{machine} {program}: {ran}");
+                }
+                None => {
+                    assert_eq!(ran["stopped"], "frames", "{machine} {program}: {ran}");
+                    let ran = watched(&mut session, &handle, "A");
+                    assert_eq!(ran["stopped"], "frames", "{machine} {program}: {ran}");
+                    let text = cpc_text(&mut session, &handle, &scratch, &font);
+                    let run = text.iter().rposition(|line| line == "RUN").expect("RUN");
+                    assert!(
+                        text[run + 1].starts_with(then),
+                        "{machine} {program}: {text:#?}"
+                    );
+                }
+            }
+        }
+        session.answer("machine_close", json!({ "handle": handle }));
+        session.answer("machine_close", json!({ "handle": reader }));
+    }
+}
+
 // The Spectrum's answer, at the top left of its picture, in the ROM's own
 // font: CHARS, at 23606, is "256 less than address of character set (which
 // starts with space and carries on to the copyright symbol)" (ZX Spectrum
@@ -13394,7 +13593,7 @@ fn a_cpc_stood_up_from_its_state_file_finds_its_disc_controller_as_amsdos_left_i
 // counters and the Gate Array's interrupt counter are the machine's. A
 // snapshot holds neither, so a run by frames from one ends at the retrace
 // the 6845's first vertical sync brings from the top of its frame, as
-// machine_open's description says.
+// docs/index.en.md says.
 #[test]
 #[ignore = "needs the emulator's fetched firmware and its command line: make test-firmware"]
 fn a_cpc_stood_up_from_its_state_file_keeps_its_place_in_the_frame() {

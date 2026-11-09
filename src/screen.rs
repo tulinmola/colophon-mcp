@@ -10,11 +10,11 @@ use crate::picture::Picture;
 #[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Reading {
-    /// As the CPC's video hardware reads memory: a character row's lines are 2K apart, and a row's bytes wrap within their 2K unless `base` is omitted and R12's bits 3 and 2 carry them into the next 16K.
+    /// As the CPC's video hardware reads memory: a character row's lines are 2K apart.
     Video,
-    /// A flat buffer: `width` bytes per line, wrapping at the end of the RAM.
+    /// A flat buffer, `width` bytes per line.
     Linear,
-    /// Column by column, left to right: each column is `height` bytes, top to bottom. Wraps as `linear` does.
+    /// Column by column, left to right, each `height` bytes down.
     Columns,
 }
 

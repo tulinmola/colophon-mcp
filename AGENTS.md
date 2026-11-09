@@ -32,7 +32,7 @@ The protocol changes; the machines do not. Nothing an agent finds may live only 
 ## Tools
 
 - A tool is added the day someone needs it and not before. The first stand machines up, from power-on, from a snapshot or from a state of their own, list them and put them away, run them by the frame and step them by the instruction, read and set anything they hold by its path, read, write and search their memory, stop them where they are told and gather what they do on the way, call their routines, show their picture and read their memory as one, disassemble it, type at them, give them their discs and tapes, and keep them as they stand to be taken up again; anything further waits for a colophon to ask for it.
-- A tool's description is the reference for it, as a header is for the core, and a page never restates a schema.
+- A tool's description is the reference a client calls it by, as a header is for the core: what the client needs to call the tool right, and a warning wherever leaving it out would let the client go wrong. What the input schema says stays out, and so does what only a refusal need tell and how the server came to work as it does; the docs keep the rest, and a page never restates a schema. The server's instructions say what the tools are for and what holds across them, and repeat no description.
 - A tool speaks in the machine's terms. A field keeps the name its header gives it.
 - A tool that succeeds answers with a JSON object, and the same JSON as text beside it: the older revisions take no other structured answer, and the protocol asks for the text. One that fails answers with text alone, saying what would have worked.
 - What can be told as text is told as text. A picture is returned only for what only a picture shows, and comes with text saying which machine, at which tick, and at what size.
@@ -65,7 +65,7 @@ A page describes what the server does today, and what it owes a reader is its li
 - Humour only as a byproduct of honesty. None in code comments, error messages or tool descriptions: comments pay rent in facts, error messages are read on bad days, and a tool description is taken at its word.
 - Counts are words and measures are figures: two machines, eight rows, against 16K, 69888 T-states, `&C000`. A machine's sizes are what it is called, not how much of something there is.
 - Write for 2036. Mood is timeless, jokes are timestamps; the prose meets the same bar as the code.
-- What a client reads from the server is the exception to all of the above but the humour: the descriptions of tools, of their arguments and of their answers' fields, and error messages, are written as a reference manual is, in the plain voice a client expects — the rule first, short sentences, every number in figures, counts too, and lists where a description enumerates. The scribe's register is for the docs, the README and the comments, save the comments that become descriptions, as `mcp_run_t`'s do.
+- What a client reads from the server is the exception to all of the above but the humour: the descriptions of tools, of their arguments and of their answers' fields, the server's instructions, and error messages, are written as a reference manual is, in the plain voice a client expects — the rule first, short sentences, every number in figures, counts too, and lists where a description enumerates. The scribe's register is for the docs, the README and the comments, save the comments that become descriptions, as `mcp_run_t`'s do.
 
 ## Writing style
 
