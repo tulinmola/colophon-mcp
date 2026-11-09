@@ -20,3 +20,13 @@ tokio = { version = "=1.53.3", features = ["macros", "rt", "io-std", "sync"] }
 bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"] }
 cc = { version = "=1.8.0", features = ["parallel"] }
 syn = { version = "=3.0.9", features = ["full"] }
+
+# The tests spend much of their time in the crates this one depends on,
+# which an edit to this crate never recompiles. Measured: the protocol tests
+# ran in a median of 8.3s with those crates at level 1, 11.1s at 3 and 19.5s
+# unoptimized, over three runs each; building the tests from nothing with
+# four jobs took 81s at 1, 113s at 3 and 41s unoptimized. The crate's own
+# Rust stays unoptimized: with it at level 1 too, a one-line edit to
+# tests/protocol.rs took 38s to rebuild, against 5s.
+[profile.dev.package."*"]
+opt-level = 1

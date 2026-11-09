@@ -2165,9 +2165,10 @@ mod tests {
     }
 
     // Under the sanitizers, a disc or a tape given in place of another, or
-    // refused, leaves nothing pointing at what was freed: the machine runs on,
-    // reading the drive, or the deck and, past the cassette's leader tape, the
-    // image, after each.
+    // refused, leaves nothing pointing at what was freed: the machine runs on
+    // after each, reading the drive, or the deck and, at its first pulse, the
+    // image of a tape put in. Each tape put in here plays without its leader
+    // tape, which would keep the deck from the image for 5.7s.
     #[test]
     fn a_disc_or_a_tape_replaced_is_freed_once_nothing_points_at_it() {
         let (workload, _) = cpc_workload();
@@ -2205,28 +2206,31 @@ mod tests {
         // produces 0x00" (16K/48K reference), after its length.
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         for image in [&tape[..], &tape, &[1, 0], &tape] {
-            let _ = spectrum.insert_tape(image);
-            let past_the_leader_tape =
-                leader_ticks(spectrum.tape.as_ref()) + 2 * SPECTRUM_FRAME_TICKS;
-            spectrum.run(u32::MAX, past_the_leader_tape, None);
+            if spectrum.insert_tape(image).is_ok() {
+                without_leader_tape(spectrum.tape.as_ref());
+            }
+            spectrum.run(u32::MAX, 2 * SPECTRUM_FRAME_TICKS, None);
         }
         assert!(!spectrum.machine().tape.is_null());
         let mut cpc = Cpc::new(sixty_four_k(), rom(&MOTOR_ON, HALT), 0);
         let cdt = standard_block_tape();
+        let into_the_image = CPC_REEL_LAG_TICKS + 2 * CPC_STANDARD_FRAME_TICKS;
         for image in [&cdt[..], &cdt, &tape, &cdt] {
-            let _ = cpc.insert_tape(image);
-            let past_the_leader_tape =
-                CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
-            let ran = cpc.run(u32::MAX, past_the_leader_tape, None);
-            assert!(ran.ticks >= past_the_leader_tape);
+            if cpc.insert_tape(image).is_ok() {
+                without_leader_tape(cpc.tape.as_ref());
+            }
+            let ran = cpc.run(u32::MAX, into_the_image, None);
+            assert!(ran.ticks >= into_the_image);
         }
         assert!(!cpc.machine().tape.is_null());
     }
 
     // Under the sanitizers, a state kept with a disc in the drive, or a tape
     // in the deck, puts it back though another has taken its place since,
-    // and the machine runs on, reading the drive, or the deck and, past the
-    // cassette's leader tape, the image, once the state itself is dropped.
+    // and the machine runs on, reading the drive, or the deck, once the state
+    // itself is dropped. Each tape put in here plays without its leader tape,
+    // so that the deck reads the image within the run that follows, not 5.7s
+    // later.
     #[test]
     fn a_state_keeps_its_disc_and_its_tape_through_a_swap() {
         let (workload, _) = cpc_workload();
@@ -2266,13 +2270,14 @@ mod tests {
         );
         let tape = [3, 0, 0xFF, 0x01, 0xFE];
         spectrum.insert_tape(&tape).unwrap();
-        let past_the_leader_tape = leader_ticks(spectrum.tape.as_ref()) + 2 * SPECTRUM_FRAME_TICKS;
-        spectrum.run(u32::MAX, past_the_leader_tape, None);
+        without_leader_tape(spectrum.tape.as_ref());
+        spectrum.run(u32::MAX, 2 * SPECTRUM_FRAME_TICKS, None);
         let state = spectrum.state();
         let kept = Rc::clone(spectrum.tape.as_ref().expect("a tape"));
         // SAFETY: the deck stands beside the machine, which is not running.
         let played = unsafe { (*kept.deck.as_ptr()).tape.ticks_left };
         spectrum.insert_tape(&tape).unwrap();
+        without_leader_tape(spectrum.tape.as_ref());
         spectrum.run(2, 4 * SPECTRUM_FRAME_TICKS, None);
         // SAFETY: as above.
         unsafe { (*kept.deck.as_ptr()).tape.ticks_left = played + 1 };
@@ -2288,18 +2293,17 @@ mod tests {
         let mut cpc = Cpc::new(sixty_four_k(), rom(&MOTOR_ON, HALT), 0);
         let cdt = standard_block_tape();
         cpc.insert_tape(&cdt).unwrap();
-        let past_the_leader_tape =
-            CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
-        let ran = cpc.run(u32::MAX, past_the_leader_tape, None);
-        assert!(ran.ticks >= past_the_leader_tape);
+        without_leader_tape(cpc.tape.as_ref());
+        let into_the_image = CPC_REEL_LAG_TICKS + 2 * CPC_STANDARD_FRAME_TICKS;
+        let ran = cpc.run(u32::MAX, into_the_image, None);
+        assert!(ran.ticks >= into_the_image);
         let state = cpc.state();
         let kept = Rc::clone(cpc.tape.as_ref().expect("a tape"));
         // SAFETY: the deck stands beside the machine, which is not running.
         let played = unsafe { (*kept.deck.as_ptr()).tape.ticks_left };
         cpc.insert_tape(&cdt).unwrap();
-        let past_the_leader_tape =
-            CPC_REEL_LAG_TICKS + leader_ticks(cpc.tape.as_ref()) + 2 * CPC_STANDARD_FRAME_TICKS;
-        cpc.run(u32::MAX, past_the_leader_tape, None);
+        without_leader_tape(cpc.tape.as_ref());
+        cpc.run(u32::MAX, into_the_image, None);
         // SAFETY: as above.
         unsafe { (*kept.deck.as_ptr()).tape.ticks_left = played + 1 };
         cpc.restore(&state);
@@ -2967,6 +2971,16 @@ mod tests {
         let tape = tape.expect("a tape");
         // SAFETY: the deck stands beside the machine, which is not running.
         u64::from(unsafe { (*tape.deck.as_ptr()).reader.leader_ticks_left })
+    }
+
+    // Takes the cassette's leader tape away before the deck's first tick of
+    // play has taken it, as on a cassette sold without any (colophon-emulator's
+    // tzx.c, LEADER_MILLISECONDS, at ddf77d2): the deck's first pulse is then
+    // the image's.
+    fn without_leader_tape(tape: Option<&Rc<Tape>>) {
+        let tape = tape.expect("a tape");
+        // SAFETY: the deck stands beside the machine, which is not running.
+        unsafe { (*tape.deck.as_ptr()).reader.leader_ticks_left = 0 };
     }
 
     // A CPC's reel follows its motor line 50ms late, from rest when a tape

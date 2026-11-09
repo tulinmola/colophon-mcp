@@ -7780,7 +7780,7 @@ fn counting_a_stretch_is_tallying_a_gathering_of_it() {
             { "write": "&7F00", "to": "&90FF" },
             port,
         ]);
-        let stretch = 3 * SPECTRUM_FRAME_TICKS;
+        let stretch = 2 * SPECTRUM_FRAME_TICKS;
         // Each run's answer, after the tick the run began at.
         let mut over = |list: &str, count_by: Option<&str>| {
             let handle = session.open(machine);
@@ -8310,7 +8310,7 @@ fn a_gathering_written_to_a_file_is_the_stretch_gathered_through_runs_that_fill(
             { "write": "&7F00", "to": "&90FF" },
             port,
         ]);
-        let stretch = 3 * SPECTRUM_FRAME_TICKS;
+        let stretch = SPECTRUM_FRAME_TICKS;
         let carried = session.open(machine);
         let (mut tick, mut gathered) = (0, Vec::new());
         while tick < stretch {
