@@ -14,7 +14,7 @@ The npm package `colophon-mcp` carries the server built for six platforms, Linux
 npx -y colophon-mcp
 ```
 
-That is the command each client below is given, and `npx -y colophon-mcp@0.3.0` holds a client to that version.
+That is the command each client below is given, and `npx -y colophon-mcp@0.4.0` holds a client to that version.
 
 A version on npm carries the servers of the release of the same version, so it answers with the same build name, and a version the release workflow publishes carries npm's record of where it was built ([trusted publishing](https://docs.npmjs.com/trusted-publishers)).
 
@@ -130,7 +130,7 @@ Invoke-WebRequest "https://github.com/tulinmola/colophon-mcp/releases/latest/dow
 Expand-Archive "colophon-mcp-x86_64-pc-windows-msvc.zip" -DestinationPath .
 ```
 
-`latest/download` takes the newest release; `download/v0.3.0`, or another release's tag, takes that one.
+`latest/download` takes the newest release; `download/v0.4.0`, or another release's tag, takes that one.
 
 A client is given a server unpacked from an archive in place of `npx -y colophon-mcp`: the server's absolute path as the command, and as its arguments `--roms` and the absolute path of the `roms` folder beside it. For the archive for Apple silicon unpacked in `/path/to`, Claude Code's line is
 
